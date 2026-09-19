@@ -59,17 +59,34 @@ function audioFormat(name: string): string {
   return ext === "m4a" ? "mp4" : ext;
 }
 
+/**
+ * Create the batch row.
+ *
+ * `pending` with a `sourceObject` is the normal path: the archive is in the
+ * bucket and the Worker picks the job up from the queue. `processing` is for a
+ * caller that is about to run the import itself in-process (the e2e script).
+ */
 export async function createImportBatch(
   dataSourceId: string,
   fileName: string,
   userId: string | null,
+  options: { status?: "pending" | "processing"; sourceObject?: string | null } = {},
 ): Promise<string> {
+  const status = options.status ?? "processing";
   try {
     const row = await one<{ id: string }>(
-      `insert into import_batches (data_source_id, file_name, status, created_by, progress_detail)
-       values ($1, $2, 'processing', $3, $4::jsonb)
+      `insert into import_batches
+         (data_source_id, file_name, status, created_by, progress_detail, source_object, heartbeat_at)
+       values ($1, $2, $3, $4, $5::jsonb, $6, now())
        returning id`,
-      [dataSourceId, fileName, userId, JSON.stringify({ step: "queued" })],
+      [
+        dataSourceId,
+        fileName,
+        status,
+        userId,
+        JSON.stringify({ step: "queued" }),
+        options.sourceObject ?? null,
+      ],
     );
     return row.id;
   } catch (err) {
@@ -149,7 +166,9 @@ export async function importZip(
     if (all.length === 0) throw new Error("没有解析出任何对话记录");
 
     await execute(
-      `update import_batches set total_entries = $2, progress_detail = $3::jsonb where id = $1`,
+      `update import_batches
+       set total_entries = $2, progress_detail = $3::jsonb, heartbeat_at = now()
+       where id = $1`,
       [batchId, all.length, JSON.stringify({ step: "bundle" })],
     );
 
@@ -180,10 +199,10 @@ export async function importZip(
   const messageRows: MessageRowInsert[] = [];
 
 
-    await execute(`update import_batches set progress_detail = $2::jsonb where id = $1`, [
-      batchId,
-      JSON.stringify({ step: "write" }),
-    ]);
+    await execute(
+      `update import_batches set progress_detail = $2::jsonb, heartbeat_at = now() where id = $1`,
+      [batchId, JSON.stringify({ step: "write" })],
+    );
 
     // One statement per slice: new sessions are inserted, sessions seen by an
     // earlier batch take the recomputed counters, and both come back with their
@@ -278,7 +297,9 @@ export async function importZip(
     }
 
     await execute(
-      `update import_batches set progress_detail = $2::jsonb, created_sessions = $3 where id = $1`,
+      `update import_batches
+       set progress_detail = $2::jsonb, created_sessions = $3, heartbeat_at = now()
+       where id = $1`,
       [batchId, JSON.stringify({ step: "messages" }), result.sessions],
     );
 
@@ -313,17 +334,17 @@ export async function importZip(
         throw new Error(`写入 message 失败: ${(err as Error).message}`);
       }
       result.messages += rows.length;
-      await execute(`update import_batches set created_messages = $2 where id = $1`, [
-        batchId,
-        result.messages,
-      ]);
+      await execute(
+        `update import_batches set created_messages = $2, heartbeat_at = now() where id = $1`,
+        [batchId, result.messages],
+      );
     }
 
     await execute(
       `update import_batches
        set status = 'completed', created_sessions = $2, created_messages = $3,
            uploaded_audios = $4, failed_audios = $5, skipped = $6, error = $7,
-           finished_at = now(), progress_detail = $8::jsonb
+           finished_at = now(), progress_detail = $8::jsonb, heartbeat_at = now()
        where id = $1`,
       [
         batchId,
@@ -447,7 +468,17 @@ async function uploadAudios(
         if (errors.length < 10) errors.push(`音频上传失败 ${job.entry.path}: ${(e as Error).message}`);
       }
       done++;
-      if (done % 25 === 0) log(`音频上传进度`, { done, total: jobs.length });
+      if (done % 25 === 0) {
+        log(`音频上传进度`, { done, total: jobs.length });
+        // The long phase. Without this the batch would look abandoned to the
+        // stale sweep while it is in fact working.
+        await execute(
+          `update import_batches
+           set heartbeat_at = now(), progress_detail = $2::jsonb, uploaded_audios = $3
+           where id = $1`,
+          [batchId, JSON.stringify({ step: "audio", done, total: jobs.length }), ok],
+        ).catch(() => {});
+      }
     }
   }
 

@@ -1,8 +1,10 @@
+import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
 import { execute, maybeOne } from "@/lib/db";
 import { canAccessSource, currentViewer } from "@/lib/auth/access";
 import { buildDemoZip, DEMO_EXTRA_SCHEMA, generateDemoDataset } from "@/lib/demo/generate";
-import { createImportBatch, importZip } from "@/lib/engine/import";
+import { createImportBatch } from "@/lib/engine/import";
+import { storageConfigured, uploadObject } from "@/lib/storage";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -40,6 +42,9 @@ export async function POST(request: Request) {
   };
   const sourceId = body.sourceId;
   if (!sourceId) return NextResponse.json({ error: "缺少 sourceId" }, { status: 400 });
+  if (!storageConfigured()) {
+    return NextResponse.json({ error: "对象存储未配置，无法导入示例数据" }, { status: 503 });
+  }
 
   if (!(await canAccessSource(viewer, sourceId))) {
     return NextResponse.json({ error: "数据源不存在" }, { status: 404 });
@@ -68,20 +73,21 @@ export async function POST(request: Request) {
     );
   }
 
-  const batchId = await createImportBatch(
-    sourceId,
-    `demo-car-assistant-${dataset.sessions}s.zip`,
-    viewer.userId,
-  );
+  // Staged in the bucket and queued like any other upload, so the sample data
+  // exercises exactly the path a real import takes — and survives a restart.
+  const fileName = `demo-car-assistant-${dataset.sessions}s.zip`;
+  const key = `imports/${sourceId}/${randomUUID()}/${fileName}`;
+  try {
+    await uploadObject(key, zip, "application/zip");
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return NextResponse.json({ error: `示例数据写入对象存储失败：${message}` }, { status: 500 });
+  }
 
-  void importZip(
-    sourceId,
-    { kind: "buffer", data: zip.buffer as ArrayBuffer },
-    `demo-car-assistant-${dataset.sessions}s.zip`,
-    viewer.userId,
-    () => {},
-    batchId,
-  ).catch((e: unknown) => console.error("[demo import] failed:", e instanceof Error ? e.message : e));
+  const batchId = await createImportBatch(sourceId, fileName, viewer.userId, {
+    status: "pending",
+    sourceObject: key,
+  });
 
   return NextResponse.json({
     batchId,

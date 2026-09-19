@@ -14,6 +14,7 @@ import {
   Info,
   Music4,
   Ban,
+  RotateCcw,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -27,6 +28,7 @@ import {
   pendingUpload,
   uploadArchive,
 } from "@/lib/upload/multipart";
+import { retryBatch } from "@/lib/actions/sources";
 import type { JsonObject } from "@/lib/types";
 
 interface Batch extends JsonObject {
@@ -43,10 +45,12 @@ interface Batch extends JsonObject {
   created_at: string;
   finished_at: string | null;
   progress_detail: JsonObject | null;
+  source_object: string | null;
 }
 
 const STAGE_NOTE: Record<string, string> = {
-  queued: "排队中",
+  queued: "等待 Worker 认领",
+  claimed: "Worker 已认领",
   unzip: "解压压缩包",
   bundle: "按 session 归并",
   write: "写入会话记录",
@@ -72,6 +76,7 @@ export function ImportPanel({
   const [percent, setPercent] = useState(0);
   const [note, setNote] = useState("");
   const [seeding, setSeeding] = useState(false);
+  const [retrying, setRetrying] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const fileRef = useRef<File | null>(null);
@@ -115,7 +120,7 @@ export function ImportPanel({
           },
         });
 
-        setNote("上传完成，正在提交导入…");
+        setNote("上传完成，正在排队导入…");
         const res = await fetch(`/api/sources/${sourceId}/import`, {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -124,7 +129,7 @@ export function ImportPanel({
         const json = (await res.json()) as { batchId?: string; error?: string };
         if (!res.ok || !json.batchId) throw new Error(json.error ?? "导入提交失败");
 
-        toast.success("压缩包已入库，正在后台解析导入");
+        toast.success("压缩包已上传，已排队等待 Worker 解析导入");
         setPercent(100);
         router.refresh();
       } catch (e) {
@@ -156,6 +161,19 @@ export function ImportPanel({
     const file = fileRef.current;
     if (file) await discardUpload(sourceId, file);
   }, [sourceId]);
+
+  async function retry(batchId: string) {
+    setRetrying(batchId);
+    try {
+      await retryBatch(batchId);
+      toast.success("已重新排队，Worker 会用原来的压缩包再导入一次");
+      router.refresh();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "重试失败");
+    } finally {
+      setRetrying(null);
+    }
+  }
 
   async function seedDemo() {
     setSeeding(true);
@@ -359,7 +377,8 @@ export function ImportPanel({
         <CardHeader>
           <CardTitle className="text-sm font-semibold">导入批次</CardTitle>
           <CardDescription className="text-[12.5px]">
-            每次上传生成一个批次；状态每 2.5 秒自动刷新。删除批次会连带清理其写入的数据。
+            每次上传生成一个批次，由后台 Worker 排队解析；状态每 2.5 秒自动刷新。
+            失败的批次会保留压缩包，可直接重试，不用重新上传。删除批次会连带清理其写入的数据与压缩包。
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-2.5">
@@ -388,11 +407,27 @@ export function ImportPanel({
                     <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{b.file_name ?? "—"}</span>
                     <StatusBadge status={b.status} />
                     <span className="num text-[11.5px] text-muted-foreground">{formatDate(b.created_at)}</span>
+                    {b.status === "failed" && b.source_object && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-7"
+                        disabled={retrying === b.id}
+                        onClick={() => void retry(b.id)}
+                      >
+                        {retrying === b.id ? (
+                          <Loader2 className="size-3.5 animate-spin" />
+                        ) : (
+                          <RotateCcw className="size-3.5" />
+                        )}
+                        重试
+                      </Button>
+                    )}
                   </div>
 
                   {active && (
                     <div className="mt-2.5 flex items-center gap-2 pl-[26px] text-[12px] text-muted-foreground">
-                      <Progress value={60} className="h-1 flex-1" />
+                      <Progress value={b.status === "pending" ? 8 : 60} className="h-1 flex-1" />
                       <span>{STAGE_NOTE[stage] ?? stage ?? "处理中"}</span>
                     </div>
                   )}

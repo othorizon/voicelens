@@ -219,7 +219,7 @@ export async function listBatches(dataSourceId: string) {
   return query<JsonObject>(
     `select id, data_source_id, file_name, status, total_entries, created_sessions,
             created_messages, uploaded_audios, failed_audios, skipped, error,
-            progress_detail, created_by, created_at, finished_at
+            progress_detail, source_object, created_by, created_at, finished_at
      from import_batches
      where data_source_id = $1
      order by created_at desc`,

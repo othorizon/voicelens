@@ -6,8 +6,10 @@ import {
   requireSourceAccess,
   requireBatchAccess,
   ActionError,
+  fail,
 } from "./common";
 import { callJson, execute, one, scalar } from "@/lib/db";
+import { deleteObject } from "@/lib/storage";
 import { defaultGraph } from "@/lib/workflow/graph";
 import type { ExtraFieldDef } from "@/lib/types";
 
@@ -158,6 +160,13 @@ export async function deleteDataSource(id: string): Promise<void> {
 export async function deleteBatch(batchId: string): Promise<{ messages: number; sessions: number }> {
   const { dataSourceId } = await requireBatchAccess(batchId);
 
+  // Read the staged archive's key before the row goes; a failed batch still
+  // holds one, and nothing else would ever clean it up.
+  const staged = await scalar<string | null>(
+    `select source_object from import_batches where id = $1`,
+    [batchId],
+  );
+
   let result: { deleted_messages?: number; deleted_sessions?: number };
   try {
     result =
@@ -169,8 +178,55 @@ export async function deleteBatch(batchId: string): Promise<{ messages: number; 
     throw new ActionError(`删除批次失败：${(err as Error).message}`);
   }
 
+  if (staged) await deleteObject(staged).catch(() => {});
+
   revalidatePath(`/sources/${dataSourceId}`);
   revalidatePath(`/sources/${dataSourceId}/data`);
   revalidatePath("/sources");
   return { messages: result.deleted_messages ?? 0, sessions: result.deleted_sessions ?? 0 };
+}
+
+/**
+ * Re-queue a failed import against the archive it already uploaded.
+ *
+ * The failed batch may have written some of its rows before it died, and
+ * message seq numbers are unique per session, so a plain re-run would collide.
+ * `delete_import_batch` clears what it wrote (and the batch row), then the
+ * same object is queued as a fresh batch — no re-upload.
+ */
+export async function retryBatch(batchId: string): Promise<{ batchId: string }> {
+  const { dataSourceId } = await requireBatchAccess(batchId);
+
+  const row = await one<{ status: string; source_object: string | null; file_name: string | null }>(
+    `select status, source_object, file_name from import_batches where id = $1`,
+    [batchId],
+  );
+  if (!row.source_object) fail("这个批次没有保留压缩包，无法重试，请重新上传");
+  if (row.status === "pending" || row.status === "processing") fail("这个批次还在进行中");
+
+  const { userId } = await requireSession();
+
+  try {
+    await callJson("delete_import_batch", [batchId]);
+    const created = await one<{ id: string }>(
+      `insert into import_batches
+         (data_source_id, file_name, status, created_by, progress_detail, source_object, heartbeat_at)
+       values ($1, $2, 'pending', $3, $4::jsonb, $5, now())
+       returning id`,
+      [
+        dataSourceId,
+        row.file_name,
+        userId,
+        JSON.stringify({ step: "queued" }),
+        row.source_object,
+      ],
+    );
+
+    revalidatePath(`/sources/${dataSourceId}`);
+    revalidatePath(`/sources/${dataSourceId}/import`);
+    return { batchId: created.id };
+  } catch (err) {
+    if (err instanceof ActionError) throw err;
+    throw new ActionError(`重试导入失败：${(err as Error).message}`);
+  }
 }

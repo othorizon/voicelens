@@ -1,22 +1,22 @@
 import { NextResponse } from "next/server";
 import { canAccessSource, currentViewer } from "@/lib/auth/access";
-import { importZip, createImportBatch } from "@/lib/engine/import";
+import { createImportBatch } from "@/lib/engine/import";
 import { storageConfigured } from "@/lib/storage";
 
 export const runtime = "nodejs";
-export const maxDuration = 300;
 
 /**
  * POST /api/sources/[id]/import
- * JSON: { key: string, fileName?: string, mode?: "background" | "sync" }
+ * JSON: { key: string, fileName?: string }
  *
- * Starts an import from an archive the browser has already uploaded to the
+ * Queues an import of an archive the browser has already uploaded to the
  * bucket (see /api/sources/[id]/uploads). The request carries only the object
- * key, so the size of the archive is not a property of this request at all.
+ * key, so neither the size of the archive nor the length of the import is a
+ * property of this request.
  *
- * Creates the batch row, then runs the parse + storage unpack in the
- * background and returns the batch id immediately so the UI can poll for
- * progress.
+ * This only writes the 'pending' batch row. The Worker claims it and does the
+ * unpacking, which is what keeps an import alive across a deploy or a restart
+ * of the web process.
  */
 export async function POST(request: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id: dataSourceId } = await ctx.params;
@@ -46,25 +46,11 @@ export async function POST(request: Request, ctx: { params: Promise<{ id: string
     return NextResponse.json({ error: "仅支持 .zip 压缩包（内含 JSONL 与音频文件）" }, { status: 400 });
   }
 
-  const mode = String(body.mode ?? "background");
-  const source = { kind: "object", path: key } as const;
-
   try {
-    const batchId = await createImportBatch(dataSourceId, fileName, viewer.userId);
-
-    if (mode === "sync") {
-      const result = await importZip(dataSourceId, source, fileName, viewer.userId, () => {}, batchId);
-      return NextResponse.json({ ...result, batchId });
-    }
-
-    // The connection pool is process-wide, so this keeps running after the
-    // response is sent; progress lands on the batch row for the UI to poll.
-    void importZip(dataSourceId, source, fileName, viewer.userId, () => {}, batchId).catch(
-      (e: unknown) => {
-        console.error("[import] background failure:", e instanceof Error ? e.message : e);
-      },
-    );
-
+    const batchId = await createImportBatch(dataSourceId, fileName, viewer.userId, {
+      status: "pending",
+      sourceObject: key,
+    });
     return NextResponse.json({ batchId });
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);

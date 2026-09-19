@@ -1,11 +1,12 @@
 /**
- * Background analysis worker.
+ * Background worker.
  *
- * Polls Postgres for three kinds of jobs and runs them out-of-band so the web
+ * Polls Postgres for four kinds of jobs and runs them out-of-band so the web
  * app never holds a long HTTP request:
- *   1. planning_jobs      -> AI 规划，产出 analysis_templates 新版本
- *   2. template_previews  -> 基于模板 + 抽样数据生成预览报告
- *   3. analysis_tasks     -> 全量三层分析与报告输出
+ *   1. import_batches     -> 解压对象存储里的压缩包并入库
+ *   2. planning_jobs      -> AI 规划，产出 analysis_templates 新版本
+ *   3. template_previews  -> 基于模板 + 抽样数据生成预览报告
+ *   4. analysis_tasks     -> 全量三层分析与报告输出
  *
  * It connects to the database directly with the same credentials as the web
  * app, so there is no service account to provision.
@@ -14,6 +15,7 @@ import "dotenv/config";
 import { closePool, execute, maybeOne, one, query, scalar } from "../src/lib/db";
 import { planTemplate, buildPreview, fallbackTemplate, type DataSourceLike } from "../src/lib/engine/plan";
 import { runTask, log } from "../src/lib/engine/executor";
+import { importZip } from "../src/lib/engine/import";
 import { configFromGraph, normalizeGraph } from "../src/lib/workflow/graph";
 import type { WorkflowConfig } from "../src/lib/workflow/definition";
 import type { ExtraFieldDef, JsonObject } from "../src/lib/types";
@@ -32,13 +34,15 @@ async function claim<T extends { id: string }>(
   setClause: string,
   params: unknown[] = [],
   from = "pending",
+  to = "running",
+  where = "",
 ): Promise<T | null> {
   const rows = await query<T>(
     `update ${table}
-     set status = 'running'${setClause ? `, ${setClause}` : ""}
+     set status = '${to}'${setClause ? `, ${setClause}` : ""}
      where id = (
        select id from ${table}
-       where status = $1
+       where status = $1${where ? ` and ${where}` : ""}
        order by created_at
        for update skip locked
        limit 1
@@ -69,6 +73,72 @@ async function loadConfig(workflowId: string | null): Promise<WorkflowConfig> {
   if (!workflowId) return configFromGraph(null);
   const graph = await scalar<unknown>(`select graph from workflows where id = $1`, [workflowId]);
   return configFromGraph(normalizeGraph(graph) as never);
+}
+
+/* --------------------------------------------------------------- import */
+
+interface ImportBatch extends JsonObject {
+  id: string;
+  data_source_id: string;
+  file_name: string | null;
+  source_object: string | null;
+  created_by: string | null;
+}
+
+/**
+ * A 'processing' batch is only abandoned once its heartbeat has gone quiet —
+ * a live import bumps it every few seconds. Checking the heartbeat rather
+ * than "was running when I booted" is what lets several Workers share the
+ * queue without one declaring another's in-flight import dead.
+ */
+const IMPORT_STALE_AFTER = "5 minutes";
+
+async function claimImport(): Promise<ImportBatch | null> {
+  return claim<ImportBatch>(
+    "import_batches",
+    "heartbeat_at = now(), progress_detail = $2::jsonb",
+    [JSON.stringify({ step: "claimed" })],
+    "pending",
+    "processing",
+    // A batch with no object is one the web process is running itself (the
+    // e2e script); the Worker has nothing to read.
+    "source_object is not null",
+  );
+}
+
+async function handleImport(batch: ImportBatch) {
+  if (!batch.source_object) throw new Error("批次没有记录对象存储路径");
+  const result = await importZip(
+    batch.data_source_id,
+    { kind: "object", path: batch.source_object },
+    batch.file_name ?? "upload.zip",
+    batch.created_by,
+    (m, extra) => console.log(`[worker] import ${batch.id}: ${m}`, extra ?? ""),
+    batch.id,
+  );
+  console.log(
+    `[worker] import ${batch.id}: ${result.sessions} 会话 / ${result.messages} 消息 / ${result.audios} 音频`,
+  );
+}
+
+/**
+ * Fail the imports whose Worker died mid-unpack. Re-running one is not safe —
+ * the batch has already written some of its rows, and message seq numbers are
+ * unique per session — so the batch is marked failed with its archive left in
+ * the bucket, and the import page offers a retry that clears the half-written
+ * rows first.
+ */
+async function sweepStaleImports() {
+  const n = await execute(
+    `update import_batches
+     set status = 'failed',
+         error = 'Worker 在导入过程中中断。压缩包仍保留在对象存储中，可在导入页点「重试」继续。',
+         finished_at = now()
+     where status = 'processing'
+       and source_object is not null
+       and heartbeat_at < now() - interval '${IMPORT_STALE_AFTER}'`,
+  );
+  if (n) console.log(`[worker] marked ${n} stalled import(s) as failed`);
 }
 
 /* ------------------------------------------------------------ planning */
@@ -283,6 +353,23 @@ async function handleTask(job: TaskRow) {
 /* ---------------------------------------------------------------- loop */
 
 async function tick() {
+  await sweepStaleImports();
+
+  const batch = await claimImport();
+  if (batch) {
+    active.add(batch.id);
+    void run("import", batch.id, () => handleImport(batch), async (err) => {
+      // importZip already records its own failures; this covers a throw on the
+      // way in, before it owns the row.
+      await execute(
+        `update import_batches
+         set status = 'failed', error = coalesce(error, $2), finished_at = now()
+         where id = $1 and status <> 'failed'`,
+        [batch.id, err.slice(0, 1000)],
+      );
+    });
+  }
+
   const planning = await claim<PlanningJob>("planning_jobs", "started_at = now()");
   if (planning) {
     active.add(planning.id);

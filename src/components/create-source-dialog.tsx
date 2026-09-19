@@ -84,6 +84,10 @@ export function CreateSourceDialog({ children }: { children?: React.ReactNode })
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               rows={7}
+              // The shared Textarea grows with its content. Cap it here so a
+              // long business description scrolls inside the field instead of
+              // stretching the dialog past the window.
+              className="max-h-[38svh] overflow-y-auto"
               placeholder={
                 "描述这批数据是什么业务、对话双方是谁、用户来完成什么任务。\n\n例如：\n这是新能源汽车车机语音助手的真实用户对话。用户通过语音控制导航、音乐、空调、车窗，也会闲聊。系统为 ASR-LLM-TTS 三段式，常见问题是 ASR 把车内噪音误识别、TTS 播报被用户打断、多轮指代消解失败。我们希望了解：用户最常用哪些技能、哪些指令容易失败、打断率高不高、整体体验如何。"
               }
