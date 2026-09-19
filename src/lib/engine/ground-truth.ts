@@ -12,7 +12,10 @@ import type { ExtraFieldDef } from "@/lib/types";
 export interface HistogramEntry {
   key: string;
   values: { name: string; value: number }[];
+  /** 1 = categorical counts, 2 = numeric summary. */
   kind?: number;
+  /** Values excluded because they did not match the field's chosen type. */
+  mixed_count?: number;
 }
 
 export interface GroundTruthMetric {

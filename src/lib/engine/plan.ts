@@ -637,6 +637,7 @@ export async function extraHistogramForSessions(
     key: r.key,
     values: (r.values ?? []).slice(0, 16),
     kind: r.kind,
+    mixed_count: r.mixed_count,
   }));
 }
 
