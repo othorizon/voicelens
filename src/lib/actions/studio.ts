@@ -192,8 +192,8 @@ export async function startPreview(
   try {
     created = await one<{ id: string }>(
       `insert into template_previews
-         (template_id, data_source_id, status, params, progress, sessions, concurrency, created_by)
-       values ($1, $2, 'pending', $3::jsonb, $4::jsonb, $5, $6, $7)
+         (template_id, data_source_id, status, params, progress, created_by)
+       values ($1, $2, 'pending', $3::jsonb, $4::jsonb, $5)
        returning id`,
       [
         templateId,
@@ -204,8 +204,6 @@ export async function startPreview(
           concurrency: params.concurrency ?? 3,
         }),
         JSON.stringify({ stage: "queued", done: 0, total: sessions }),
-        sessions,
-        params.concurrency ?? 3,
         userId,
       ],
     );

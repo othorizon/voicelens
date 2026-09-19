@@ -162,8 +162,8 @@ async function main() {
     if (!templateId) throw new Error("no template, cannot preview");
     const pv = await one<{ id: string }>(
       `insert into template_previews
-         (template_id, data_source_id, status, params, progress, sessions, concurrency, created_by)
-       values ($1, $2, 'pending', $3::jsonb, $4::jsonb, 8, 3, $5)
+         (template_id, data_source_id, status, params, progress, created_by)
+       values ($1, $2, 'pending', $3::jsonb, $4::jsonb, $5)
        returning id`,
       [
         templateId,

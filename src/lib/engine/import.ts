@@ -233,7 +233,8 @@ export async function importZip(
           session_id: sessionPk,
           seq: offset + m.seq,
           role: m.role,
-          content: JSON.stringify(m.content ?? m.contentText),
+          // content is NOT NULL: fall back to the extracted text, then to "".
+          content: JSON.stringify(m.content ?? m.contentText ?? ""),
           content_text: m.contentText,
           occurred_at: m.occurredAt,
           audio_path: uploads.pathOf.get(m) ?? null,
