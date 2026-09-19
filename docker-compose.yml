@@ -1,0 +1,32 @@
+# 一条命令起 Web + Worker：同一个镜像、同一套环境变量，两个容器各自重启与扩缩。
+#
+#   cp .env.local.example .env.local        # 填数据库 / 对象存储 / 模型凭据
+#   docker compose run --rm web migrate     # 首次部署：建表建函数（幂等）
+#   docker compose up -d --build            # 起服务，访问 http://<host>:3000
+#   docker compose logs -f worker           # 跟 Worker 日志
+#   docker compose up -d --scale worker=3   # Worker 不够快就加，队列自带 skip locked
+#
+# 默认用 Dockerfile_cn（国内源 + UTC+8）；官方源与 UTC 用：
+#   DOCKERFILE=Dockerfile docker compose up -d --build
+#
+# PostgreSQL 与对象存储都在 compose 之外，容器本身无状态，不需要挂卷。
+
+x-voicelens: &voicelens
+  build:
+    context: .
+    dockerfile: ${DOCKERFILE:-Dockerfile_cn}
+  image: voicelens:latest
+  env_file: .env.local
+  restart: unless-stopped
+
+services:
+  web:
+    <<: *voicelens
+    command: web
+    # 换端口要改两处：这里的宿主机侧，以及 .env.local 里的 PORT
+    ports:
+      - "3000:3000"
+
+  worker:
+    <<: *voicelens
+    command: worker

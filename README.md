@@ -72,21 +72,56 @@ npm run worker                     # 后台 Worker（另开一个进程，必须
 | `Dockerfile` | 能直连官方源 | npm 官方源，时区 UTC |
 | `Dockerfile_cn` | 国内 | npm 源 `registry.npmmirror.com`、apt 源 `mirrors.aliyun.com`，时区 `Asia/Shanghai`（UTC+8） |
 
-一个镜像承载三种角色，用第一个参数选择：`web`（默认）/ `worker` / `migrate`。
+一个镜像承载四种角色，用第一个参数选择：`web`（默认）/ `worker` / `all` / `migrate`。
+
+### 方式一：compose，一条命令两个容器（推荐）
 
 ```bash
-docker build -f Dockerfile_cn -t voicelens:latest .   # 官方源用 -f Dockerfile
+cp .env.local.example .env.local         # 填数据库、对象存储与模型凭据
+docker compose run --rm web migrate      # 首次部署：建表建函数（幂等）
+docker compose up -d --build             # Web + Worker，访问 http://<host>:3000
+```
 
+默认走 `Dockerfile_cn`；官方源与 UTC 用 `DOCKERFILE=Dockerfile docker compose up -d --build`。
+Worker 跑不过来就 `docker compose up -d --scale worker=3`——队列用 `for update skip locked`
+领作业，多实例不会抢到同一个任务。
+
+### 方式二：一个容器跑全部（单机省事）
+
+```bash
+docker build -f Dockerfile_cn -t voicelens:latest .
+docker run -d --name voicelens --restart unless-stopped \
+  --env-file .env.local -e VOICELENS_MIGRATE_ON_START=true \
+  -p 3000:3000 voicelens:latest all
+```
+
+`all` 在一个容器里起 Web 与 Worker 两个进程，任一进程退出就把另一个收掉、整体退出，
+交给 `--restart` 拉起——避免「容器还在但 Worker 已经死了，任务只排队不执行」。
+代价是日志混在一起、不能只重启或只扩容其中一个，数据量上来了建议换方式一。
+`VOICELENS_MIGRATE_ON_START=true` 会在起服务前跑一次迁移（`db/apply.ts` 没有互斥锁，
+同一个库别让两个容器同时开这个开关）。
+
+### 方式三：手动两个容器
+
+```bash
 docker run --rm     --env-file .env.local                                voicelens:latest migrate
 docker run -d --name voicelens-web    --env-file .env.local -p 3000:3000 voicelens:latest
 docker run -d --name voicelens-worker --env-file .env.local              voicelens:latest worker
 ```
 
+### 为什么 Web 与 Worker 要分开
+
+Web 只接受请求、写作业；Worker 跑的是几分钟到几十分钟、反复调模型的三层分析。合在一个进程里，
+长任务会占住事件循环与连接池，页面响应和 3 秒一次的进度轮询都会被拖慢；分开还能各自重启、
+只给 Worker 扩容（Web 一份、Worker 多份）。`all` 只是把这两个进程放进同一个容器，并没有合成一个进程。
+
+### 通用说明
+
 - `--env-file` 直接读 `.env.local`，但**值不要加引号**：docker 会把引号当字面量读进去。
-- Web 与 Worker 是两个容器、同一套环境变量；Worker 不常驻的话任务只会排队不执行。
-  `migrate --dry` 只列待执行的迁移；镜像里的其它命令原样执行，例如
-  `docker run --rm --env-file .env.local voicelens:latest node_modules/.bin/tsx scripts/rerender-report.ts <task-id>`。
+- Worker 必须常驻，否则任务只会排队不执行；Worker 重启会自动把孤儿作业重新入队。
 - 容器无状态：数据在 Postgres、音频在对象存储，不用挂卷；进程以非 root（uid 1000）运行。
+- `migrate --dry` 只列待执行的迁移；镜像里的其它命令原样执行，例如
+  `docker run --rm --env-file .env.local voicelens:latest node_modules/.bin/tsx scripts/rerender-report.ts <task-id>`。
 - 镜像源与时区都是 build-arg，换一家只改参数：
   `--build-arg NPM_REGISTRY=https://mirrors.cloud.tencent.com/npm/`、`--build-arg APT_MIRROR=mirrors.tuna.tsinghua.edu.cn`、`--build-arg TZ=UTC`。
 - 基础镜像（docker.io）拉不动时，给 dockerd 配 `registry-mirrors`，或
