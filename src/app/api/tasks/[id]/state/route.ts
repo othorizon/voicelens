@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { maybeOne, query } from "@/lib/db";
-import { currentUser } from "@/lib/auth";
+import { currentViewer, resolveOwnedRow } from "@/lib/auth/access";
 import type { JsonObject } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -9,7 +9,11 @@ export const dynamic = "force-dynamic";
 /** GET /api/tasks/[id]/state — live status polling (task row, recent logs, result tallies). */
 export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
-  if (!(await currentUser())) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  const viewer = await currentViewer();
+  if (!viewer) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  if (!(await resolveOwnedRow(viewer, "analysis_tasks", id))) {
+    return NextResponse.json({ error: "任务不存在" }, { status: 404 });
+  }
 
   const after = new URL(req.url).searchParams.get("after");
   const afterId = after !== null && Number.isFinite(Number(after)) ? Number(after) : null;

@@ -1,7 +1,11 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { requireSession, ActionError } from "./common";
+import {
+  requireSourceAccess,
+  requireTemplateAccess,
+  ActionError,
+} from "./common";
 import { count, execute, maybeOne, one, tx } from "@/lib/db";
 
 export interface PlanningParams {
@@ -17,11 +21,17 @@ export async function startPlanning(
   workflowId: string | null,
   params: PlanningParams = {},
 ): Promise<{ jobId: string }> {
-  const { userId } = await requireSession();
-  const source = await maybeOne<{ id: string }>(`select id from data_sources where id = $1`, [
-    dataSourceId,
-  ]);
-  if (!source) throw new ActionError("数据源不存在");
+  const { userId } = await requireSourceAccess(dataSourceId);
+
+  // A workflow from another member's source would be read by the worker, so it
+  // has to belong to the source the caller just cleared.
+  if (workflowId) {
+    const workflow = await maybeOne<{ id: string }>(
+      `select id from workflows where id = $1 and data_source_id = $2`,
+      [workflowId, dataSourceId],
+    );
+    if (!workflow) throw new ActionError("工作流不存在");
+  }
 
   const sessions = await count(`select count(*) from sessions where data_source_id = $1`, [
     dataSourceId,
@@ -59,14 +69,15 @@ export async function startReplanning(
   feedback: string,
   params: PlanningParams = {},
 ): Promise<{ jobId: string }> {
-  const { userId } = await requireSession();
+  const { session, dataSourceId } = await requireTemplateAccess(parentTemplateId);
+  const userId = session.userId;
   if (!feedback.trim()) throw new ActionError("请填写修改建议");
 
-  const parent = await maybeOne<{ data_source_id: string; workflow_id: string | null }>(
-    `select data_source_id, workflow_id from analysis_templates where id = $1`,
+  // The guard already proved this row exists and is the caller's.
+  const parent = await one<{ workflow_id: string | null }>(
+    `select workflow_id from analysis_templates where id = $1`,
     [parentTemplateId],
   );
-  if (!parent) throw new ActionError("模板不存在");
 
   let created: { id: string };
   try {
@@ -76,7 +87,7 @@ export async function startReplanning(
        values ($1, $2, 'revise', 'pending', $3::jsonb, $4, $5, $6)
        returning id`,
       [
-        parent.data_source_id,
+        dataSourceId,
         parent.workflow_id,
         JSON.stringify({
           sessionSamples: params.sessionSamples ?? 5,
@@ -92,17 +103,12 @@ export async function startReplanning(
   } catch (err) {
     throw new ActionError(`创建规划任务失败：${(err as Error).message}`);
   }
-  revalidatePath(`/sources/${parent.data_source_id}/studio`);
+  revalidatePath(`/sources/${dataSourceId}/studio`);
   return { jobId: created.id };
 }
 
 export async function confirmTemplate(templateId: string): Promise<void> {
-  await requireSession();
-  const tpl = await maybeOne<{ data_source_id: string }>(
-    `select data_source_id from analysis_templates where id = $1`,
-    [templateId],
-  );
-  if (!tpl) throw new ActionError("模板不存在");
+  const { dataSourceId } = await requireTemplateAccess(templateId);
 
   try {
     // Exactly one template per source may be `confirmed`, so archive the
@@ -111,7 +117,7 @@ export async function confirmTemplate(templateId: string): Promise<void> {
       await execute(
         `update analysis_templates set status = 'archived'
          where data_source_id = $1 and status = 'confirmed'`,
-        [tpl.data_source_id],
+        [dataSourceId],
         client,
       );
       await execute(`update analysis_templates set status = 'confirmed' where id = $1`, [templateId], client);
@@ -120,8 +126,8 @@ export async function confirmTemplate(templateId: string): Promise<void> {
     throw new ActionError(`确认模板失败：${(err as Error).message}`);
   }
 
-  revalidatePath(`/sources/${tpl.data_source_id}/studio`);
-  revalidatePath(`/sources/${tpl.data_source_id}`);
+  revalidatePath(`/sources/${dataSourceId}/studio`);
+  revalidatePath(`/sources/${dataSourceId}`);
 }
 
 export async function updateTemplatePrompt(
@@ -133,12 +139,8 @@ export async function updateTemplatePrompt(
     report_prompt?: string;
   },
 ): Promise<{ id: string; version: number }> {
-  const { userId } = await requireSession();
-  const tpl = await maybeOne<{ data_source_id: string; version: number }>(
-    `select data_source_id, version from analysis_templates where id = $1`,
-    [templateId],
-  );
-  if (!tpl) throw new ActionError("模板不存在");
+  const { session, dataSourceId } = await requireTemplateAccess(templateId);
+  const userId = session.userId;
 
   try {
     // Carry every unedited field over from the parent row, and take the next
@@ -169,7 +171,7 @@ export async function updateTemplatePrompt(
         userId,
       ],
     );
-    revalidatePath(`/sources/${tpl.data_source_id}/studio`);
+    revalidatePath(`/sources/${dataSourceId}/studio`);
     return { id: created.id, version: created.version };
   } catch (err) {
     throw new ActionError(`保存失败：${(err as Error).message}`);
@@ -180,12 +182,8 @@ export async function startPreview(
   templateId: string,
   params: { sessions?: number; useAudio?: boolean; concurrency?: number } = {},
 ): Promise<{ previewId: string }> {
-  const { userId } = await requireSession();
-  const tpl = await maybeOne<{ data_source_id: string }>(
-    `select data_source_id from analysis_templates where id = $1`,
-    [templateId],
-  );
-  if (!tpl) throw new ActionError("模板不存在");
+  const { session, dataSourceId } = await requireTemplateAccess(templateId);
+  const userId = session.userId;
 
   const sessions = params.sessions ?? 12;
   let created: { id: string };
@@ -197,7 +195,7 @@ export async function startPreview(
        returning id`,
       [
         templateId,
-        tpl.data_source_id,
+        dataSourceId,
         JSON.stringify({
           sessions,
           useAudio: params.useAudio ?? false,
@@ -210,6 +208,6 @@ export async function startPreview(
   } catch (err) {
     throw new ActionError(`创建预览失败：${(err as Error).message}`);
   }
-  revalidatePath(`/sources/${tpl.data_source_id}/studio`);
+  revalidatePath(`/sources/${dataSourceId}/studio`);
   return { previewId: created.id };
 }

@@ -9,6 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { cn, formatDate } from "@/lib/utils";
 import type { JsonObject } from "@/lib/types";
 import { AudioChip } from "@/components/audio-chip";
+import { requireSourcePage } from "@/lib/actions/common";
 
 export const metadata: Metadata = { title: "会话数据" };
 export const dynamic = "force-dynamic";
@@ -23,6 +24,7 @@ export default async function DataPage({
   searchParams: Promise<{ q?: string; user?: string; session?: string; page?: string; sort?: string }>;
 }) {
   const { id } = await params;
+  await requireSourcePage(id);
   const sp = await searchParams;
   const page = Math.max(1, Number(sp.page ?? 1));
   const q = sp.q?.trim() ?? "";

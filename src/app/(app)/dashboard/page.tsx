@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { count } from "@/lib/db";
 import { listDataSources, listTasks } from "@/lib/queries";
+import { ownerScope, requireSession } from "@/lib/actions/common";
 import { PageHeader, StatCard, StatusBadge, EmptyState } from "@/components/ui-kit";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -23,12 +24,18 @@ export const metadata: Metadata = { title: "概览" };
 export const dynamic = "force-dynamic";
 
 export default async function DashboardPage() {
+  // A member sees only the data sources they created, and everything under
+  // them; owner/admin get an unfiltered scope.
+  const scope = ownerScope(await requireSession());
   const [sources, tasks, running] = await Promise.all([
-    listDataSources(),
-    listTasks(8),
+    listDataSources(scope),
+    listTasks(scope, 8),
     count(
-      `select count(*) from analysis_tasks
-       where status in ('pending', 'running', 'aggregating', 'reporting')`,
+      `select count(*) from analysis_tasks t
+       join data_sources d on d.id = t.data_source_id
+       where t.status in ('pending', 'running', 'aggregating', 'reporting')
+         and ($1::uuid is null or d.created_by = $1)`,
+      [scope],
     ),
   ]);
 

@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { maybeOne } from "@/lib/db";
 import { sourceStats } from "@/lib/queries";
+import { requireSourcePage } from "@/lib/actions/common";
 import { SourceNav } from "@/components/source-nav";
 import { Button } from "@/components/ui/button";
 import { compactNumber } from "@/lib/utils";
@@ -27,6 +28,7 @@ export default async function SourceLayout({
   params: Promise<{ id: string }>;
 }) {
   const { id } = await params;
+  await requireSourcePage(id);
   const source = await maybeOne<{
     id: string;
     name: string;

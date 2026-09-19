@@ -3,6 +3,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { FileBarChart, ExternalLink, Download, Layers, Users, MessagesSquare } from "lucide-react";
 import { callJson, count as countRows, maybeOne } from "@/lib/db";
+import { requireTaskPage } from "@/lib/actions/common";
 import { TaskLive } from "@/components/task-live";
 import { DrillExplorer } from "@/components/drill-explorer";
 import { BarStrip, Donut } from "@/components/mini-charts";
@@ -18,6 +19,7 @@ export const dynamic = "force-dynamic";
 
 export default async function TaskDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
+  await requireTaskPage(id);
   // The embedded resources are left joins now, flattened back into the nested
   // shape this page already reads.
   const task = await maybeOne<JsonObject>(

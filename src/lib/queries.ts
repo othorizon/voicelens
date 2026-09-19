@@ -5,6 +5,13 @@ import type { ExtraFieldDef, JsonObject } from "@/lib/types";
  * Read paths shared by the pages. The joins that used to be PostgREST embedded
  * resources (`profiles(display_name, email)`) are plain left joins now, shaped
  * back into the nested objects the components already read.
+ *
+ * Anything that spans data sources takes an `ownerId` scope: null for an
+ * owner/admin (no filter), a user id for a member, which keeps them to the
+ * sources they created. Build it with `ownerScope()` from the caller's session
+ * rather than by hand. The per-source readers below take no scope — their
+ * caller has already cleared the source with `requireSourceAccess()`, and that
+ * one check covers every row hanging off it.
  */
 
 export interface DataSourceWithStats {
@@ -43,13 +50,15 @@ function creatorOf(row: JsonObject): { display_name: string | null; email: strin
     : null;
 }
 
-export async function listDataSources(): Promise<DataSourceWithStats[]> {
+export async function listDataSources(ownerId: string | null): Promise<DataSourceWithStats[]> {
   const rows = await query<JsonObject>(
     `select d.id, d.name, d.description, d.extra_schema, d.status, d.created_at, d.updated_at,
             d.created_by, p.display_name as creator_name, p.email as creator_email
      from data_sources d
      left join profiles p on p.id = d.created_by
+     where ($1::uuid is null or d.created_by = $1)
      order by d.created_at desc`,
+    [ownerId],
   );
   if (!rows.length) return [];
 
@@ -94,14 +103,15 @@ export async function sourceStats(
   } as JsonObject & { sessions: number; users: number; messages: number; audios: number };
 }
 
-export async function getDataSource(id: string) {
+/** Returns null when the source does not exist *or* is not the viewer's. */
+export async function getDataSource(id: string, ownerId: string | null) {
   const row = await maybeOne<JsonObject>(
     `select d.id, d.name, d.description, d.extra_schema, d.status, d.created_at, d.updated_at,
             d.created_by, p.display_name as creator_name, p.email as creator_email
      from data_sources d
      left join profiles p on p.id = d.created_by
-     where d.id = $1`,
-    [id],
+     where d.id = $1 and ($2::uuid is null or d.created_by = $2)`,
+    [id, ownerId],
   );
   if (!row) return null;
   return { ...row, profiles: creatorOf(row) } as JsonObject & {
@@ -113,15 +123,16 @@ export async function getDataSource(id: string) {
   };
 }
 
-export async function listWorkflows(dataSourceId?: string) {
+export async function listWorkflows(ownerId: string | null, dataSourceId?: string) {
   const rows = await query<JsonObject>(
     `select w.id, w.data_source_id, w.name, w.graph, w.config, w.is_active,
             w.created_at, w.updated_at, d.name as source_name
      from workflows w
-     left join data_sources d on d.id = w.data_source_id
+     join data_sources d on d.id = w.data_source_id
      where ($1::uuid is null or w.data_source_id = $1)
+       and ($2::uuid is null or d.created_by = $2)
      order by w.updated_at desc`,
-    [dataSourceId ?? null],
+    [dataSourceId ?? null, ownerId],
   );
   return rows.map((r) => ({
     ...r,
@@ -140,18 +151,19 @@ export async function listTemplates(dataSourceId: string) {
   );
 }
 
-export async function listTasks(limit = 50, dataSourceId?: string) {
+export async function listTasks(ownerId: string | null, limit = 50, dataSourceId?: string) {
   const rows = await query<JsonObject>(
     `select t.id, t.name, t.status, t.stage, t.progress, t.stats, t.error, t.created_at,
             t.started_at, t.finished_at, t.data_source_id, t.template_id, t.scope_type,
             t.range_start, t.range_end, d.name as source_name, p.display_name as creator_name
      from analysis_tasks t
-     left join data_sources d on d.id = t.data_source_id
+     join data_sources d on d.id = t.data_source_id
      left join profiles p on p.id = t.created_by
      where ($2::uuid is null or t.data_source_id = $2)
+       and ($3::uuid is null or d.created_by = $3)
      order by t.created_at desc
      limit $1`,
-    [limit, dataSourceId ?? null],
+    [limit, dataSourceId ?? null, ownerId],
   );
   return rows.map((r) => ({
     ...r,

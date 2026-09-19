@@ -20,12 +20,14 @@ import { compactNumber, formatDate, relativeTime } from "@/lib/utils";
 import { Sparkline, BarStrip } from "@/components/mini-charts";
 import { DescriptionEditor } from "@/components/description-editor";
 import { BatchActions } from "@/components/batch-actions";
+import { requireSourcePage } from "@/lib/actions/common";
 
 export const metadata: Metadata = { title: "数据源概览" };
 export const dynamic = "force-dynamic";
 
 export default async function SourceOverviewPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
+  await requireSourcePage(id);
   const [source, stats, batches] = await Promise.all([
     maybeOne<{
       id: string;

@@ -2,6 +2,7 @@
 
 import { redirect } from "next/navigation";
 import { AuthError, registerUser, signIn, signOut as clearSession } from "@/lib/auth";
+import { canUseApp } from "@/lib/auth/roles";
 import { ActionError } from "./common";
 
 /**
@@ -22,14 +23,20 @@ export async function loginAction(email: string, password: string): Promise<void
   }
 }
 
+/**
+ * Returns whether the new account can use the app right away. Only the very
+ * first account does (it becomes the owner); every later one registers with no
+ * role and waits to be activated, so the form routes it to the holding page.
+ */
 export async function registerAction(
   email: string,
   password: string,
   displayName: string | null,
-): Promise<void> {
+): Promise<{ activated: boolean }> {
   try {
-    await registerUser(email, password, displayName);
+    const user = await registerUser(email, password, displayName);
     await signIn(email, password);
+    return { activated: canUseApp(user.role) };
   } catch (err) {
     toActionError(err);
   }

@@ -1,8 +1,13 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { requireSession, ActionError } from "./common";
-import { callJson, execute, maybeOne, one, scalar } from "@/lib/db";
+import {
+  requireSession,
+  requireSourceAccess,
+  requireBatchAccess,
+  ActionError,
+} from "./common";
+import { callJson, execute, one, scalar } from "@/lib/db";
 import { defaultGraph } from "@/lib/workflow/graph";
 import type { ExtraFieldDef } from "@/lib/types";
 
@@ -45,7 +50,7 @@ export async function updateDataSource(
   id: string,
   patch: { name?: string; description?: string },
 ): Promise<void> {
-  await requireSession();
+  await requireSourceAccess(id);
   if (patch.name === undefined && patch.description === undefined) return;
 
   try {
@@ -67,7 +72,7 @@ export async function updateDataSource(
 }
 
 export async function saveExtraSchema(id: string, schema: ExtraFieldDef[]): Promise<void> {
-  await requireSession();
+  await requireSourceAccess(id);
   for (const f of schema) {
     if (!f.name?.trim()) throw new ActionError("存在未命名的 extra 字段");
   }
@@ -86,7 +91,7 @@ export async function saveExtraSchema(id: string, schema: ExtraFieldDef[]): Prom
 }
 
 export async function inferSchemaFromData(id: string): Promise<ExtraFieldDef[]> {
-  await requireSession();
+  await requireSourceAccess(id);
   let data: { key: string; values: { name: string; value: number }[] }[] | null;
   try {
     data = await callJson<{ key: string; values: { name: string; value: number }[] }[]>(
@@ -129,8 +134,8 @@ function pretty(key: string) {
   return key.replace(/[_-]+/g, " ").replace(/\b[a-z]/g, (c) => c.toUpperCase());
 }
 
+// Private helper; every caller has already cleared `id` with requireSourceAccess.
 async function getExtraSchema(id: string): Promise<ExtraFieldDef[]> {
-  await requireSession();
   const schema = await scalar<ExtraFieldDef[]>(
     `select extra_schema from data_sources where id = $1`,
     [id],
@@ -139,7 +144,7 @@ async function getExtraSchema(id: string): Promise<ExtraFieldDef[]> {
 }
 
 export async function deleteDataSource(id: string): Promise<void> {
-  await requireSession();
+  await requireSourceAccess(id);
   try {
     // Sessions, messages, workflows, templates and tasks cascade from here.
     await execute(`delete from data_sources where id = $1`, [id]);
@@ -151,12 +156,7 @@ export async function deleteDataSource(id: string): Promise<void> {
 }
 
 export async function deleteBatch(batchId: string): Promise<{ messages: number; sessions: number }> {
-  await requireSession();
-  const batch = await maybeOne<{ id: string; data_source_id: string }>(
-    `select id, data_source_id from import_batches where id = $1`,
-    [batchId],
-  );
-  if (!batch) throw new ActionError("批次不存在");
+  const { dataSourceId } = await requireBatchAccess(batchId);
 
   let result: { deleted_messages?: number; deleted_sessions?: number };
   try {
@@ -169,8 +169,8 @@ export async function deleteBatch(batchId: string): Promise<{ messages: number; 
     throw new ActionError(`删除批次失败：${(err as Error).message}`);
   }
 
-  revalidatePath(`/sources/${batch.data_source_id}`);
-  revalidatePath(`/sources/${batch.data_source_id}/data`);
+  revalidatePath(`/sources/${dataSourceId}`);
+  revalidatePath(`/sources/${dataSourceId}/data`);
   revalidatePath("/sources");
   return { messages: result.deleted_messages ?? 0, sessions: result.deleted_sessions ?? 0 };
 }

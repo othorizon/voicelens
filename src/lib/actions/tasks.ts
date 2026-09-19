@@ -1,7 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { requireSession, ActionError } from "./common";
+import { requireSourceAccess, requireTaskAccess, ActionError } from "./common";
 import { execute, maybeOne, one } from "@/lib/db";
 import type { JsonObject } from "@/lib/types";
 
@@ -17,7 +17,7 @@ export interface CreateTaskInput {
 }
 
 export async function createAnalysisTask(input: CreateTaskInput): Promise<{ taskId: string }> {
-  const { userId } = await requireSession();
+  const { userId } = await requireSourceAccess(input.dataSourceId);
 
   const source = await maybeOne<{ id: string; name: string }>(
     `select id, name from data_sources where id = $1`,
@@ -25,14 +25,26 @@ export async function createAnalysisTask(input: CreateTaskInput): Promise<{ task
   );
   if (!source) throw new ActionError("数据源不存在");
 
+  // The template and workflow must belong to the source the caller just
+  // cleared, so neither id can be used to pull in another member's row.
+  if (input.workflowId) {
+    const workflow = await maybeOne<{ id: string }>(
+      `select id from workflows where id = $1 and data_source_id = $2`,
+      [input.workflowId, input.dataSourceId],
+    );
+    if (!workflow) throw new ActionError("工作流不存在");
+  }
+
   // Resolve which template to run with: explicit -> confirmed -> latest.
   type TemplateRef = { id: string; version: number; status: string };
   let template: TemplateRef | null = null;
   if (input.templateId) {
     template = await maybeOne<TemplateRef>(
-      `select id, version, status from analysis_templates where id = $1`,
-      [input.templateId],
+      `select id, version, status from analysis_templates
+       where id = $1 and data_source_id = $2`,
+      [input.templateId, input.dataSourceId],
     );
+    if (!template) throw new ActionError("模板不存在");
   }
 
   if (!template) {
@@ -94,7 +106,7 @@ export async function createAnalysisTask(input: CreateTaskInput): Promise<{ task
 }
 
 export async function cancelTask(taskId: string): Promise<void> {
-  await requireSession();
+  await requireTaskAccess(taskId);
   try {
     // Only an in-flight task can be cancelled; a finished one is left alone.
     await execute(
@@ -111,9 +123,8 @@ export async function cancelTask(taskId: string): Promise<void> {
 }
 
 export async function rerunTask(taskId: string): Promise<{ taskId: string }> {
-  const { userId } = await requireSession();
-  const exists = await maybeOne<{ id: string }>(`select id from analysis_tasks where id = $1`, [taskId]);
-  if (!exists) throw new ActionError("任务不存在");
+  const { session } = await requireTaskAccess(taskId);
+  const userId = session.userId;
 
   try {
     // Copy the source task's scope and config in one statement so a rerun can
@@ -137,7 +148,7 @@ export async function rerunTask(taskId: string): Promise<{ taskId: string }> {
 }
 
 export async function deleteTask(taskId: string): Promise<void> {
-  await requireSession();
+  await requireTaskAccess(taskId);
   try {
     // Logs, per-session/user results, the global result and reports cascade.
     await execute(`delete from analysis_tasks where id = $1`, [taskId]);

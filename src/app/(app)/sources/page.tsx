@@ -2,6 +2,7 @@ import Link from "next/link";
 import type { Metadata } from "next";
 import { Database, MessagesSquare, Users, ArrowUpRight, AudioLines } from "lucide-react";
 import { listDataSources } from "@/lib/queries";
+import { ownerScope, requireSession } from "@/lib/actions/common";
 import { PageHeader, EmptyState } from "@/components/ui-kit";
 import { Button } from "@/components/ui/button";
 import { CreateSourceDialog } from "@/components/create-source-dialog";
@@ -11,7 +12,7 @@ export const metadata: Metadata = { title: "数据源" };
 export const dynamic = "force-dynamic";
 
 export default async function SourcesPage() {
-  const sources = await listDataSources();
+  const sources = await listDataSources(ownerScope(await requireSession()));
 
   return (
     <>

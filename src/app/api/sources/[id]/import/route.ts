@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { maybeOne } from "@/lib/db";
-import { currentUser } from "@/lib/auth";
+import { canAccessSource, currentViewer } from "@/lib/auth/access";
 import { importZip, createImportBatch } from "@/lib/engine/import";
 
 export const runtime = "nodejs";
@@ -15,13 +14,11 @@ export const maxDuration = 300;
  */
 export async function POST(request: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id: dataSourceId } = await ctx.params;
-  const user = await currentUser();
-  if (!user) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
-
-  const source = await maybeOne<{ id: string }>(`select id from data_sources where id = $1`, [
-    dataSourceId,
-  ]);
-  if (!source) return NextResponse.json({ error: "data source not found" }, { status: 404 });
+  const viewer = await currentViewer();
+  if (!viewer) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  if (!(await canAccessSource(viewer, dataSourceId))) {
+    return NextResponse.json({ error: "data source not found" }, { status: 404 });
+  }
 
   let form: FormData;
   try {
@@ -45,16 +42,16 @@ export async function POST(request: Request, ctx: { params: Promise<{ id: string
 
   try {
     const buffer = await file.arrayBuffer();
-    const batchId = await createImportBatch(dataSourceId, file.name, user.id);
+    const batchId = await createImportBatch(dataSourceId, file.name, viewer.userId);
 
     if (mode === "sync") {
-      const result = await importZip(dataSourceId, buffer, file.name, user.id, () => {}, batchId);
+      const result = await importZip(dataSourceId, buffer, file.name, viewer.userId, () => {}, batchId);
       return NextResponse.json({ ...result, batchId });
     }
 
     // The connection pool is process-wide, so this keeps running after the
     // response is sent; progress lands on the batch row for the UI to poll.
-    void importZip(dataSourceId, buffer, file.name, user.id, () => {}, batchId).catch((e: unknown) => {
+    void importZip(dataSourceId, buffer, file.name, viewer.userId, () => {}, batchId).catch((e: unknown) => {
       console.error("[import] background failure:", e instanceof Error ? e.message : e);
     });
 

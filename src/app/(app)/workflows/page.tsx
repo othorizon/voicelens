@@ -3,6 +3,7 @@ import type { Metadata } from "next";
 import { Workflow, ArrowUpRight, Sparkles, Database } from "lucide-react";
 import { query } from "@/lib/db";
 import { listWorkflows } from "@/lib/queries";
+import { ownerScope, requireSession } from "@/lib/actions/common";
 import { PageHeader, EmptyState } from "@/components/ui-kit";
 import { Badge } from "@/components/ui/badge";
 import { configFromGraph, normalizeGraph } from "@/lib/workflow/graph";
@@ -12,10 +13,14 @@ export const metadata: Metadata = { title: "工作流" };
 export const dynamic = "force-dynamic";
 
 export default async function WorkflowsPage() {
+  const scope = ownerScope(await requireSession());
   const [workflows, sources] = await Promise.all([
-    listWorkflows(),
+    listWorkflows(scope),
     query<{ id: string; name: string }>(
-      `select id, name from data_sources order by created_at desc`,
+      `select id, name from data_sources
+       where ($1::uuid is null or created_by = $1)
+       order by created_at desc`,
+      [scope],
     ),
   ]);
   const sourceName = new Map(sources.map((s) => [s.id, s.name]));

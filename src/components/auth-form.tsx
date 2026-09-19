@@ -25,10 +25,17 @@ export function AuthForm({ mode }: { mode: "login" | "register" }) {
     try {
       // The password only ever travels to the server action; the browser holds
       // no database credential of any kind.
-      if (isRegister) await registerAction(email, password, name || null);
-      else await loginAction(email, password);
-      toast.success(isRegister ? "账号已创建，欢迎加入" : "登录成功");
-      router.replace("/dashboard");
+      if (isRegister) {
+        // Only the first account ever created is active on sign-up; the rest
+        // land on the holding page until an owner or admin assigns a role.
+        const { activated } = await registerAction(email, password, name || null);
+        toast.success(activated ? "账号已创建，欢迎加入" : "账号已创建，等待管理员开通权限");
+        router.replace(activated ? "/dashboard" : "/pending");
+      } else {
+        await loginAction(email, password);
+        toast.success("登录成功");
+        router.replace("/dashboard");
+      }
       router.refresh();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "操作失败");
@@ -57,7 +64,7 @@ export function AuthForm({ mode }: { mode: "login" | "register" }) {
         </h1>
         <p className="mt-1 mb-6 text-sm text-muted-foreground">
           {isRegister
-            ? "注册后即可访问团队工作区中的全部数据源与分析任务"
+            ? "第一个注册的账号成为工作区所有者；之后注册的账号需要由所有者或管理员开通权限"
             : "使用邮箱登录，进入你的分析工作台"}
         </p>
 

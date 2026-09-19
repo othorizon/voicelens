@@ -1,6 +1,7 @@
 import { cookies } from "next/headers";
 import { hash, verify } from "@node-rs/argon2";
 import { maybeOne, one } from "@/lib/db";
+import { asRole, type Role } from "./roles";
 import {
   SESSION_COOKIE,
   cookieOptions,
@@ -11,9 +12,11 @@ import {
 /**
  * Email/password authentication, replacing Supabase Auth.
  *
- * Every signed-in member shares one workspace, which is the model the app had
- * before: there is no per-row ownership to enforce, only the question of
- * whether the caller is signed in at all.
+ * This only answers "who is calling"; what they may see is decided by their
+ * role — see ./roles for the table and @/lib/actions/common for the guards
+ * that enforce it. The role is deliberately not carried in the session token,
+ * so a role change takes effect on the caller's very next request instead of
+ * when their cookie expires.
  *
  * Node-runtime only — argon2 is a native binding and the queries need the
  * Postgres pool. `middleware.ts` verifies sessions through ./token instead.
@@ -24,7 +27,7 @@ export interface AuthUser {
   email: string;
   display_name: string | null;
   avatar_color: string;
-  role: string;
+  role: Role;
 }
 
 // OWASP's argon2id baseline: 19 MiB, 2 passes, 1 lane.
@@ -49,11 +52,13 @@ export async function currentUser(): Promise<AuthUser | null> {
   const claims = await verifySessionToken(store.get(SESSION_COOKIE)?.value);
   if (!claims) return null;
 
-  // The token proves the session; this read proves the account still exists.
-  return maybeOne<AuthUser>(
+  // The token proves the session; this read proves the account still exists —
+  // and carries the current role, so a revoked account loses access at once.
+  const row = await maybeOne<AuthUser & { role: string }>(
     `select id, email, display_name, avatar_color, role from users where id = $1`,
     [claims.userId],
   );
+  return row ? { ...row, role: asRole(row.role) } : null;
 }
 
 export async function requireUser(): Promise<AuthUser> {
@@ -78,7 +83,7 @@ function normalizeEmail(email: string): string {
  * anywhere — `signIn` is this plus the cookie.
  */
 export async function verifyCredentials(email: string, password: string): Promise<AuthUser> {
-  const row = await maybeOne<AuthUser & { password_hash: string }>(
+  const row = await maybeOne<AuthUser & { role: string; password_hash: string }>(
     `select id, email, display_name, avatar_color, role, password_hash
      from users where lower(email) = $1`,
     [normalizeEmail(email)],
@@ -102,7 +107,7 @@ export async function verifyCredentials(email: string, password: string): Promis
     email: row.email,
     display_name: row.display_name,
     avatar_color: row.avatar_color,
-    role: row.role,
+    role: asRole(row.role),
   };
 }
 
@@ -114,8 +119,9 @@ export async function signIn(email: string, password: string): Promise<AuthUser>
 }
 
 /**
- * Create an account. Replaces the `register_user` RPC; the first account to be
- * created becomes the workspace owner.
+ * Create an account. Replaces the `register_user` RPC; the first account ever
+ * created becomes the workspace owner, and every account after it starts with
+ * no access at all until an owner or admin activates it.
  */
 export async function registerUser(
   email: string,
@@ -144,7 +150,7 @@ export async function registerUser(
         await hashPassword(password),
         displayName?.trim() || null,
         palette[Math.floor(Math.random() * palette.length)],
-        isFirst ? "owner" : "member",
+        isFirst ? "owner" : "none",
       ],
     );
   } catch (err) {

@@ -1,12 +1,14 @@
 import { notFound } from "next/navigation";
 import { maybeOne } from "@/lib/db";
-import { currentUser } from "@/lib/auth";
+import { currentViewer, resolveOwnedRow } from "@/lib/auth/access";
 
 export const runtime = "nodejs";
 
 export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
-  if (!(await currentUser())) notFound();
+  const viewer = await currentViewer();
+  if (!viewer) notFound();
+  if (!(await resolveOwnedRow(viewer, "analysis_tasks", id))) notFound();
 
   const task = await maybeOne<{ id: string; name: string; report_html: string | null }>(
     `select id, name, report_html from analysis_tasks where id = $1`,

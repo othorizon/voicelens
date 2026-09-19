@@ -2,12 +2,14 @@ import type { Metadata } from "next";
 import { count as countRows, maybeOne, query } from "@/lib/db";
 import { Studio } from "@/components/studio/studio";
 import type { ExtraFieldDef, JsonObject } from "@/lib/types";
+import { requireSourcePage } from "@/lib/actions/common";
 
 export const metadata: Metadata = { title: "分析工作台" };
 export const dynamic = "force-dynamic";
 
 export default async function StudioPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
+  await requireSourcePage(id);
   const [source, templates, jobs, previews, wf, count] = await Promise.all([
     maybeOne<{ id: string; name: string; description: string; extra_schema: unknown }>(
       `select id, name, description, extra_schema from data_sources where id = $1`,

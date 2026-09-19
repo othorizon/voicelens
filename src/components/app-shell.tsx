@@ -28,12 +28,14 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { ROLE_LABEL, type Role } from "@/lib/auth/roles";
 
 export interface CurrentUser {
   id: string;
   email: string;
   display_name: string | null;
   avatar_color: string | null;
+  role: Role;
 }
 
 const NAV = [
@@ -119,7 +121,7 @@ export function AppShell({
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" side="top" className="w-56">
               <DropdownMenuLabel className="text-xs text-muted-foreground">
-                工作区账号
+                工作区账号 · {ROLE_LABEL[user.role]}
               </DropdownMenuLabel>
               <DropdownMenuSeparator />
               <DropdownMenuItem

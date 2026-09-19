@@ -1,8 +1,8 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { requireSession, ActionError } from "./common";
-import { execute, maybeOne, one } from "@/lib/db";
+import { requireSourceAccess, requireWorkflowAccess, ActionError } from "./common";
+import { execute, one } from "@/lib/db";
 import { configFromGraph, normalizeGraph, validateGraph, type WfGraph } from "@/lib/workflow/graph";
 
 export async function saveWorkflow(
@@ -10,7 +10,7 @@ export async function saveWorkflow(
   graph: WfGraph,
   name?: string,
 ): Promise<{ config: ReturnType<typeof configFromGraph> }> {
-  await requireSession();
+  await requireWorkflowAccess(workflowId);
   const problems = validateGraph(graph);
   if (problems.length) throw new ActionError(`工作流配置不完整：${problems.join("；")}`);
 
@@ -30,7 +30,7 @@ export async function saveWorkflow(
 }
 
 export async function resetWorkflow(workflowId: string): Promise<WfGraph> {
-  await requireSession();
+  await requireWorkflowAccess(workflowId);
   const graph = normalizeGraph(null);
   try {
     await execute(
@@ -45,7 +45,7 @@ export async function resetWorkflow(workflowId: string): Promise<WfGraph> {
 }
 
 export async function createWorkflow(dataSourceId: string, name: string): Promise<{ id: string }> {
-  const { userId } = await requireSession();
+  const { userId } = await requireSourceAccess(dataSourceId);
   const graph = normalizeGraph(null);
   let created: { id: string };
   try {
@@ -64,9 +64,8 @@ export async function createWorkflow(dataSourceId: string, name: string): Promis
 }
 
 export async function duplicateWorkflow(workflowId: string): Promise<{ id: string }> {
-  const { userId } = await requireSession();
-  const src = await maybeOne<{ id: string }>(`select id from workflows where id = $1`, [workflowId]);
-  if (!src) throw new ActionError("工作流不存在");
+  const { session } = await requireWorkflowAccess(workflowId);
+  const userId = session.userId;
   let created: { id: string };
   try {
     created = await one<{ id: string }>(
@@ -84,7 +83,7 @@ export async function duplicateWorkflow(workflowId: string): Promise<{ id: strin
 }
 
 export async function deleteWorkflow(workflowId: string): Promise<void> {
-  await requireSession();
+  await requireWorkflowAccess(workflowId);
   try {
     await execute(`delete from workflows where id = $1`, [workflowId]);
   } catch (err) {

@@ -2,6 +2,7 @@ import Link from "next/link";
 import type { Metadata } from "next";
 import { ListChecks, FileBarChart, ArrowUpRight, Clock } from "lucide-react";
 import { listTasks } from "@/lib/queries";
+import { ownerScope, requireSession } from "@/lib/actions/common";
 import { PageHeader, StatusBadge, StageLabel, EmptyState } from "@/components/ui-kit";
 import { AutoRefresh } from "@/components/auto-refresh";
 import { Card, CardContent } from "@/components/ui/card";
@@ -14,7 +15,7 @@ export const metadata: Metadata = { title: "分析任务" };
 export const dynamic = "force-dynamic";
 
 export default async function TasksPage() {
-  const tasks = await listTasks(100);
+  const tasks = await listTasks(ownerScope(await requireSession()), 100);
   const hasActive = tasks.some((t) => ["pending", "running", "aggregating", "reporting"].includes(t.status));
 
   return (

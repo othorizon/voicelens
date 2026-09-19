@@ -33,13 +33,14 @@ PostgreSQL（pg 直连）· S3 兼容对象存储（阿里云 OSS）· qwen3.8-o
 |---|---|
 | `db/migrations/` | 建库 SQL（15 张表 + 7 个 SQL 函数 + 索引），由 `npm run db:migrate` 应用 |
 | `src/app/(auth)/` | 登录 / 注册（自建邮箱密码认证） |
-| `src/app/(app)/` | 主应用：概览、数据源、工作流、任务、设置 |
+| `src/app/(app)/` | 主应用：概览、数据源、工作流、任务、设置（角色分配） |
+| `src/app/pending/` | 无权限账号的等待开通页 |
 | `src/app/api/` | 导入、示例数据、报告 HTML、音频签名代理、轮询状态 |
 | `src/lib/engine/` | 分析引擎：归一化、抽样、提示词、三层分析、报告渲染 |
 | `src/lib/workflow/` | 工作流节点定义与图 → 执行配置解析 |
 | `src/lib/actions/` | Server Actions（认证、数据源、工作流、工作台、任务） |
 | `src/lib/db/` | 连接池与查询封装（参数化 SQL） |
-| `src/lib/auth/` | 会话签发与校验、argon2 口令哈希 |
+| `src/lib/auth/` | 会话签发与校验、argon2 口令哈希、角色表与归属判定 |
 | `src/lib/storage/` | S3 兼容对象存储（上传与预签名 URL） |
 | `worker/index.ts` | 常驻后台 Worker：规划 / 预览 / 全量任务三类作业队列 |
 | `scripts/e2e.ts` | 端到端冒烟脚本 |
@@ -58,7 +59,8 @@ npm run worker                     # 后台 Worker（另开一个进程，必须
 每个文件在自己的事务里应用，并把 sha256 记进 `_migrations`。已应用的文件被改动会直接报错——
 改 schema 请新增一个迁移文件，不要编辑旧的。`npm run db:migrate -- --dry` 只列出待执行项。
 
-首次访问 `/register` 注册的账号会成为工作区 owner，之后注册的是 member。
+首次访问 `/register` 注册的账号会成为工作区 **owner**（拥有全部权限）；之后注册的账号默认
+**无权限**，需要 owner 或管理员在「设置 → 成员与角色」里开通。角色见下面的〈权限模型〉。
 
 `worker` 与 Web 是两个独立进程：Web 只接受请求、写作业；Worker 轮询队列执行长任务，
 进度与日志写回任务对象，Web 端每 3 秒轮询刷新。Worker 重启会自动把孤儿作业重新入队。
@@ -210,10 +212,48 @@ zip 压缩包 = 一个对话 JSONL（层级任意）＋ 音频文件（可选，
 | `VOICELENS_ROLE` | 仅容器：不带命令参数时跑哪个角色（`web` 默认 / `worker` / `all` / `migrate`） |
 | `VOICELENS_MIGRATE_ON_START` | 仅容器：`web`/`all` 启动前自动应用迁移（默认关） |
 
+## 权限模型
+
+角色存在 `users.role` 一列，四个取值：
+
+| 角色 | 看数据 | 管数据 | 分配角色 |
+|---|---|---|---|
+| `owner` | 全部 | 全部 | 任意角色，含任免管理员；平台第一个账号，唯一且不可转让 |
+| `admin` | 全部 | 全部 | 仅在「成员 ↔ 无权限」之间调整 |
+| `member` | 自己创建的数据源 | 同左 | 无 |
+| `none` | 无 | 无 | 无；新注册账号的默认值，登录后落在 `/pending` 等待开通 |
+
+**归属以数据源为单位**：`sessions` / `messages` / `workflows` / `analysis_templates` /
+`planning_jobs` / `template_previews` / `analysis_tasks` 全部挂在 `data_source_id` 下，
+所以校验 `data_sources.created_by` 一处即覆盖其下全部内容。创建者被删号的数据源
+（`created_by` 为 null）只有 owner / admin 看得到。
+
+规则集中在三个文件，不散落在各处：
+
+| 文件 | 职责 |
+|---|---|
+| `src/lib/auth/roles.ts` | 角色表与分配规则（无服务端依赖，前端选择器与后端校验共用同一份） |
+| `src/lib/auth/access.ts` | 归属判定：`canAccessSource` / `resolveOwnedRow` / `resolveAudioSource` |
+| `src/lib/actions/common.ts` | 守卫：`requireSession` / `require*Access` / `require*Page` / `ownerScope` |
+
+跨数据源的列表查询（`listDataSources` / `listTasks` / `listWorkflows`）接收 `ownerScope()`
+产出的过滤值：owner/admin 传 null 不过滤，成员传自己的 id。「不存在」与「不是你的」返回
+同样的结果，因此无法用来探测 id 是否存在。
+
+角色**不写进会话 Cookie**，`currentUser()` 每次请求都回库读取，所以调整角色后对方下一次
+请求即生效，无需重新登录。
+
+回归测试（需要一个**可写坏的**临时库，会自建再自清 fixture 行）：
+
+```bash
+ACCESS_TEST_DATABASE_URL=postgresql://... npm run test:access
+```
+
 ## 安全边界
 
-- 授权在应用层：未登录请求在 middleware 被重定向，Server Actions 与 Route Handlers 各自再校验一次会话。
-  这是一个**共享团队工作区**——登录后即可访问全部数据源与任务，记录只留创建者，不做行级隔离。
+- 授权在应用层：未登录请求在 middleware 被重定向，Server Actions 与 Route Handlers 各自再按
+  创建者校验一次（见〈权限模型〉）。`middleware.ts` 跑在 Edge runtime、只验签名 Cookie，读不到角色，
+  因此角色校验落在 `src/app/(app)/layout.tsx` 与各 action / route 里。
 - 会话是一枚 HS256 签名的 HttpOnly Cookie（7 天，活跃使用会自动续期）；口令用 argon2id 哈希
   （19 MiB / 2 轮）。登录失败不区分「密码错」与「账号不存在」，避免枚举。
 - 浏览器只与本平台自己的路由通信：报告、音频、任务状态都经服务端转发，数据库与对象存储凭据

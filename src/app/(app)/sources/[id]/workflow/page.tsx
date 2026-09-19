@@ -7,12 +7,14 @@ import { normalizeGraph, type WfGraph } from "@/lib/workflow/graph";
 import { EmptyState } from "@/components/ui-kit";
 import { Button } from "@/components/ui/button";
 import { Workflow } from "lucide-react";
+import { requireSourcePage } from "@/lib/actions/common";
 
 export const metadata: Metadata = { title: "工作流" };
 export const dynamic = "force-dynamic";
 
 export default async function WorkflowPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
+  await requireSourcePage(id);
   const wf = await maybeOne<{ id: string; name: string; graph: unknown }>(
     `select id, name, graph from workflows
      where data_source_id = $1

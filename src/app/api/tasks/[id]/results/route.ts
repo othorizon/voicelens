@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { count as countRows, maybeOne, query } from "@/lib/db";
-import { currentUser } from "@/lib/auth";
+import { currentViewer, resolveOwnedRow } from "@/lib/auth/access";
 import { digestToTranscript } from "@/lib/engine/plan";
 import type { JsonObject } from "@/lib/types";
 
@@ -16,7 +16,12 @@ const PAGE = 50;
  */
 export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
-  if (!(await currentUser())) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  const viewer = await currentViewer();
+  if (!viewer) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  // Every query below is keyed on this task, so clearing it clears them all.
+  if (!(await resolveOwnedRow(viewer, "analysis_tasks", id))) {
+    return NextResponse.json({ error: "任务不存在" }, { status: 404 });
+  }
 
   const url = new URL(req.url);
   const level = url.searchParams.get("level") ?? "users";

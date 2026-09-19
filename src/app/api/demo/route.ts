@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { execute, maybeOne } from "@/lib/db";
-import { currentUser } from "@/lib/auth";
+import { canAccessSource, currentViewer } from "@/lib/auth/access";
 import { buildDemoZip, DEMO_EXTRA_SCHEMA, generateDemoDataset } from "@/lib/demo/generate";
 import { createImportBatch, importZip } from "@/lib/engine/import";
 
@@ -29,8 +29,8 @@ export async function GET(request: Request) {
  * including the recommended extra schema.
  */
 export async function POST(request: Request) {
-  const user = await currentUser();
-  if (!user) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  const viewer = await currentViewer();
+  if (!viewer) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
 
   const body = (await request.json().catch(() => ({}))) as {
     sourceId?: string;
@@ -41,6 +41,9 @@ export async function POST(request: Request) {
   const sourceId = body.sourceId;
   if (!sourceId) return NextResponse.json({ error: "缺少 sourceId" }, { status: 400 });
 
+  if (!(await canAccessSource(viewer, sourceId))) {
+    return NextResponse.json({ error: "数据源不存在" }, { status: 404 });
+  }
   const source = await maybeOne<{ id: string; name: string; description: string }>(
     `select id, name, description from data_sources where id = $1`,
     [sourceId],
@@ -68,14 +71,14 @@ export async function POST(request: Request) {
   const batchId = await createImportBatch(
     sourceId,
     `demo-car-assistant-${dataset.sessions}s.zip`,
-    user.id,
+    viewer.userId,
   );
 
   void importZip(
     sourceId,
     zip.buffer as ArrayBuffer,
     `demo-car-assistant-${dataset.sessions}s.zip`,
-    user.id,
+    viewer.userId,
     () => {},
     batchId,
   ).catch((e: unknown) => console.error("[demo import] failed:", e instanceof Error ? e.message : e));
