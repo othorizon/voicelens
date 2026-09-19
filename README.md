@@ -41,7 +41,8 @@ PostgreSQL（pg 直连）· S3 兼容对象存储（阿里云 OSS）· qwen3.8-o
 | `src/lib/actions/` | Server Actions（认证、数据源、工作流、工作台、任务） |
 | `src/lib/db/` | 连接池与查询封装（参数化 SQL） |
 | `src/lib/auth/` | 会话签发与校验、argon2 口令哈希、角色表与归属判定 |
-| `src/lib/storage/` | S3 兼容对象存储（上传与预签名 URL） |
+| `src/lib/storage/` | S3 兼容对象存储（分片上传、预签名 URL、Range 读取） |
+| `src/lib/upload/` | 浏览器端分片直传与断点续传 |
 | `worker/index.ts` | 常驻后台 Worker：规划 / 预览 / 全量任务三类作业队列 |
 | `scripts/e2e.ts` | 端到端冒烟脚本 |
 
@@ -182,6 +183,38 @@ zip 压缩包 = 一个对话 JSONL（层级任意）＋ 音频文件（可选，
 
 同一个 `sessionId` 多次导入会自动追加到已有会话（`seq` 续号、转录拼接、计数累加）。
 
+### 导入上传：浏览器直传 + 断点续传
+
+压缩包的字节**不经过应用服务器**。上传时浏览器先向 `/api/sources/[id]/uploads` 要一次分片
+上传（`create`），拿到服务端签好的 PUT URL（`sign`），再把切片直接 PUT 到对象存储；服务端
+只负责签名、列分片（`status`）与合并（`complete`），全程不持有文件内容。
+
+断点续传就落在这套机制上：已被对象存储接收的分片会一直留着，直到上传被合并或作废。
+浏览器把 `key` / `uploadId` 记在 localStorage，暂停、刷新、断网、合上电脑之后重新选择
+同一个文件，会先问一次 `status`、跳过已传分片、只补剩下的。上传页的「暂停」保留分片，
+「取消并丢弃」会调用 `abort` 把分片一并删掉。
+
+入库时也不再把压缩包读进内存：服务端用 **HTTP Range 就地读**桶里的这个对象——先读中央目录，
+再按条目读——峰值内存是单个条目而不是整包（实测 600MB 压缩包，峰值 RSS 174MB；旧的整包
+读法同一份数据是 740MB，且随包大小线性增长）。解包完成后暂存的压缩包默认删除，失败则保留
+以便重试（`IMPORT_KEEP_SOURCE_ZIP=true` 可改为一直保留）。
+
+上限因此从 800MB 放宽到 **5GB**（`IMPORT_MAX_ZIP_MB` 可调）。它现在只是一道防手滑的闸，
+真正随数据量增长的是**条数**：一个批次解析出的消息在写库期间会留在内存里，音频体积不会。
+
+**必须配置的一条 Bucket 跨域规则**——浏览器直传是跨域 PUT，没有这条会在上传时直接失败。
+阿里云 OSS 控制台 → 对应 Bucket → 数据安全 → 跨域设置，新建规则：
+
+| 项 | 值 |
+|---|---|
+| 来源 Source | 应用访问地址，如 `https://voicelens.example.com`（本地开发再加 `http://localhost:3000`） |
+| 允许 Methods | `PUT`（预检 `OPTIONS` 由该规则自动覆盖） |
+| 允许 Headers | `*` |
+| 暴露 Headers | 不需要——ETag 由服务端 `ListParts` 读取，不经过浏览器 |
+
+另外建议给 Bucket 加一条**生命周期规则**，清理「未完成的分片上传」（OSS：生命周期 → 碎片
+过期天数，设 7 天即可）。中断且再也没人续传的上传，分片会一直占着存储。
+
 ### extra 字段的统计口径
 
 `extra` 的真实取值分布由 Postgres 直算（`extra_histogram`），是报告「确定性指标」的来源，
@@ -206,6 +239,8 @@ zip 压缩包 = 一个对话 JSONL（层级任意）＋ 音频文件（可选，
 | `S3_ENDPOINT` / `S3_REGION` / `S3_BUCKET` | S3 兼容对象存储的接入点与私有桶 |
 | `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | 对象存储凭据（仅服务端使用） |
 | `S3_FORCE_PATH_STYLE` | 路径风格寻址；OSS/S3 用默认 false，MinIO 需 true |
+| `IMPORT_MAX_ZIP_MB` | 单个压缩包上限，MB（默认 5120 = 5GB） |
+| `IMPORT_KEEP_SOURCE_ZIP` | 导入成功后保留暂存的压缩包（默认 false，解包后即删） |
 | `AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` | 模型服务（OpenAI 兼容 Chat Completions） |
 | `AI_ENABLE_THINKING` | 深度思考默认开关（默认 false，规划与报告单独开启） |
 | `WORKER_POLL_MS` | Worker 轮询间隔 |
@@ -257,7 +292,9 @@ ACCESS_TEST_DATABASE_URL=postgresql://... npm run test:access
 - 会话是一枚 HS256 签名的 HttpOnly Cookie（7 天，活跃使用会自动续期）；口令用 argon2id 哈希
   （19 MiB / 2 轮）。登录失败不区分「密码错」与「账号不存在」，避免枚举。
 - 浏览器只与本平台自己的路由通信：报告、音频、任务状态都经服务端转发，数据库与对象存储凭据
-  不下发到前端。
+  不下发到前端。导入上传是唯一一条浏览器直连对象存储的链路，走的也是**服务端签名的一次性
+  分片 PUT URL**，前端拿不到任何长期凭据；对象路径由服务端按 `imports/<数据源 id>/…` 生成，
+  签名与合并前都会校验它属于当前数据源。
 - 音频桶保持私有，播放与送模型都走**短时效预签名 URL**（播放 10 分钟，送模型 1 小时）。
 - 数据库里不存文件字节；音频仅存对象路径。
 

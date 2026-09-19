@@ -1,12 +1,13 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  serverExternalPackages: ["jszip"],
+  serverExternalPackages: ["jszip", "yauzl"],
   eslint: { ignoreDuringBuilds: true },
   experimental: {
     serverActions: {
-      // Uploading the demo zip and importing large archives can take a while.
-      bodySizeLimit: "900mb",
+      // Archives go browser -> bucket now and never reach this process, so the
+      // old 900mb allowance is gone; this only has to cover ordinary forms.
+      bodySizeLimit: "4mb",
     },
   },
 };

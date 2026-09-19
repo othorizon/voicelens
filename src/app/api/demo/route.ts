@@ -76,7 +76,7 @@ export async function POST(request: Request) {
 
   void importZip(
     sourceId,
-    zip.buffer as ArrayBuffer,
+    { kind: "buffer", data: zip.buffer as ArrayBuffer },
     `demo-car-assistant-${dataset.sessions}s.zip`,
     viewer.userId,
     () => {},

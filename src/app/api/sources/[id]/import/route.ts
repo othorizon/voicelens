@@ -1,16 +1,22 @@
 import { NextResponse } from "next/server";
 import { canAccessSource, currentViewer } from "@/lib/auth/access";
 import { importZip, createImportBatch } from "@/lib/engine/import";
+import { storageConfigured } from "@/lib/storage";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
 
 /**
  * POST /api/sources/[id]/import
- * multipart/form-data: { file: <zip>, mode: "background" | "sync" }
+ * JSON: { key: string, fileName?: string, mode?: "background" | "sync" }
  *
- * Creates the batch row, then runs the parse + storage upload in the background
- * and returns the batch id immediately so the UI can poll for progress.
+ * Starts an import from an archive the browser has already uploaded to the
+ * bucket (see /api/sources/[id]/uploads). The request carries only the object
+ * key, so the size of the archive is not a property of this request at all.
+ *
+ * Creates the batch row, then runs the parse + storage unpack in the
+ * background and returns the batch id immediately so the UI can poll for
+ * progress.
  */
 export async function POST(request: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id: dataSourceId } = await ctx.params;
@@ -19,41 +25,45 @@ export async function POST(request: Request, ctx: { params: Promise<{ id: string
   if (!(await canAccessSource(viewer, dataSourceId))) {
     return NextResponse.json({ error: "data source not found" }, { status: 404 });
   }
+  if (!storageConfigured()) {
+    return NextResponse.json({ error: "对象存储未配置，无法导入" }, { status: 503 });
+  }
 
-  let form: FormData;
+  let body: { key?: unknown; fileName?: unknown; mode?: unknown };
   try {
-    form = await request.formData();
+    body = (await request.json()) as typeof body;
   } catch {
-    return NextResponse.json({ error: "请求必须是 multipart/form-data，字段名为 file" }, { status: 400 });
+    return NextResponse.json({ error: "请求体必须是 JSON，字段名为 key" }, { status: 400 });
   }
 
-  const file = form.get("file");
-  if (!(file instanceof File)) {
-    return NextResponse.json({ error: "缺少 file 字段" }, { status: 400 });
-  }
-  if (!/\.zip$/i.test(file.name)) {
-    return NextResponse.json({ error: "仅支持上传 .zip 压缩包（内含 JSONL 与音频文件）" }, { status: 400 });
-  }
-  if (file.size > 800 * 1024 * 1024) {
-    return NextResponse.json({ error: "压缩包超过 800MB 上限，请拆分后再导入" }, { status: 413 });
+  const key = String(body.key ?? "");
+  if (!key.startsWith(`imports/${dataSourceId}/`) || key.includes("..")) {
+    return NextResponse.json({ error: "对象路径不属于该数据源" }, { status: 403 });
   }
 
-  const mode = String(form.get("mode") ?? "background");
+  const fileName = String(body.fileName ?? key.split("/").pop() ?? "upload.zip");
+  if (!/\.zip$/i.test(fileName)) {
+    return NextResponse.json({ error: "仅支持 .zip 压缩包（内含 JSONL 与音频文件）" }, { status: 400 });
+  }
+
+  const mode = String(body.mode ?? "background");
+  const source = { kind: "object", path: key } as const;
 
   try {
-    const buffer = await file.arrayBuffer();
-    const batchId = await createImportBatch(dataSourceId, file.name, viewer.userId);
+    const batchId = await createImportBatch(dataSourceId, fileName, viewer.userId);
 
     if (mode === "sync") {
-      const result = await importZip(dataSourceId, buffer, file.name, viewer.userId, () => {}, batchId);
+      const result = await importZip(dataSourceId, source, fileName, viewer.userId, () => {}, batchId);
       return NextResponse.json({ ...result, batchId });
     }
 
     // The connection pool is process-wide, so this keeps running after the
     // response is sent; progress lands on the batch row for the UI to poll.
-    void importZip(dataSourceId, buffer, file.name, viewer.userId, () => {}, batchId).catch((e: unknown) => {
-      console.error("[import] background failure:", e instanceof Error ? e.message : e);
-    });
+    void importZip(dataSourceId, source, fileName, viewer.userId, () => {}, batchId).catch(
+      (e: unknown) => {
+        console.error("[import] background failure:", e instanceof Error ? e.message : e);
+      },
+    );
 
     return NextResponse.json({ batchId });
   } catch (e) {

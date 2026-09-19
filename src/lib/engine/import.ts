@@ -1,6 +1,6 @@
-import JSZip from "jszip";
 import { execute, one, query } from "@/lib/db";
-import { uploadObject } from "@/lib/storage";
+import { deleteObject, uploadObject } from "@/lib/storage";
+import { openZipBuffer, openZipObject, type ZipArchive, type ZipEntry } from "./zip";
 import { bundleSessions, normalizeLine, type NormalizedMessage, type SessionBundle } from "./normalize";
 
 export interface ImportResult {
@@ -21,6 +21,33 @@ export interface ImportLogger {
 
 const AUDIO_EXT = /\.(wav|mp3|m4a|aac|flac|ogg|opus|webm|amr|pcm)$/i;
 const CHUNK = 400;
+
+/**
+ * Ceiling on one uploaded archive.
+ *
+ * The bytes go browser -> bucket now, and the importer reads the archive out
+ * of the bucket one entry at a time, so this is no longer a memory ceiling —
+ * it is a sanity guard against a mis-picked file. What still scales with the
+ * archive is the *record* side: every parsed message is held in memory while
+ * the batch is written. Audio dominates a realistic archive, so 5GB of zip is
+ * a comfortably large single batch; raise `IMPORT_MAX_ZIP_MB` if your data
+ * says otherwise.
+ */
+const DEFAULT_MAX_ZIP_MB = 5120;
+
+export function maxZipBytes(): number {
+  const raw = Number(process.env.IMPORT_MAX_ZIP_MB);
+  const mb = Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAX_ZIP_MB;
+  return Math.round(mb) * 1024 * 1024;
+}
+
+/**
+ * Where the importer reads the archive from: `buffer` for the generated demo
+ * dataset, `object` for anything the browser uploaded to the bucket.
+ */
+export type ZipSource =
+  | { kind: "buffer"; data: ArrayBuffer }
+  | { kind: "object"; path: string };
 
 function sanitizePath(p: string): string {
   return p.replace(/^\/+/, "").replace(/\\/g, "/").replace(/[^\w./\-\u4e00-\u9fa5]+/g, "_");
@@ -52,7 +79,7 @@ export async function createImportBatch(
 
 export async function importZip(
   dataSourceId: string,
-  zipBuffer: ArrayBuffer,
+  source: ZipSource,
   fileName: string,
   userId: string | null,
   log: ImportLogger = () => {},
@@ -73,21 +100,26 @@ export async function importZip(
     errors,
   };
 
+  // Held outside the try so the finally can close it, opened inside so a bad
+  // archive is recorded on the batch row like any other failure.
+  let archive: ZipArchive | null = null;
+
   try {
-    const zip = await JSZip.loadAsync(zipBuffer);
-    log("解压完成", { files: Object.keys(zip.files).length });
+    const opened =
+      source.kind === "buffer" ? await openZipBuffer(source.data) : await openZipObject(source.path);
+    archive = opened;
+    log("读取压缩包目录", { files: opened.entries.length });
 
-    const jsonlEntries: { path: string; file: JSZip.JSZipObject }[] = [];
-    const audioEntries = new Map<string, JSZip.JSZipObject>();
+    const jsonlEntries: ZipEntry[] = [];
+    const audioEntries = new Map<string, ZipEntry>();
 
-    zip.forEach((path, file) => {
-      if (file.dir) return;
-      if (/\.(jsonl|ndjson|json)$/i.test(path)) jsonlEntries.push({ path, file });
-      else if (AUDIO_EXT.test(path)) {
-        audioEntries.set(path.split("/").pop()!.toLowerCase(), file);
-        audioEntries.set(sanitizePath(path).toLowerCase(), file);
+    for (const entry of opened.entries) {
+      if (/\.(jsonl|ndjson|json)$/i.test(entry.path)) jsonlEntries.push(entry);
+      else if (AUDIO_EXT.test(entry.path)) {
+        audioEntries.set(entry.path.split("/").pop()!.toLowerCase(), entry);
+        audioEntries.set(sanitizePath(entry.path).toLowerCase(), entry);
       }
-    });
+    }
 
     if (jsonlEntries.length === 0) throw new Error("压缩包内没有找到 .jsonl 文件");
     result.jsonlFiles = jsonlEntries.length;
@@ -95,7 +127,7 @@ export async function importZip(
     // ------------------------------------------------------------ 1. parse
     const all: NormalizedMessage[] = [];
     for (const entry of jsonlEntries) {
-      const text = await entry.file.async("string");
+      const text = await entry.text();
       const stem = entry.path.split("/").pop()!.replace(/\.(jsonl|ndjson|json)$/i, "");
       const lines = text.split(/\r?\n/);
       let parsedHere = 0;
@@ -306,6 +338,18 @@ export async function importZip(
     );
 
     log("导入完成", { sessions: result.sessions, messages: result.messages, audios: result.audios });
+
+    // The archive has been unpacked into the bucket entry by entry, so the
+    // staged copy is now dead weight. A failed import keeps it, so a retry can
+    // reuse the object instead of making the user upload it again.
+    if (source.kind === "object" && process.env.IMPORT_KEEP_SOURCE_ZIP !== "true") {
+      try {
+        await deleteObject(source.path);
+      } catch (err) {
+        log("暂存压缩包清理失败", { path: source.path, error: (err as Error).message });
+      }
+    }
+
     return result;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -314,6 +358,8 @@ export async function importZip(
       [batchId, message.slice(0, 1000)],
     );
     throw err;
+  } finally {
+    await archive?.close().catch(() => {});
   }
 }
 
@@ -347,7 +393,7 @@ async function uploadAudios(
   dataSourceId: string,
   batchId: string,
   bundles: SessionBundle[],
-  audioEntries: Map<string, JSZip.JSZipObject>,
+  audioEntries: Map<string, ZipEntry>,
   log: ImportLogger,
 ) {
   const pathOf = new Map<NormalizedMessage, string>();
@@ -356,7 +402,7 @@ async function uploadAudios(
   let ok = 0;
   let failed = 0;
 
-  const jobs: { msg: NormalizedMessage; entry: JSZip.JSZipObject; objectPath: string }[] = [];
+  const jobs: { msg: NormalizedMessage; entry: ZipEntry; objectPath: string }[] = [];
   const usedPaths = new Set<string>();
 
   for (const bundle of bundles) {
@@ -370,7 +416,7 @@ async function uploadAudios(
         if (errors.length < 10) errors.push(`音频缺失: ${msg.audio}`);
         continue;
       }
-      const base = entry.name.split("/").pop()!;
+      const base = entry.path.split("/").pop()!;
       let objectPath = sanitizePath(`${dataSourceId}/${batchId}/${base}`);
       if (usedPaths.has(objectPath)) {
         objectPath = sanitizePath(`${dataSourceId}/${batchId}/${bundle.sessionKey}-${msg.seq}-${base}`);
@@ -391,14 +437,14 @@ async function uploadAudios(
     while (cursor < jobs.length) {
       const job = jobs[cursor++];
       try {
-        const buffer = await job.entry.async("uint8array");
-        await uploadObject(job.objectPath, buffer, mimeOf(job.entry.name));
+        const buffer = await job.entry.bytes();
+        await uploadObject(job.objectPath, buffer, mimeOf(job.entry.path));
         pathOf.set(job.msg, job.objectPath);
         sizeOf.set(job.msg, buffer.byteLength);
         ok++;
       } catch (e) {
         failed++;
-        if (errors.length < 10) errors.push(`音频上传失败 ${job.entry.name}: ${(e as Error).message}`);
+        if (errors.length < 10) errors.push(`音频上传失败 ${job.entry.path}: ${(e as Error).message}`);
       }
       done++;
       if (done % 25 === 0) log(`音频上传进度`, { done, total: jobs.length });

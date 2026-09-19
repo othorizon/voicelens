@@ -13,12 +13,20 @@ import {
   Wand2,
   Info,
   Music4,
+  Ban,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { StatusBadge } from "@/components/ui-kit";
 import { cn, compactNumber, formatDate, relativeTime } from "@/lib/utils";
+import {
+  UploadAbortedError,
+  discardUpload,
+  formatBytes,
+  pendingUpload,
+  uploadArchive,
+} from "@/lib/upload/multipart";
 import type { JsonObject } from "@/lib/types";
 
 interface Batch extends JsonObject {
@@ -51,17 +59,22 @@ export function ImportPanel({
   sourceId,
   batches,
   autoRefresh,
+  maxBytes,
 }: {
   sourceId: string;
   batches: JsonObject[];
   autoRefresh: boolean;
+  maxBytes: number;
 }) {
   const router = useRouter();
   const [dragging, setDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [percent, setPercent] = useState(0);
+  const [note, setNote] = useState("");
   const [seeding, setSeeding] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const fileRef = useRef<File | null>(null);
 
   useEffect(() => {
     if (!autoRefresh) return;
@@ -69,36 +82,80 @@ export function ImportPanel({
     return () => clearInterval(t);
   }, [autoRefresh, router]);
 
+  // The bytes go browser -> bucket over presigned part URLs; this app only
+  // arranges the upload and then points the importer at the finished object.
   const upload = useCallback(
     async (file: File) => {
       if (!/\.zip$/i.test(file.name)) {
         toast.error("请上传 .zip 压缩包");
         return;
       }
+      if (file.size > maxBytes) {
+        toast.error(`压缩包 ${formatBytes(file.size)} 超过 ${formatBytes(maxBytes)} 上限，请拆分后再导入`);
+        return;
+      }
+
+      const controller = new AbortController();
+      abortRef.current = controller;
+      fileRef.current = file;
       setUploading(true);
       setPercent(0);
-      try {
-        const form = new FormData();
-        form.append("file", file);
-        form.append("mode", "background");
+      setNote(pendingUpload(sourceId, file) ? "正在续传未完成的上传…" : "正在上传到对象存储…");
 
-        const res = await fetch(`/api/sources/${sourceId}/import`, { method: "POST", body: form });
+      try {
+        const key = await uploadArchive({
+          sourceId,
+          file,
+          signal: controller.signal,
+          onProgress: ({ loaded, total, resumed }) => {
+            setPercent(total ? Math.round((loaded / total) * 100) : 0);
+            setNote(
+              `${resumed ? "续传" : "上传"} ${formatBytes(loaded)} / ${formatBytes(total)}`,
+            );
+          },
+        });
+
+        setNote("上传完成，正在提交导入…");
+        const res = await fetch(`/api/sources/${sourceId}/import`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ key, fileName: file.name, mode: "background" }),
+        });
         const json = (await res.json()) as { batchId?: string; error?: string };
-        if (!res.ok || !json.batchId) throw new Error(json.error ?? "上传失败");
-        toast.success("已接收压缩包，正在后台解析导入");
+        if (!res.ok || !json.batchId) throw new Error(json.error ?? "导入提交失败");
+
+        toast.success("压缩包已入库，正在后台解析导入");
         setPercent(100);
         router.refresh();
       } catch (e) {
-        toast.error(e instanceof Error ? e.message : "上传失败");
+        if (e instanceof UploadAbortedError || controller.signal.aborted) {
+          toast.info("上传已暂停，重新选择同一个文件即可从断点继续");
+        } else {
+          toast.error(e instanceof Error ? e.message : "上传失败");
+        }
       } finally {
+        abortRef.current = null;
         setTimeout(() => {
           setUploading(false);
           setPercent(0);
+          setNote("");
         }, 700);
       }
     },
-    [router, sourceId],
+    [maxBytes, router, sourceId],
   );
+
+  // Pause: in-flight PUTs stop, but the parts already accepted by the bucket
+  // stay, so picking the same file again resumes instead of restarting.
+  const pause = useCallback(() => abortRef.current?.abort(), []);
+
+  // Cancel: also tell the bucket to throw the accepted parts away, so an
+  // abandoned upload does not sit there billing for storage.
+  const cancel = useCallback(async () => {
+    abortRef.current?.abort();
+    const file = fileRef.current;
+    if (file) await discardUpload(sourceId, file);
+  }, [sourceId]);
 
   async function seedDemo() {
     setSeeding(true);
@@ -136,31 +193,44 @@ export function ImportPanel({
             <div
               onDragOver={(e) => {
                 e.preventDefault();
-                setDragging(true);
+                if (!uploading) setDragging(true);
               }}
               onDragLeave={() => setDragging(false)}
               onDrop={(e) => {
                 e.preventDefault();
                 setDragging(false);
+                if (uploading) return;
                 const file = e.dataTransfer.files?.[0];
                 if (file) void upload(file);
               }}
-              onClick={() => inputRef.current?.click()}
+              onClick={() => {
+                // One upload at a time: the picker would otherwise start a
+                // second transfer on top of the one in flight.
+                if (!uploading) inputRef.current?.click();
+              }}
               className={cn(
-                "flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-12 text-center transition-colors",
-                dragging ? "border-primary bg-accent" : "border-border/80 bg-muted/20 hover:border-primary/50",
+                "flex flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-12 text-center transition-colors",
+                uploading
+                  ? "cursor-default border-border/80 bg-muted/20"
+                  : "cursor-pointer " +
+                    (dragging
+                      ? "border-primary bg-accent"
+                      : "border-border/80 bg-muted/20 hover:border-primary/50"),
               )}
             >
               {uploading ? (
                 <>
                   <Loader2 className="mb-3 size-8 animate-spin text-primary" />
-                  <div className="text-sm font-medium">上传中…</div>
+                  <div className="num text-sm font-medium">{percent}%</div>
+                  <div className="mt-1 text-[12px] text-muted-foreground">{note}</div>
                 </>
               ) : (
                 <>
                   <UploadCloud className="mb-3 size-8 text-muted-foreground" />
                   <div className="text-sm font-medium">拖拽 zip 到这里，或点击选择文件</div>
-                  <div className="mt-1 text-[12px] text-muted-foreground">单个压缩包上限 800MB</div>
+                  <div className="mt-1 text-[12px] text-muted-foreground">
+                    浏览器直传对象存储 · 支持断点续传 · 单个压缩包上限 {formatBytes(maxBytes)}
+                  </div>
                 </>
               )}
               <input
@@ -176,7 +246,23 @@ export function ImportPanel({
               />
             </div>
 
-            {uploading && <Progress value={percent} className="h-1.5" />}
+            {uploading && (
+              <div className="space-y-2">
+                <Progress value={percent} className="h-1.5" />
+                <div className="flex items-center gap-2">
+                  <Button variant="outline" size="sm" onClick={pause}>
+                    暂停
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={() => void cancel()}>
+                    <Ban className="size-3.5" />
+                    取消并丢弃
+                  </Button>
+                  <span className="text-[12px] text-muted-foreground">
+                    暂停后重新选择同一个文件即可续传
+                  </span>
+                </div>
+              </div>
+            )}
 
             <div className="flex flex-wrap items-center gap-2 border-t border-border/70 pt-4">
               <Button variant="outline" size="sm" onClick={seedDemo} disabled={seeding}>

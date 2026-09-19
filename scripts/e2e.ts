@@ -97,8 +97,12 @@ async function main() {
       log("demo dataset", { sessions: dataset.sessions, records: dataset.records.length, audios: dataset.audios });
       const zip = await buildDemoZip(dataset);
       log("zip built", `${(zip.byteLength / 1024).toFixed(0)} KB`);
-      const res = await importZip(sourceId, zip.buffer as ArrayBuffer, "demo.zip", userId, (m, e) =>
-        log(`import: ${m}`, e),
+      const res = await importZip(
+        sourceId,
+        { kind: "buffer", data: zip.buffer as ArrayBuffer },
+        "demo.zip",
+        userId,
+        (m, e) => log(`import: ${m}`, e),
       );
       log("import done", res);
     } else {
