@@ -1,7 +1,8 @@
 import type { Metadata } from "next";
 import { redirect } from "next/navigation";
 import { Bot, Database, ShieldCheck, Users, Cpu, Cloud } from "lucide-react";
-import { createClient } from "@/lib/supabase/server";
+import { count as countRows, maybeOne, query } from "@/lib/db";
+import { currentUser } from "@/lib/auth";
 import { PageHeader, StatCard } from "@/components/ui-kit";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -12,16 +13,30 @@ export const metadata: Metadata = { title: "设置" };
 export const dynamic = "force-dynamic";
 
 export default async function SettingsPage() {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const user = await currentUser();
   if (!user) redirect("/login");
 
-  const [{ data: profile }, { data: members }, { count: sourceCount }] = await Promise.all([
-    supabase.from("profiles").select("*").eq("id", user.id).maybeSingle(),
-    supabase.from("profiles").select("id, email, display_name, avatar_color, role, created_at").order("created_at", { ascending: true }),
-    supabase.from("data_sources").select("id", { count: "exact", head: true }),
+  // `profiles` is a view over `users` without the password column, so no query
+  // here can reach a credential.
+  const [profile, members, sourceCount] = await Promise.all([
+    maybeOne<{
+      display_name: string | null;
+      avatar_color: string | null;
+      role: string;
+      created_at: string;
+    }>(`select display_name, avatar_color, role, created_at from profiles where id = $1`, [user.id]),
+    query<{
+      id: string;
+      email: string;
+      display_name: string | null;
+      avatar_color: string | null;
+      role: string;
+      created_at: string;
+    }>(
+      `select id, email, display_name, avatar_color, role, created_at
+       from profiles order by created_at`,
+    ),
+    countRows(`select count(*) from data_sources`),
   ]);
 
   const model = process.env.AI_MODEL ?? "qwen3.8-omni-flash";
@@ -34,8 +49,8 @@ export default async function SettingsPage() {
       <PageHeader title="设置" description="当前账号、团队工作区成员、模型与基础设施配置。" />
       <div className="mx-auto max-w-[1440px] space-y-5 p-4 md:p-8">
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-          <StatCard label="数据源" value={sourceCount ?? 0} icon={Database} />
-          <StatCard label="工作区成员" value={(members ?? []).length} icon={Users} tone="info" />
+          <StatCard label="数据源" value={sourceCount} icon={Database} />
+          <StatCard label="工作区成员" value={members.length} icon={Users} tone="info" />
           <StatCard label="分析模型" value={model.replace("qwen3.8-", "")} hint={model} icon={Cpu} tone="good" />
           <StatCard
             label="模型连通性"
@@ -50,7 +65,7 @@ export default async function SettingsPage() {
           <Card>
             <CardHeader>
               <CardTitle className="text-sm font-semibold">我的账号</CardTitle>
-              <CardDescription className="text-[12.5px]">登录态由 Supabase Auth 管理，会话保存在 HttpOnly Cookie 中。</CardDescription>
+              <CardDescription className="text-[12.5px]">登录态由本平台自己签发，会话是一枚签名的 HttpOnly Cookie。</CardDescription>
             </CardHeader>
             <CardContent className="space-y-3">
               <div className="flex items-center gap-3">
@@ -58,23 +73,23 @@ export default async function SettingsPage() {
                   className="grid size-11 shrink-0 place-items-center rounded-full text-sm font-semibold text-white"
                   style={{ background: String(profile?.avatar_color ?? "var(--primary)") }}
                 >
-                  {initials(String(profile?.display_name ?? user.email))}
+                  {initials(profile?.display_name ?? user.email)}
                 </span>
                 <div className="min-w-0">
                   <div className="truncate text-sm font-medium">
-                    {String(profile?.display_name ?? user.email?.split("@")[0])}
+                    {profile?.display_name ?? user.email.split("@")[0]}
                   </div>
                   <div className="truncate text-[12px] text-muted-foreground">{user.email}</div>
                 </div>
                 <Badge variant="outline" className="ml-auto shrink-0">
-                  {String(profile?.role ?? "member")}
+                  {profile?.role ?? "member"}
                 </Badge>
               </div>
               <Separator />
               <dl className="space-y-1.5 text-[12px]">
-                <Row k="用户 ID" v={String(user.id)} mono />
-                <Row k="注册时间" v={String(profile?.created_at ?? "").replace("T", " ").slice(0, 19)} />
-                <Row k="认证方式" v="邮箱 + 密码（bcrypt）" />
+                <Row k="用户 ID" v={user.id} mono />
+                <Row k="注册时间" v={(profile?.created_at ?? "").replace("T", " ").slice(0, 19)} />
+                <Row k="认证方式" v="邮箱 + 密码（argon2id）" />
               </dl>
             </CardContent>
           </Card>
@@ -91,11 +106,11 @@ export default async function SettingsPage() {
             </CardHeader>
             <CardContent className="space-y-2.5 text-[12.5px] leading-relaxed text-muted-foreground">
               {[
-                { k: "行级安全", v: "全部业务表开启 RLS，仅 authenticated 角色可读写；未登录请求在中间件层被重定向。" },
-                { k: "浏览器边界", v: "浏览器只与本平台自己的服务端路由通信，不直连 Supabase 写入业务数据。" },
-                { k: "音频存储", v: "音频字节存放在 Supabase Storage 私有桶 audio，数据库中只保存对象路径。" },
-                { k: "播放与送模型", v: "播放与分析都通过短时效签名 URL 访问，签名链接最长 1 小时。" },
-                { k: "后台任务", v: "规划、预览、全量分析由独立 Worker 进程以专用成员账号执行，进度与日志写回任务对象。" },
+                { k: "访问控制", v: "授权在应用层：未登录请求在中间件被重定向，服务端动作与路由各自再校验一次会话。" },
+                { k: "浏览器边界", v: "浏览器只与本平台自己的服务端路由通信，任何数据库或对象存储凭据都不下发到前端。" },
+                { k: "音频存储", v: "音频字节存放在 S3 兼容私有桶（阿里云 OSS），数据库中只保存对象路径。" },
+                { k: "播放与送模型", v: "播放与分析都通过短时效预签名 URL 访问，播放 10 分钟、送模型 1 小时。" },
+                { k: "后台任务", v: "规划、预览、全量分析由独立 Worker 进程直连数据库执行，进度与日志写回任务对象。" },
               ].map((r) => (
                 <div key={r.k} className="rounded-lg border border-border/60 p-3">
                   <div className="font-medium text-foreground">{r.k}</div>
@@ -113,19 +128,19 @@ export default async function SettingsPage() {
           </CardHeader>
           <CardContent>
             <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-              {(members ?? []).map((m) => (
-                <div key={String(m.id)} className="flex items-center gap-2.5 rounded-lg border border-border/70 p-2.5">
+              {members.map((m) => (
+                <div key={m.id} className="flex items-center gap-2.5 rounded-lg border border-border/70 p-2.5">
                   <span
                     className="grid size-8 shrink-0 place-items-center rounded-full text-[11px] font-semibold text-white"
-                    style={{ background: String(m.avatar_color ?? "var(--primary)") }}
+                    style={{ background: m.avatar_color ?? "var(--primary)" }}
                   >
-                    {initials(String(m.display_name ?? m.email))}
+                    {initials(m.display_name ?? m.email)}
                   </span>
                   <div className="min-w-0 flex-1">
-                    <div className="truncate text-[12.5px] font-medium">{String(m.display_name ?? "—")}</div>
-                    <div className="truncate text-[11.5px] text-muted-foreground">{String(m.email)}</div>
+                    <div className="truncate text-[12.5px] font-medium">{m.display_name ?? "—"}</div>
+                    <div className="truncate text-[11.5px] text-muted-foreground">{m.email}</div>
                   </div>
-                  {String(m.id) === String(user.id) && <Badge variant="secondary">我</Badge>}
+                  {m.id === user.id && <Badge variant="secondary">我</Badge>}
                 </div>
               ))}
             </div>
@@ -145,8 +160,8 @@ export default async function SettingsPage() {
               <Row k="推理服务" v={host || "—"} mono />
               <Row k="兼容协议" v="OpenAI Chat Completions（stream）" />
               <Row k="输入模态" v="文本 / 图像 / 音频" />
-              <Row k="后端数据库" v="Supabase Postgres + RLS" />
-              <Row k="对象存储" v="Supabase Storage · bucket: audio" />
+              <Row k="后端数据库" v="PostgreSQL（pg 直连）" />
+              <Row k="对象存储" v={`S3 兼容 · bucket: ${process.env.S3_BUCKET ?? "—"}`} />
               <Row k="后台 Worker" v="tsx 常驻进程，轮询任务队列" />
               <Row k="可视化编排" v="React Flow (@xyflow/react)" />
               <Row k="UI" v="Next.js App Router + shadcn/ui + Tailwind v4" />

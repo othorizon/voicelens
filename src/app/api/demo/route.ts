@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase/server";
-import { createStandaloneClient } from "@/lib/supabase/standalone";
+import { execute, maybeOne } from "@/lib/db";
+import { currentUser } from "@/lib/auth";
 import { buildDemoZip, DEMO_EXTRA_SCHEMA, generateDemoDataset } from "@/lib/demo/generate";
 import { createImportBatch, importZip } from "@/lib/engine/import";
 
@@ -29,10 +29,7 @@ export async function GET(request: Request) {
  * including the recommended extra schema.
  */
 export async function POST(request: Request) {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const user = await currentUser();
   if (!user) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
 
   const body = (await request.json().catch(() => ({}))) as {
@@ -44,11 +41,10 @@ export async function POST(request: Request) {
   const sourceId = body.sourceId;
   if (!sourceId) return NextResponse.json({ error: "缺少 sourceId" }, { status: 400 });
 
-  const { data: source } = await supabase
-    .from("data_sources")
-    .select("id, name, description, extra_schema")
-    .eq("id", sourceId)
-    .maybeSingle();
+  const source = await maybeOne<{ id: string; name: string; description: string }>(
+    `select id, name, description from data_sources where id = $1`,
+    [sourceId],
+  );
   if (!source) return NextResponse.json({ error: "数据源不存在" }, { status: 404 });
 
   const dataset = generateDemoDataset({
@@ -59,23 +55,23 @@ export async function POST(request: Request) {
 
   if (body.autoSchema !== false && body.fillDescription !== false) {
     const { DEMO_BUSINESS_DESC } = await import("@/lib/demo/generate");
-    await supabase
-      .from("data_sources")
-      .update({
-        extra_schema: DEMO_EXTRA_SCHEMA,
-        description: (source.description as string)?.trim() ? source.description : DEMO_BUSINESS_DESC,
-      })
-      .eq("id", sourceId);
+    await execute(
+      `update data_sources
+       set extra_schema = $2::jsonb,
+           description = case when coalesce(trim(description), '') = '' then $3 else description end,
+           updated_at = now()
+       where id = $1`,
+      [sourceId, JSON.stringify(DEMO_EXTRA_SCHEMA), DEMO_BUSINESS_DESC],
+    );
   }
 
-  const batchId = await createImportBatch(supabase, sourceId, `demo-car-assistant-${dataset.sessions}s.zip`, user.id);
-  const {
-    data: { session },
-  } = await supabase.auth.getSession();
-  const standalone = createStandaloneClient(session?.access_token ?? null);
+  const batchId = await createImportBatch(
+    sourceId,
+    `demo-car-assistant-${dataset.sessions}s.zip`,
+    user.id,
+  );
 
   void importZip(
-    standalone,
     sourceId,
     zip.buffer as ArrayBuffer,
     `demo-car-assistant-${dataset.sessions}s.zip`,

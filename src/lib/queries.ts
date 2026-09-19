@@ -1,5 +1,11 @@
-import type { SupabaseClient } from "@supabase/supabase-js";
+import { callJson, maybeOne, query } from "@/lib/db";
 import type { ExtraFieldDef, JsonObject } from "@/lib/types";
+
+/**
+ * Read paths shared by the pages. The joins that used to be PostgREST embedded
+ * resources (`profiles(display_name, email)`) are plain left joins now, shaped
+ * back into the nested objects the components already read.
+ */
 
 export interface DataSourceWithStats {
   id: string;
@@ -21,23 +27,38 @@ export interface DataSourceWithStats {
   creator?: { display_name: string | null; email: string } | null;
 }
 
-const STATS_SELECT =
-  "id, name, description, extra_schema, status, created_at, updated_at, created_by";
+interface SourceOverview {
+  sessions?: number;
+  users?: number;
+  messages?: number;
+  audios?: number;
+  first_seen?: string | null;
+  last_seen?: string | null;
+}
 
-export async function listDataSources(supabase: SupabaseClient): Promise<DataSourceWithStats[]> {
-  const { data } = await supabase
-    .from("data_sources")
-    .select(`${STATS_SELECT}, profiles(display_name, email)`)
-    .order("created_at", { ascending: false });
-  const rows = (data ?? []) as JsonObject[];
+/** Wrap a joined author into the `{ display_name, email }` shape components expect. */
+function creatorOf(row: JsonObject): { display_name: string | null; email: string } | null {
+  return row.creator_email
+    ? { display_name: (row.creator_name as string | null) ?? null, email: row.creator_email as string }
+    : null;
+}
+
+export async function listDataSources(): Promise<DataSourceWithStats[]> {
+  const rows = await query<JsonObject>(
+    `select d.id, d.name, d.description, d.extra_schema, d.status, d.created_at, d.updated_at,
+            d.created_by, p.display_name as creator_name, p.email as creator_email
+     from data_sources d
+     left join profiles p on p.id = d.created_by
+     order by d.created_at desc`,
+  );
   if (!rows.length) return [];
 
   const overviews = await Promise.all(
-    rows.map((r) => supabase.rpc("source_overview", { p_data_source_id: r.id as string })),
+    rows.map((r) => callJson<SourceOverview>("source_overview", [r.id])),
   );
 
   return rows.map((r, i) => {
-    const o = (overviews[i]?.data ?? {}) as JsonObject;
+    const o = overviews[i] ?? {};
     return {
       id: r.id as string,
       name: r.name as string,
@@ -52,19 +73,18 @@ export async function listDataSources(supabase: SupabaseClient): Promise<DataSou
         user_count: Number(o.users ?? 0),
         message_count: Number(o.messages ?? 0),
         audio_count: Number(o.audios ?? 0),
-        first_seen: (o.first_seen as string | null) ?? null,
-        last_seen: (o.last_seen as string | null) ?? null,
+        first_seen: o.first_seen ?? null,
+        last_seen: o.last_seen ?? null,
       },
-      creator: (r.profiles as DataSourceWithStats["creator"]) ?? null,
+      creator: creatorOf(r),
     };
   });
 }
 
 export async function sourceStats(
-  supabase: SupabaseClient,
   dataSourceId: string,
 ): Promise<JsonObject & { sessions: number; users: number; messages: number; audios: number }> {
-  const { data } = await supabase.rpc("source_overview", { p_data_source_id: dataSourceId });
+  const data = await callJson<SourceOverview>("source_overview", [dataSourceId]);
   return {
     sessions: 0,
     users: 0,
@@ -74,55 +94,70 @@ export async function sourceStats(
   } as JsonObject & { sessions: number; users: number; messages: number; audios: number };
 }
 
-export async function getDataSource(supabase: SupabaseClient, id: string) {
-  const { data } = await supabase
-    .from("data_sources")
-    .select("id, name, description, extra_schema, status, created_at, updated_at, created_by, profiles(display_name, email)")
-    .eq("id", id)
-    .maybeSingle();
-  return data as
-    | (JsonObject & {
-        id: string;
-        name: string;
-        description: string;
-        extra_schema: ExtraFieldDef[];
-        profiles?: { display_name: string | null; email: string } | null;
-      })
-    | null;
+export async function getDataSource(id: string) {
+  const row = await maybeOne<JsonObject>(
+    `select d.id, d.name, d.description, d.extra_schema, d.status, d.created_at, d.updated_at,
+            d.created_by, p.display_name as creator_name, p.email as creator_email
+     from data_sources d
+     left join profiles p on p.id = d.created_by
+     where d.id = $1`,
+    [id],
+  );
+  if (!row) return null;
+  return { ...row, profiles: creatorOf(row) } as JsonObject & {
+    id: string;
+    name: string;
+    description: string;
+    extra_schema: ExtraFieldDef[];
+    profiles?: { display_name: string | null; email: string } | null;
+  };
 }
 
-export async function listWorkflows(supabase: SupabaseClient, dataSourceId?: string) {
-  let query = supabase
-    .from("workflows")
-    .select("id, data_source_id, name, graph, config, is_active, created_at, updated_at, data_sources(name)")
-    .order("updated_at", { ascending: false });
-  if (dataSourceId) query = query.eq("data_source_id", dataSourceId);
-  const { data } = await query;
-  return (data ?? []) as (JsonObject & { id: string; name: string; data_source_id: string })[];
+export async function listWorkflows(dataSourceId?: string) {
+  const rows = await query<JsonObject>(
+    `select w.id, w.data_source_id, w.name, w.graph, w.config, w.is_active,
+            w.created_at, w.updated_at, d.name as source_name
+     from workflows w
+     left join data_sources d on d.id = w.data_source_id
+     where ($1::uuid is null or w.data_source_id = $1)
+     order by w.updated_at desc`,
+    [dataSourceId ?? null],
+  );
+  return rows.map((r) => ({
+    ...r,
+    data_sources: r.source_name ? { name: r.source_name as string } : null,
+  })) as unknown as (JsonObject & { id: string; name: string; data_source_id: string })[];
 }
 
-export async function listTemplates(supabase: SupabaseClient, dataSourceId: string) {
-  const { data } = await supabase
-    .from("analysis_templates")
-    .select(
-      "id, version, status, rationale, feedback, created_at, created_by, metric_schema, samples, parent_id, session_prompt, user_prompt, global_prompt, report_prompt",
-    )
-    .eq("data_source_id", dataSourceId)
-    .order("version", { ascending: false });
-  return (data ?? []) as JsonObject[];
+export async function listTemplates(dataSourceId: string) {
+  return query<JsonObject>(
+    `select id, version, status, rationale, feedback, created_at, created_by, metric_schema,
+            samples, parent_id, session_prompt, user_prompt, global_prompt, report_prompt
+     from analysis_templates
+     where data_source_id = $1
+     order by version desc`,
+    [dataSourceId],
+  );
 }
 
-export async function listTasks(supabase: SupabaseClient, limit = 50, dataSourceId?: string) {
-  let query = supabase
-    .from("analysis_tasks")
-    .select(
-      "id, name, status, stage, progress, stats, error, created_at, started_at, finished_at, data_source_id, template_id, scope_type, range_start, range_end, data_sources(name), profiles(display_name)",
-    )
-    .order("created_at", { ascending: false })
-    .limit(limit);
-  if (dataSourceId) query = query.eq("data_source_id", dataSourceId);
-  const { data } = await query;
-  return (data ?? []) as unknown as TaskRow[];
+export async function listTasks(limit = 50, dataSourceId?: string) {
+  const rows = await query<JsonObject>(
+    `select t.id, t.name, t.status, t.stage, t.progress, t.stats, t.error, t.created_at,
+            t.started_at, t.finished_at, t.data_source_id, t.template_id, t.scope_type,
+            t.range_start, t.range_end, d.name as source_name, p.display_name as creator_name
+     from analysis_tasks t
+     left join data_sources d on d.id = t.data_source_id
+     left join profiles p on p.id = t.created_by
+     where ($2::uuid is null or t.data_source_id = $2)
+     order by t.created_at desc
+     limit $1`,
+    [limit, dataSourceId ?? null],
+  );
+  return rows.map((r) => ({
+    ...r,
+    data_sources: r.source_name ? { name: r.source_name as string } : null,
+    profiles: { display_name: (r.creator_name as string | null) ?? null },
+  })) as unknown as TaskRow[];
 }
 
 export interface TaskRow extends JsonObject {
@@ -145,31 +180,37 @@ export interface TaskRow extends JsonObject {
   profiles?: { display_name: string | null } | null;
 }
 
-export async function listPreviews(supabase: SupabaseClient, dataSourceId: string) {
-  const { data } = await supabase
-    .from("template_previews")
-    .select("id, template_id, status, progress, error, created_at, finished_at, stats")
-    .eq("data_source_id", dataSourceId)
-    .order("created_at", { ascending: false })
-    .limit(20);
-  return (data ?? []) as JsonObject[];
+export async function listPreviews(dataSourceId: string) {
+  return query<JsonObject>(
+    `select id, template_id, status, progress, error, created_at, finished_at, stats
+     from template_previews
+     where data_source_id = $1
+     order by created_at desc
+     limit 20`,
+    [dataSourceId],
+  );
 }
 
-export async function listPlanningJobs(supabase: SupabaseClient, dataSourceId: string) {
-  const { data } = await supabase
-    .from("planning_jobs")
-    .select("id, status, kind, params, feedback, error, created_at, finished_at, progress, template_id, parent_template_id")
-    .eq("data_source_id", dataSourceId)
-    .order("created_at", { ascending: false })
-    .limit(20);
-  return (data ?? []) as JsonObject[];
+export async function listPlanningJobs(dataSourceId: string) {
+  return query<JsonObject>(
+    `select id, status, kind, params, feedback, error, created_at, finished_at, progress,
+            template_id, parent_template_id
+     from planning_jobs
+     where data_source_id = $1
+     order by created_at desc
+     limit 20`,
+    [dataSourceId],
+  );
 }
 
-export async function listBatches(supabase: SupabaseClient, dataSourceId: string) {
-  const { data } = await supabase
-    .from("import_batches")
-    .select("*")
-    .eq("data_source_id", dataSourceId)
-    .order("created_at", { ascending: false });
-  return (data ?? []) as JsonObject[];
+export async function listBatches(dataSourceId: string) {
+  return query<JsonObject>(
+    `select id, data_source_id, file_name, status, total_entries, created_sessions,
+            created_messages, uploaded_audios, failed_audios, skipped, error,
+            progress_detail, created_by, created_at, finished_at
+     from import_batches
+     where data_source_id = $1
+     order by created_at desc`,
+    [dataSourceId],
+  );
 }

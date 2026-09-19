@@ -11,7 +11,7 @@ import {
   Sparkles,
   FileBarChart,
 } from "lucide-react";
-import { createClient } from "@/lib/supabase/server";
+import { count } from "@/lib/db";
 import { listDataSources, listTasks } from "@/lib/queries";
 import { PageHeader, StatCard, StatusBadge, EmptyState } from "@/components/ui-kit";
 import { Button } from "@/components/ui/button";
@@ -23,11 +23,13 @@ export const metadata: Metadata = { title: "概览" };
 export const dynamic = "force-dynamic";
 
 export default async function DashboardPage() {
-  const supabase = await createClient();
-  const [sources, tasks, { count: running }] = await Promise.all([
-    listDataSources(supabase),
-    listTasks(supabase, 8),
-    supabase.from("analysis_tasks").select("id", { count: "exact", head: true }).in("status", ["pending", "running", "aggregating", "reporting"]),
+  const [sources, tasks, running] = await Promise.all([
+    listDataSources(),
+    listTasks(8),
+    count(
+      `select count(*) from analysis_tasks
+       where status in ('pending', 'running', 'aggregating', 'reporting')`,
+    ),
   ]);
 
   const totals = sources.reduce(

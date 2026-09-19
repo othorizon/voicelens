@@ -262,7 +262,7 @@ function buildConversation(rnd: () => number, quality: "good" | "mixed" | "bad",
       noise,
     });
 
-    let reply = isFallback ? pick(rnd, FALLBACK_LINES.ai) : aiText;
+    const reply = isFallback ? pick(rnd, FALLBACK_LINES.ai) : aiText;
     turns.push({
       role: "assistant",
       text: interrupt ? truncateMid(reply) : reply,

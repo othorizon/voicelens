@@ -1,7 +1,7 @@
 import Link from "next/link";
 import type { Metadata } from "next";
 import { Workflow, ArrowUpRight, Sparkles, Database } from "lucide-react";
-import { createClient } from "@/lib/supabase/server";
+import { query } from "@/lib/db";
 import { listWorkflows } from "@/lib/queries";
 import { PageHeader, EmptyState } from "@/components/ui-kit";
 import { Badge } from "@/components/ui/badge";
@@ -12,12 +12,13 @@ export const metadata: Metadata = { title: "工作流" };
 export const dynamic = "force-dynamic";
 
 export default async function WorkflowsPage() {
-  const supabase = await createClient();
-  const [workflows, { data: sources }] = await Promise.all([
-    listWorkflows(supabase),
-    supabase.from("data_sources").select("id, name").order("created_at", { ascending: false }),
+  const [workflows, sources] = await Promise.all([
+    listWorkflows(),
+    query<{ id: string; name: string }>(
+      `select id, name from data_sources order by created_at desc`,
+    ),
   ]);
-  const sourceName = new Map((sources ?? []).map((s) => [s.id as string, s.name as string]));
+  const sourceName = new Map(sources.map((s) => [s.id, s.name]));
 
   return (
     <>

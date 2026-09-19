@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { FileBarChart, ExternalLink, Download, Layers, Users, MessagesSquare } from "lucide-react";
-import { createClient } from "@/lib/supabase/server";
+import { callJson, count as countRows, maybeOne } from "@/lib/db";
 import { TaskLive } from "@/components/task-live";
 import { DrillExplorer } from "@/components/drill-explorer";
 import { BarStrip, Donut } from "@/components/mini-charts";
@@ -18,34 +18,45 @@ export const dynamic = "force-dynamic";
 
 export default async function TaskDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const supabase = await createClient();
-
-  const { data: task } = await supabase
-    .from("analysis_tasks")
-    .select(
-      "id, name, status, stage, progress, stats, error, created_at, started_at, finished_at, data_source_id, template_id, scope_type, range_start, range_end, report, report_html, config, data_sources(name), analysis_templates(version), profiles(display_name)",
-    )
-    .eq("id", id)
-    .maybeSingle();
+  // The embedded resources are left joins now, flattened back into the nested
+  // shape this page already reads.
+  const task = await maybeOne<JsonObject>(
+    `select t.id, t.name, t.status, t.stage, t.progress, t.stats, t.error, t.created_at,
+            t.started_at, t.finished_at, t.data_source_id, t.template_id, t.scope_type,
+            t.range_start, t.range_end, t.report, t.report_html, t.config,
+            d.name as source_name, tpl.version as template_version,
+            p.display_name as creator_name
+     from analysis_tasks t
+     left join data_sources d on d.id = t.data_source_id
+     left join analysis_templates tpl on tpl.id = t.template_id
+     left join profiles p on p.id = t.created_by
+     where t.id = $1`,
+    [id],
+  );
 
   if (!task) notFound();
 
-  const t = task as JsonObject;
+  const t: JsonObject = {
+    ...task,
+    data_sources: task.source_name ? { name: task.source_name } : null,
+    analysis_templates: task.template_version != null ? { version: task.template_version } : null,
+    profiles: { display_name: task.creator_name ?? null },
+  };
   const completed = t.status === "completed";
 
-  const [{ data: globalRes }, { data: sessionStats }, { data: userStats }, { count: userCount }] =
-    await Promise.all([
-      supabase.from("task_global_result").select("result, status").eq("task_id", id).maybeSingle(),
-      completed
-        ? supabase.rpc("task_session_stats", { p_task_id: id, p_scope: "all", p_user_key: null })
-        : Promise.resolve({ data: null }),
-      completed ? supabase.rpc("task_user_stats", { p_task_id: id }) : Promise.resolve({ data: null }),
-      supabase.from("task_session_results").select("user_key", { count: "exact", head: true }).eq("task_id", id),
-    ]);
+  const [globalRes, sessionStats, userStats, userCount] = await Promise.all([
+    maybeOne<{ result: JsonObject | null; status: string }>(
+      `select result, status from task_global_result where task_id = $1`,
+      [id],
+    ),
+    completed ? callJson<JsonObject>("task_session_stats", [id, "all", null]) : null,
+    completed ? callJson<JsonObject>("task_user_stats", [id]) : null,
+    countRows(`select count(*) from task_session_results where task_id = $1`, [id]),
+  ]);
 
-  const g = ((globalRes?.result ?? {}) as JsonObject) ?? {};
-  const ss = ((sessionStats ?? {}) as JsonObject) ?? {};
-  const us = ((userStats ?? {}) as JsonObject) ?? {};
+  const g = (globalRes?.result ?? {}) as JsonObject;
+  const ss = (sessionStats ?? {}) as JsonObject;
+  const us = (userStats ?? {}) as JsonObject;
   const dist = (ss.distributions ?? {}) as JsonObject;
 
   return (

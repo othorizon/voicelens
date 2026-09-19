@@ -1,4 +1,4 @@
-import type { SupabaseClient } from "@supabase/supabase-js";
+import { callJson, count as countRows, query } from "@/lib/db";
 import { truncate } from "./normalize";
 import type { ExtraFieldDef, JsonObject } from "@/lib/types";
 
@@ -17,36 +17,35 @@ export interface ScopeOptions {
 
 /** Decide which sessions this run should cover. */
 export async function resolveScope(
-  supabase: SupabaseClient,
   dataSourceId: string,
   options: ScopeOptions,
 ): Promise<ScopeSelection> {
   const limit = options.limit > 0 ? options.limit : 100000;
 
   if (options.mode === "range") {
-    let query = supabase
-      .from("sessions")
-      .select("id")
-      .eq("data_source_id", dataSourceId)
-      .order("started_at", { ascending: true })
-      .limit(limit);
-    if (options.rangeStart) query = query.gte("started_at", options.rangeStart);
-    if (options.rangeEnd) query = query.lte("started_at", options.rangeEnd);
-    const { data } = await query;
-    const ids = (data ?? []).map((r) => r.id as string);
+    // A null bound means "unbounded on that side".
+    const rows = await query<{ id: string }>(
+      `select id from sessions
+       where data_source_id = $1
+         and ($2::timestamptz is null or started_at >= $2)
+         and ($3::timestamptz is null or started_at <= $3)
+       order by started_at
+       limit $4`,
+      [dataSourceId, options.rangeStart ?? null, options.rangeEnd ?? null, limit],
+    );
+    const ids = rows.map((r) => r.id);
     return { sessionIds: ids, mode: "range", totalAvailable: ids.length };
   }
 
-  const { data } = await supabase.rpc("unanalyzed_session_ids", {
-    p_data_source_id: dataSourceId,
-    p_limit: limit,
-  });
-  const ids = ((data ?? []) as { id: string }[]).map((r) => r.id);
-  const { count } = await supabase
-    .from("sessions")
-    .select("id", { count: "exact", head: true })
-    .eq("data_source_id", dataSourceId);
-  return { sessionIds: ids, mode: "incremental", totalAvailable: count ?? ids.length };
+  const rows = await query<{ id: string }>(`select id from unanalyzed_session_ids($1, $2)`, [
+    dataSourceId,
+    limit,
+  ]);
+  const ids = rows.map((r) => r.id);
+  const total = await countRows(`select count(*) from sessions where data_source_id = $1`, [
+    dataSourceId,
+  ]);
+  return { sessionIds: ids, mode: "incremental", totalAvailable: total || ids.length };
 }
 
 export interface SessionLike {
@@ -143,20 +142,19 @@ export interface SampleLayers extends PlanningSamples {
  * statistics computed in Postgres.
  */
 export async function sampleForPlanning(
-  supabase: SupabaseClient,
   dataSourceId: string,
   opts: { sessionSamples: number; userSamples: number },
 ): Promise<SampleLayers> {
   const want = Math.max(3, Math.min(opts.sessionSamples, 12));
 
-  const { data: head } = await supabase
-    .from("sessions")
-    .select("id, session_key, user_key, started_at, ended_at, turn_count, audio_count, digest, extra")
-    .eq("data_source_id", dataSourceId)
-    .order("started_at", { ascending: false, nullsFirst: false })
-    .limit(Math.max(want * 8, 120));
-
-  const pool = (head ?? []) as SessionLike[];
+  const pool = await query<SessionLike>(
+    `select id, session_key, user_key, started_at, ended_at, turn_count, audio_count, digest, extra
+     from sessions
+     where data_source_id = $1
+     order by started_at desc nulls last
+     limit $2`,
+    [dataSourceId, Math.max(want * 8, 120)],
+  );
 
   // Representative spread over session length and distinct users, plus the two
   // longest sessions, which usually carry the most signal for prompt design.
@@ -173,16 +171,18 @@ export async function sampleForPlanning(
   // Fill digests for any session that does not have one stored yet.
   const missing = picked.filter((p) => !p.digest).map((p) => p.id);
   if (missing.length) {
-    const { data: msgs } = await supabase
-      .from("messages")
-      .select("session_id, seq, role, content_text, occurred_at, extra")
-      .in("session_id", missing)
-      .order("seq", { ascending: true });
-    const bySession = new Map<string, typeof msgs>();
-    for (const m of msgs ?? []) {
-      const arr = bySession.get(m.session_id as string) ?? [];
+    const msgs = await query<TranscriptRow>(
+      `select session_id, seq, role, content_text, occurred_at, extra
+       from messages
+       where session_id = any($1::uuid[])
+       order by seq`,
+      [missing],
+    );
+    const bySession = new Map<string, TranscriptRow[]>();
+    for (const m of msgs) {
+      const arr = bySession.get(m.session_id) ?? [];
       arr.push(m);
-      bySession.set(m.session_id as string, arr);
+      bySession.set(m.session_id, arr);
     }
     for (const s of picked) {
       if (!s.digest) s.digest = buildDigest(bySession.get(s.id) ?? []);
@@ -190,34 +190,37 @@ export async function sampleForPlanning(
   }
 
   // -------- user layer: prefer users with several sessions
-  const { data: userRows } = await supabase
-    .from("sessions")
-    .select("user_key")
-    .eq("data_source_id", dataSourceId);
-
-  const counts = new Map<string, number>();
-  for (const r of userRows ?? []) {
-    const k = r.user_key as string;
-    counts.set(k, (counts.get(k) ?? 0) + 1);
-  }
-  const topUsers = [...counts.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, Math.max(opts.userSamples, 2))
-    .map(([k]) => k);
+  const counted = await query<{ user_key: string; n: number }>(
+    `select user_key, count(*)::int as n
+     from sessions
+     where data_source_id = $1
+     group by user_key
+     order by n desc, user_key
+     limit $2`,
+    [dataSourceId, Math.max(opts.userSamples, 2)],
+  );
+  const topUsers = counted.map((r) => r.user_key);
 
   const usersDetail: SampleLayers["usersDetail"] = [];
   if (topUsers.length) {
-    const { data: userSessions } = await supabase
-      .from("sessions")
-      .select("user_key, session_key, digest, turn_count, started_at")
-      .eq("data_source_id", dataSourceId)
-      .in("user_key", topUsers)
-      .order("started_at", { ascending: true })
-      .limit(400);
+    const userSessions = await query<{
+      user_key: string;
+      session_key: string;
+      digest: string | null;
+      turn_count: number;
+      started_at: string | null;
+    }>(
+      `select user_key, session_key, digest, turn_count, started_at
+       from sessions
+       where data_source_id = $1 and user_key = any($2::text[])
+       order by started_at
+       limit 400`,
+      [dataSourceId, topUsers],
+    );
 
     for (const key of topUsers) {
-      const rows = (userSessions ?? []).filter((r) => r.user_key === key);
-      const sessionKeys = rows.map((r) => r.session_key as string);
+      const rows = userSessions.filter((r) => r.user_key === key);
+      const sessionKeys = rows.map((r) => r.session_key);
       const sampled =
         rows.length > 4
           ? [rows[0], rows[Math.floor(rows.length / 3)], rows[Math.floor((rows.length * 2) / 3)], rows[rows.length - 1]]
@@ -229,14 +232,18 @@ export async function sampleForPlanning(
     }
   }
 
-  const [{ data: overview }, { data: hist }] = await Promise.all([
-    supabase.rpc("source_overview", { p_data_source_id: dataSourceId }),
-    supabase.rpc("extra_histogram", { p_data_source_id: dataSourceId, p_max_values: 20 }),
+  const [overview, hist] = await Promise.all([
+    callJson<JsonObject>("source_overview", [dataSourceId]),
+    callJson<{ key: string; values: { name: string; value: number }[] }[]>("extra_histogram", [
+      dataSourceId,
+      20,
+    ]),
   ]);
 
-  const histogram = ((hist ?? []) as { key: string; values: { name: string; value: number }[] }[]).map(
-    (h) => ({ key: h.key, values: (h.values ?? []).slice(0, 16) }),
-  );
+  const histogram = (hist ?? []).map((h) => ({
+    key: h.key,
+    values: (h.values ?? []).slice(0, 16),
+  }));
 
   const o = (overview ?? {}) as JsonObject & Record<string, unknown>;
 
@@ -306,30 +313,30 @@ function fmtOffset(ms: number): string {
 }
 
 /** Load full transcripts for an explicit set of session ids. */
-export async function loadSessions(
-  supabase: SupabaseClient,
-  sessionIds: string[],
-  opts: { maxDigestChars?: number } = {},
-) {
+export async function loadSessions(sessionIds: string[], opts: { maxDigestChars?: number } = {}) {
   if (!sessionIds.length) return [];
-  const { data } = await supabase
-    .from("sessions")
-    .select("id, data_source_id, session_key, user_key, started_at, ended_at, turn_count, audio_count, extra, digest")
-    .in("id", sessionIds);
-  const rows = (data ?? []) as (Omit<SampledSession, "digest"> & { digest: string | null })[];
+  const rows = await query<Omit<SampledSession, "digest"> & { digest: string | null }>(
+    `select id, data_source_id, session_key, user_key, started_at, ended_at, turn_count,
+            audio_count, extra, digest
+     from sessions
+     where id = any($1::uuid[])`,
+    [sessionIds],
+  );
 
   const needDigest = rows.filter((r) => !r.digest).map((r) => r.id);
-  let bySession = new Map<string, TranscriptRow[]>();
+  const bySession = new Map<string, TranscriptRow[]>();
   if (needDigest.length) {
-    const { data: msgs } = await supabase
-      .from("messages")
-      .select("session_id, seq, role, content_text, occurred_at, extra")
-      .in("session_id", needDigest.slice(0, 500))
-      .order("seq", { ascending: true });
-    for (const m of msgs ?? []) {
-      const arr = bySession.get(m.session_id as string) ?? [];
-      arr.push(m as TranscriptRow);
-      bySession.set(m.session_id as string, arr);
+    const msgs = await query<TranscriptRow>(
+      `select session_id, seq, role, content_text, occurred_at, extra
+       from messages
+       where session_id = any($1::uuid[])
+       order by seq`,
+      [needDigest.slice(0, 500)],
+    );
+    for (const m of msgs) {
+      const arr = bySession.get(m.session_id) ?? [];
+      arr.push(m);
+      bySession.set(m.session_id, arr);
     }
   }
 
@@ -351,25 +358,21 @@ export interface TranscriptRow {
 }
 
 /** Audio objects (path + format) attached to a session, for multimodal input. */
-export async function loadSessionAudio(
-  supabase: SupabaseClient,
-  sessionId: string,
-  limit: number,
-) {
-  const { data } = await supabase
-    .from("messages")
-    .select("seq, role, audio_path, audio_format, content_text")
-    .eq("session_id", sessionId)
-    .not("audio_path", "is", null)
-    .order("seq", { ascending: true })
-    .limit(limit);
-  return (data ?? []) as {
+export async function loadSessionAudio(sessionId: string, limit: number) {
+  return query<{
     seq: number;
     role: string;
     audio_path: string;
     audio_format: string | null;
     content_text: string;
-  }[];
+  }>(
+    `select seq, role, audio_path, audio_format, content_text
+     from messages
+     where session_id = $1 and audio_path is not null
+     order by seq
+     limit $2`,
+    [sessionId, limit],
+  );
 }
 
 export type { ExtraFieldDef };

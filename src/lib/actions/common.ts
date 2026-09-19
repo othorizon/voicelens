@@ -1,24 +1,19 @@
 import { redirect } from "next/navigation";
-import { createClient } from "@/lib/supabase/server";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import { currentUser, type AuthUser } from "@/lib/auth";
 
 export interface Session {
-  supabase: SupabaseClient;
   userId: string;
-  accessToken: string;
+  user: AuthUser;
 }
 
-/** Server-action guard: returns the request-scoped client + user id. */
+/**
+ * Server-action guard. Every signed-in member shares one workspace, so being
+ * signed in is the whole authorization check — there is no per-row ownership.
+ */
 export async function requireSession(): Promise<Session> {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const user = await currentUser();
   if (!user) redirect("/login");
-  const {
-    data: { session },
-  } = await supabase.auth.getSession();
-  return { supabase, userId: user.id, accessToken: session?.access_token ?? "" };
+  return { userId: user.id, user };
 }
 
 export class ActionError extends Error {

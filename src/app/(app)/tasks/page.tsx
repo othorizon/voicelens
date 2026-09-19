@@ -1,7 +1,6 @@
 import Link from "next/link";
 import type { Metadata } from "next";
 import { ListChecks, FileBarChart, ArrowUpRight, Clock } from "lucide-react";
-import { createClient } from "@/lib/supabase/server";
 import { listTasks } from "@/lib/queries";
 import { PageHeader, StatusBadge, StageLabel, EmptyState } from "@/components/ui-kit";
 import { AutoRefresh } from "@/components/auto-refresh";
@@ -15,8 +14,7 @@ export const metadata: Metadata = { title: "分析任务" };
 export const dynamic = "force-dynamic";
 
 export default async function TasksPage() {
-  const supabase = await createClient();
-  const tasks = await listTasks(supabase, 100);
+  const tasks = await listTasks(100);
   const hasActive = tasks.some((t) => ["pending", "running", "aggregating", "reporting"].includes(t.status));
 
   return (

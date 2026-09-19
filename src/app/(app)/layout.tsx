@@ -1,26 +1,16 @@
 import { redirect } from "next/navigation";
-import { createClient } from "@/lib/supabase/server";
+import { currentUser } from "@/lib/auth";
 import { AppShell, type CurrentUser } from "@/components/app-shell";
 
 export default async function AppLayout({ children }: { children: React.ReactNode }) {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
+  const user = await currentUser();
   if (!user) redirect("/login");
 
-  const { data: profile } = await supabase
-    .from("profiles")
-    .select("id, email, display_name, avatar_color")
-    .eq("id", user.id)
-    .maybeSingle();
-
-  const current: CurrentUser = profile ?? {
+  const current: CurrentUser = {
     id: user.id,
-    email: user.email ?? "",
-    display_name: user.email?.split("@")[0] ?? null,
-    avatar_color: null,
+    email: user.email,
+    display_name: user.display_name ?? user.email.split("@")[0],
+    avatar_color: user.avatar_color,
   };
 
   return <AppShell user={current}>{children}</AppShell>;

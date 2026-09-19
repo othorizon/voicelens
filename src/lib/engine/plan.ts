@@ -1,4 +1,4 @@
-import type { SupabaseClient } from "@supabase/supabase-js";
+import { callJson, query } from "@/lib/db";
 import { chat, chatJson, type ContentPart } from "./ai";
 import {
   describeExtraSchema,
@@ -41,7 +41,6 @@ export interface DataSourceLike {
 /* ------------------------------------------------------------ planning */
 
 export interface PlanInput {
-  supabase: SupabaseClient;
   dataSource: DataSourceLike;
   sessionSamples: number;
   userSamples: number;
@@ -90,7 +89,6 @@ interface PlannerResult {
 
 /** Ask the multimodal model what the audio adds, so planning can rely on it. */
 async function audioImpression(
-  supabase: SupabaseClient,
   dataSource: DataSourceLike,
   sessionIds: string[],
   maxClips = 6,
@@ -98,12 +96,12 @@ async function audioImpression(
   const clips: { path: string; format: string | null; role: string }[] = [];
   for (const id of sessionIds) {
     if (clips.length >= maxClips) break;
-    const audios = await loadSessionAudio(supabase, id, 2);
+    const audios = await loadSessionAudio(id, 2);
     clips.push(...audios.map((a) => ({ path: a.audio_path, format: a.audio_format, role: a.role })));
   }
   if (!clips.length) return "";
 
-  const urls = await signedAudioUrls(supabase, clips.slice(0, maxClips).map((c) => c.path));
+  const urls = await signedAudioUrls(clips.slice(0, maxClips).map((c) => c.path));
   const parts = [
     {
       type: "text" as const,
@@ -136,8 +134,7 @@ async function audioImpression(
 }
 
 export async function planTemplate(input: PlanInput): Promise<PlanOutput> {
-  const supabaseRef = input.supabase;
-  const samples = await sampleForPlanning(supabaseRef, input.dataSource.id, {
+  const samples = await sampleForPlanning(input.dataSource.id, {
     sessionSamples: input.sessionSamples,
     userSamples: input.userSamples,
   });
@@ -147,7 +144,6 @@ export async function planTemplate(input: PlanInput): Promise<PlanOutput> {
   let impression = "";
   if (input.includeAudio && samples.rawSessions.length) {
     impression = await audioImpression(
-      supabaseRef,
       input.dataSource,
       samples.rawSessions.slice(0, 4).map((s) => s.id),
     );
@@ -306,7 +302,6 @@ quality_score 评分锚点：
 /* ------------------------------------------------------------ preview */
 
 export interface PreviewInput {
-  supabase: SupabaseClient;
   dataSource: DataSourceLike;
   template: {
     session_prompt: string;
@@ -330,18 +325,19 @@ export interface PreviewOutput {
 }
 
 export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> {
-  const { supabase, dataSource, template } = input;
+  const { dataSource, template } = input;
   const total = input.sessions;
   const progress = input.onProgress ?? (() => {});
 
   progress({ stage: "collect", done: 0, total, message: "选取预览样本" });
-  const { data: pool } = await (supabase
-    .from("sessions")
-    .select("id, session_key, user_key, started_at, ended_at, turn_count, audio_count, extra, digest")
-    .eq("data_source_id", dataSource.id)
-    .order("started_at", { ascending: false, nullsFirst: false })
-    .limit(Math.max(total * 8, 160)) as never);
-  const rows = (pool ?? []) as SessionLike[];
+  const rows = await query<SessionLike>(
+    `select id, session_key, user_key, started_at, ended_at, turn_count, audio_count, extra, digest
+     from sessions
+     where data_source_id = $1
+     order by started_at desc nulls last
+     limit $2`,
+    [dataSource.id, Math.max(total * 8, 160)],
+  );
 
   // Representative sample: spread evenly over session length AND over distinct
   // users. Picking the longest sessions first biased early previews toward the
@@ -349,7 +345,7 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
   const picked = stratifiedPick(rows, total);
 
   const ids = picked.slice(0, total).map((r) => r.id);
-  const sessions = await loadSessions(supabase, ids, { maxDigestChars: 20000 });
+  const sessions = await loadSessions(ids, { maxDigestChars: 20000 });
   progress({ stage: "session_analysis", done: 0, total: sessions.length, message: `分析 ${sessions.length} 个会话` });
 
   const extraHint = describeExtraSchema(dataSource.extra_schema);
@@ -359,7 +355,7 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
       const parsed = await chatJson<SessionAnalysis>(
         [
           { role: "system", content: template.session_prompt },
-          { role: "user", content: await sessionPayloadContent(supabase, s, extraHint, input.useAudio) },
+          { role: "user", content: await sessionPayloadContent(s, extraHint, input.useAudio) },
         ],
         { temperature: 0.3 },
       );
@@ -421,7 +417,7 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
   progress({ stage: "global_aggregation", done: 0, total: 1, message: "全局汇总" });
   const stats = computeStats(sessionResults);
   const userStats = computeUserStats(userAgg);
-  const histograms = await extraHistogramForSessions(supabase, sessions.map((s) => s.id));
+  const histograms = await extraHistogramForSessions(sessions.map((s) => s.id));
   const { result: globalResult } = await aggregateGlobal(
     {
       userResults: userAgg,
@@ -478,7 +474,6 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
 }
 
 async function sessionPayloadContent(
-  supabase: SupabaseClient,
   session: { id: string; session_key: string; user_key: string; started_at: string | null; ended_at?: string | null; turn_count: number; audio_count: number; digest: string; extra: JsonObject },
   extraHint: string,
   useAudio: boolean,
@@ -497,9 +492,9 @@ async function sessionPayloadContent(
     .join("\n");
 
   if (!useAudio || !session.audio_count) return text;
-  const audios = await loadSessionAudio(supabase, session.id, 6);
+  const audios = await loadSessionAudio(session.id, 6);
   if (!audios.length) return text;
-  const urls = await signedAudioUrls(supabase, audios.map((a) => a.audio_path));
+  const urls = await signedAudioUrls(audios.map((a) => a.audio_path));
   const parts: ContentPart[] = [
     { type: "text", text: `随附 ${urls.size} 段原始音频，顺序与转录一致。若音频可用请结合语气/情绪/打断/停顿判断；不可用则仅依据转录，不要臆测。` },
     { type: "text", text },
@@ -629,25 +624,15 @@ export function computeUserStats(users: { user_key: string; result: UserAnalysis
   };
 }
 
-async function extraHistograms(supabase: SupabaseClient, dataSourceId: string) {
-  const { data } = await supabase.rpc("extra_histogram", {
-    p_data_source_id: dataSourceId,
-    p_max_values: 16,
-  });
-  const rows = (data ?? []) as { key: string; values: { name: string; value: number }[] }[];
-  return rows.map((r) => ({ key: r.key, values: (r.values ?? []).slice(0, 16) }));
-}
-
 /** Histogram restricted to an explicit set of sessions, so a sample reports on itself. */
 export async function extraHistogramForSessions(
-  supabase: SupabaseClient,
   sessionIds: string[],
 ): Promise<HistogramEntry[]> {
   if (!sessionIds.length) return [];
-  const { data } = await supabase.rpc("extra_histogram_for_sessions", {
-    p_session_ids: sessionIds,
-    p_max_values: 16,
-  });
+  const data = await callJson<{ key: string; values: { name: string; value: number }[] }[]>(
+    "extra_histogram_for_sessions",
+    [sessionIds, 16],
+  );
   return ((data ?? []) as HistogramEntry[]).map((r) => ({
     key: r.key,
     values: (r.values ?? []).slice(0, 16),

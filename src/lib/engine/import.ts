@@ -1,5 +1,6 @@
 import JSZip from "jszip";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import { execute, one, query } from "@/lib/db";
+import { uploadObject } from "@/lib/storage";
 import { bundleSessions, normalizeLine, type NormalizedMessage, type SessionBundle } from "./normalize";
 
 export interface ImportResult {
@@ -32,28 +33,24 @@ function audioFormat(name: string): string {
 }
 
 export async function createImportBatch(
-  supabase: SupabaseClient,
   dataSourceId: string,
   fileName: string,
   userId: string | null,
 ): Promise<string> {
-  const { data, error } = await supabase
-    .from("import_batches")
-    .insert({
-      data_source_id: dataSourceId,
-      file_name: fileName,
-      status: "processing",
-      created_by: userId,
-      progress_detail: { step: "queued" },
-    })
-    .select("id")
-    .single();
-  if (error || !data) throw new Error(`无法创建导入批次: ${error?.message ?? "unknown"}`);
-  return data.id as string;
+  try {
+    const row = await one<{ id: string }>(
+      `insert into import_batches (data_source_id, file_name, status, created_by, progress_detail)
+       values ($1, $2, 'processing', $3, $4::jsonb)
+       returning id`,
+      [dataSourceId, fileName, userId, JSON.stringify({ step: "queued" })],
+    );
+    return row.id;
+  } catch (err) {
+    throw new Error(`无法创建导入批次: ${(err as Error).message}`);
+  }
 }
 
 export async function importZip(
-  supabase: SupabaseClient,
   dataSourceId: string,
   zipBuffer: ArrayBuffer,
   fileName: string,
@@ -61,7 +58,7 @@ export async function importZip(
   log: ImportLogger = () => {},
   existingBatchId?: string,
 ): Promise<ImportResult> {
-  const batchId = existingBatchId ?? (await createImportBatch(supabase, dataSourceId, fileName, userId));
+  const batchId = existingBatchId ?? (await createImportBatch(dataSourceId, fileName, userId));
 
   const errors: string[] = [];
   const result: ImportResult = {
@@ -119,10 +116,10 @@ export async function importZip(
     }
     if (all.length === 0) throw new Error("没有解析出任何对话记录");
 
-    await supabase
-      .from("import_batches")
-      .update({ total_entries: all.length, progress_detail: { step: "bundle" } })
-      .eq("id", batchId);
+    await execute(
+      `update import_batches set total_entries = $2, progress_detail = $3::jsonb where id = $1`,
+      [batchId, all.length, JSON.stringify({ step: "bundle" })],
+    );
 
     // ---------------------------------------------------------- 2. bundle
     const bundles = bundleSessions(all);
@@ -130,18 +127,18 @@ export async function importZip(
 
     // existing sessions (multi-batch append)
     const sessionKeys = bundles.map((b) => b.sessionKey);
-    const { data: existing } = await supabase
-      .from("sessions")
-      .select("id, session_key, turn_count, human_turn_count, ai_turn_count, audio_count, char_count, digest, started_at, ended_at")
-      .eq("data_source_id", dataSourceId)
-      .in("session_key", sessionKeys.slice(0, 3000));
-
-    const existingMap = new Map(
-      (existing ?? []).map((r) => [r.session_key as string, r as ExistingSession]),
+    const existing = await query<ExistingSession>(
+      `select id, session_key, turn_count, human_turn_count, ai_turn_count, audio_count,
+              char_count, digest, started_at, ended_at
+       from sessions
+       where data_source_id = $1 and session_key = any($2::text[])`,
+      [dataSourceId, sessionKeys.slice(0, 3000)],
     );
 
+    const existingMap = new Map(existing.map((r) => [r.session_key, r]));
+
     // ------------------------------------------------------------ 3. audio
-    const uploads = await uploadAudios(supabase, dataSourceId, batchId, bundles, audioEntries, log);
+    const uploads = await uploadAudios(dataSourceId, batchId, bundles, audioEntries, log);
     result.audios = uploads.ok;
     result.failedAudios = uploads.failed;
     errors.push(...uploads.errors.slice(0, 10));
@@ -151,59 +148,79 @@ export async function importZip(
   const messageRows: MessageRowInsert[] = [];
 
 
-    await supabase
-      .from("import_batches")
-      .update({ progress_detail: { step: "write" } })
-      .eq("id", batchId);
+    await execute(`update import_batches set progress_detail = $2::jsonb where id = $1`, [
+      batchId,
+      JSON.stringify({ step: "write" }),
+    ]);
 
-    // Insert new sessions / update existing ones, then read back their uuids.
+    // One statement per slice: new sessions are inserted, sessions seen by an
+    // earlier batch take the recomputed counters, and both come back with their
+    // uuid, so no separate read-back is needed.
     for (const slice of chunk(bundles, 200)) {
-      const inserts: SessionRowInsert[] = [];
-      const touchedKeys: string[] = [];
-
-      for (const b of slice) {
+      const rows = slice.map((b) => {
         const prev = existingMap.get(b.sessionKey);
-        touchedKeys.push(b.sessionKey);
-        const counters = {
+        return {
+          session_key: b.sessionKey,
+          user_key: b.userKey,
           started_at: prev?.started_at && earlier(prev.started_at, b.startedAt) ? prev.started_at : b.startedAt,
           ended_at: prev?.ended_at && later(prev.ended_at, b.endedAt) ? prev.ended_at : b.endedAt,
           turn_count: (prev?.turn_count ?? 0) + b.messages.length,
           human_turn_count: (prev?.human_turn_count ?? 0) + b.messages.filter((m) => m.role === "user").length,
           ai_turn_count: (prev?.ai_turn_count ?? 0) + b.messages.filter((m) => m.role === "assistant").length,
           audio_count: (prev?.audio_count ?? 0) + b.messages.filter((m) => uploads.pathOf.has(m)).length,
-          char_count: (prev?.char_count ?? 0) + b.messages.reduce((s, m) => s + m.contentText.length, 0),
-          extra: b.extra,
+          char_count: (prev?.char_count ?? 0) + b.messages.reduce((acc, m) => acc + m.contentText.length, 0),
+          extra: JSON.stringify(b.extra ?? {}),
           digest: prev?.digest ? `${prev.digest}\n${b.digest}` : b.digest,
-          last_import_batch_id: batchId,
         };
+      });
 
-        if (prev) {
-          const { error } = await supabase.from("sessions").update(counters as never).eq("id", prev.id);
-          if (error) throw new Error(`更新 session 失败: ${error.message}`);
-          continue;
-        }
-
-        inserts.push({
-          data_source_id: dataSourceId,
-          session_key: b.sessionKey,
-          user_key: b.userKey,
-          ...counters,
-        } satisfies SessionRowInsert);
+      let written: { id: string; session_key: string }[];
+      try {
+        written = await query<{ id: string; session_key: string }>(
+          `insert into sessions
+             (data_source_id, session_key, user_key, started_at, ended_at, turn_count,
+              human_turn_count, ai_turn_count, audio_count, char_count, extra, digest,
+              last_import_batch_id)
+           select $1, t.session_key, t.user_key, t.started_at, t.ended_at, t.turn_count,
+                  t.human_turn_count, t.ai_turn_count, t.audio_count, t.char_count, t.extra,
+                  t.digest, $2
+           from unnest($3::text[], $4::text[], $5::timestamptz[], $6::timestamptz[], $7::int[],
+                       $8::int[], $9::int[], $10::int[], $11::int[], $12::jsonb[], $13::text[])
+             as t(session_key, user_key, started_at, ended_at, turn_count, human_turn_count,
+                  ai_turn_count, audio_count, char_count, extra, digest)
+           on conflict (data_source_id, session_key) do update
+             set started_at = excluded.started_at,
+                 ended_at = excluded.ended_at,
+                 turn_count = excluded.turn_count,
+                 human_turn_count = excluded.human_turn_count,
+                 ai_turn_count = excluded.ai_turn_count,
+                 audio_count = excluded.audio_count,
+                 char_count = excluded.char_count,
+                 extra = excluded.extra,
+                 digest = excluded.digest,
+                 last_import_batch_id = excluded.last_import_batch_id
+           returning id, session_key`,
+          [
+            dataSourceId,
+            batchId,
+            rows.map((r) => r.session_key),
+            rows.map((r) => r.user_key),
+            rows.map((r) => r.started_at),
+            rows.map((r) => r.ended_at),
+            rows.map((r) => r.turn_count),
+            rows.map((r) => r.human_turn_count),
+            rows.map((r) => r.ai_turn_count),
+            rows.map((r) => r.audio_count),
+            rows.map((r) => r.char_count),
+            rows.map((r) => r.extra),
+            rows.map((r) => r.digest),
+          ],
+        );
+      } catch (err) {
+        throw new Error(`写入 session 失败: ${(err as Error).message}`);
       }
 
-      // Rows are kept homogeneous so PostgREST never fills a missing column with NULL.
-      if (inserts.length) {
-        const { error } = await supabase.from("sessions").insert(inserts as never);
-        if (error) throw new Error(`写入 session 失败: ${error.message}`);
-      }
-
-      const { data: inserted, error: readErr } = await supabase
-        .from("sessions")
-        .select("id, session_key")
-        .eq("data_source_id", dataSourceId)
-        .in("session_key", touchedKeys);
-      if (readErr) throw new Error(`回读 session 失败: ${readErr.message}`);
-      for (const row of inserted ?? []) sessionPkByKey.set(String(row.session_key), String(row.id));
+      for (const row of written) sessionPkByKey.set(row.session_key, row.id);
       result.sessions += slice.length;
     }
 
@@ -213,66 +230,105 @@ export async function importZip(
       const offset = existingMap.get(bundle.sessionKey)?.turn_count ?? 0;
       for (const m of bundle.messages) {
         messageRows.push({
-          data_source_id: dataSourceId,
           session_id: sessionPk,
           seq: offset + m.seq,
           role: m.role,
-          content: m.content ?? m.contentText,
+          content: JSON.stringify(m.content ?? m.contentText),
           content_text: m.contentText,
           occurred_at: m.occurredAt,
           audio_path: uploads.pathOf.get(m) ?? null,
           audio_format: uploads.pathOf.has(m) ? audioFormat(m.audio ?? "") : null,
           audio_size: uploads.sizeOf.get(m) ?? null,
-          extra: m.extra ?? {},
-          import_batch_id: batchId,
+          extra: JSON.stringify(m.extra ?? {}),
         });
       }
     }
 
-    await supabase
-      .from("import_batches")
-      .update({ progress_detail: { step: "messages" }, created_sessions: result.sessions })
-      .eq("id", batchId);
+    await execute(
+      `update import_batches set progress_detail = $2::jsonb, created_sessions = $3 where id = $1`,
+      [batchId, JSON.stringify({ step: "messages" }), result.sessions],
+    );
 
     for (const rows of chunk(messageRows, CHUNK)) {
-      const { error } = await supabase.from("messages").insert(rows as never);
-      if (error) throw new Error(`写入 message 失败: ${error.message}`);
+      try {
+        await execute(
+          `insert into messages
+             (data_source_id, session_id, seq, role, content, content_text, occurred_at,
+              audio_path, audio_format, audio_size, extra, import_batch_id)
+           select $1, t.session_id, t.seq, t.role, t.content, t.content_text, t.occurred_at,
+                  t.audio_path, t.audio_format, t.audio_size, t.extra, $2
+           from unnest($3::uuid[], $4::int[], $5::text[], $6::jsonb[], $7::text[],
+                       $8::timestamptz[], $9::text[], $10::text[], $11::bigint[], $12::jsonb[])
+             as t(session_id, seq, role, content, content_text, occurred_at, audio_path,
+                  audio_format, audio_size, extra)`,
+          [
+            dataSourceId,
+            batchId,
+            rows.map((r) => r.session_id),
+            rows.map((r) => r.seq),
+            rows.map((r) => r.role),
+            rows.map((r) => r.content),
+            rows.map((r) => r.content_text),
+            rows.map((r) => r.occurred_at),
+            rows.map((r) => r.audio_path),
+            rows.map((r) => r.audio_format),
+            rows.map((r) => r.audio_size),
+            rows.map((r) => r.extra),
+          ],
+        );
+      } catch (err) {
+        throw new Error(`写入 message 失败: ${(err as Error).message}`);
+      }
       result.messages += rows.length;
-      await supabase
-        .from("import_batches")
-        .update({ created_messages: result.messages })
-        .eq("id", batchId);
+      await execute(`update import_batches set created_messages = $2 where id = $1`, [
+        batchId,
+        result.messages,
+      ]);
     }
 
-    await supabase
-      .from("import_batches")
-      .update({
-        status: "completed",
-        created_sessions: result.sessions,
-        created_messages: result.messages,
-        uploaded_audios: result.audios,
-        failed_audios: result.failedAudios,
-        skipped: result.skipped,
-        error: errors.length ? errors.slice(0, 10).join("; ").slice(0, 900) : null,
-        finished_at: new Date().toISOString(),
-        progress_detail: { step: "done" },
-      })
-      .eq("id", batchId);
+    await execute(
+      `update import_batches
+       set status = 'completed', created_sessions = $2, created_messages = $3,
+           uploaded_audios = $4, failed_audios = $5, skipped = $6, error = $7,
+           finished_at = now(), progress_detail = $8::jsonb
+       where id = $1`,
+      [
+        batchId,
+        result.sessions,
+        result.messages,
+        result.audios,
+        result.failedAudios,
+        result.skipped,
+        errors.length ? errors.slice(0, 10).join("; ").slice(0, 900) : null,
+        JSON.stringify({ step: "done" }),
+      ],
+    );
 
     log("导入完成", { sessions: result.sessions, messages: result.messages, audios: result.audios });
     return result;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await supabase
-      .from("import_batches")
-      .update({ status: "failed", error: message.slice(0, 1000), finished_at: new Date().toISOString() })
-      .eq("id", batchId);
+    await execute(
+      `update import_batches set status = 'failed', error = $2, finished_at = now() where id = $1`,
+      [batchId, message.slice(0, 1000)],
+    );
     throw err;
   }
 }
 
-type SessionRowInsert = Record<string, unknown>;
-type MessageRowInsert = Record<string, unknown>;
+interface MessageRowInsert {
+  session_id: string;
+  seq: number;
+  role: string;
+  content: string;
+  content_text: string;
+  occurred_at: string | null;
+  audio_path: string | null;
+  audio_format: string | null;
+  audio_size: number | null;
+  extra: string;
+}
+
 interface ExistingSession {
   id: string;
   session_key: string;
@@ -287,7 +343,6 @@ interface ExistingSession {
 }
 
 async function uploadAudios(
-  supabase: SupabaseClient,
   dataSourceId: string,
   batchId: string,
   bundles: SessionBundle[],
@@ -336,12 +391,7 @@ async function uploadAudios(
       const job = jobs[cursor++];
       try {
         const buffer = await job.entry.async("uint8array");
-        const contentType = mimeOf(job.entry.name);
-        const { error } = await supabase.storage.from("audio").upload(job.objectPath, buffer, {
-          contentType,
-          upsert: true,
-        });
-        if (error) throw new Error(error.message);
+        await uploadObject(job.objectPath, buffer, mimeOf(job.entry.name));
         pathOf.set(job.msg, job.objectPath);
         sizeOf.set(job.msg, buffer.byteLength);
         ok++;

@@ -2,7 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { requireSession, ActionError } from "./common";
-import type { JsonObject } from "@/lib/types";
+import { count, execute, maybeOne, one, tx } from "@/lib/db";
 
 export interface PlanningParams {
   sessionSamples?: number;
@@ -17,41 +17,40 @@ export async function startPlanning(
   workflowId: string | null,
   params: PlanningParams = {},
 ): Promise<{ jobId: string }> {
-  const { supabase, userId } = await requireSession();
-  const { data: source } = await supabase
-    .from("data_sources")
-    .select("id, name")
-    .eq("id", dataSourceId)
-    .maybeSingle();
+  const { userId } = await requireSession();
+  const source = await maybeOne<{ id: string }>(`select id from data_sources where id = $1`, [
+    dataSourceId,
+  ]);
   if (!source) throw new ActionError("数据源不存在");
 
-  const { count } = await supabase
-    .from("sessions")
-    .select("id", { count: "exact", head: true })
-    .eq("data_source_id", dataSourceId);
-  if (!count) throw new ActionError("该数据源还没有数据，请先导入 JSONL + 音频压缩包");
+  const sessions = await count(`select count(*) from sessions where data_source_id = $1`, [
+    dataSourceId,
+  ]);
+  if (!sessions) throw new ActionError("该数据源还没有数据，请先导入 JSONL + 音频压缩包");
 
-  const { data, error } = await supabase
-    .from("planning_jobs")
-    .insert({
-      data_source_id: dataSourceId,
-      workflow_id: workflowId,
-      kind: "create",
-      status: "pending",
-      params: {
-        sessionSamples: params.sessionSamples ?? 5,
-        userSamples: params.userSamples ?? 4,
-        includeAudio: params.includeAudio ?? true,
-        focus: params.focus ?? "",
-      } as unknown as JsonObject,
-      created_by: userId,
-    } as never)
-    .select("id")
-    .single();
-
-  if (error || !data) throw new ActionError(`创建规划任务失败：${error?.message ?? "unknown"}`);
+  let created: { id: string };
+  try {
+    created = await one<{ id: string }>(
+      `insert into planning_jobs (data_source_id, workflow_id, kind, status, params, created_by)
+       values ($1, $2, 'create', 'pending', $3::jsonb, $4)
+       returning id`,
+      [
+        dataSourceId,
+        workflowId,
+        JSON.stringify({
+          sessionSamples: params.sessionSamples ?? 5,
+          userSamples: params.userSamples ?? 4,
+          includeAudio: params.includeAudio ?? true,
+          focus: params.focus ?? "",
+        }),
+        userId,
+      ],
+    );
+  } catch (err) {
+    throw new ActionError(`创建规划任务失败：${(err as Error).message}`);
+  }
   revalidatePath(`/sources/${dataSourceId}/studio`);
-  return { jobId: data.id as string };
+  return { jobId: created.id };
 }
 
 /** Iterate: the user reviewed the preview and asked for changes. */
@@ -60,62 +59,66 @@ export async function startReplanning(
   feedback: string,
   params: PlanningParams = {},
 ): Promise<{ jobId: string }> {
-  const { supabase, userId } = await requireSession();
+  const { userId } = await requireSession();
   if (!feedback.trim()) throw new ActionError("请填写修改建议");
 
-  const { data: parent } = await supabase
-    .from("analysis_templates")
-    .select("id, data_source_id, workflow_id")
-    .eq("id", parentTemplateId)
-    .maybeSingle();
+  const parent = await maybeOne<{ data_source_id: string; workflow_id: string | null }>(
+    `select data_source_id, workflow_id from analysis_templates where id = $1`,
+    [parentTemplateId],
+  );
   if (!parent) throw new ActionError("模板不存在");
 
-  const { data, error } = await supabase
-    .from("planning_jobs")
-    .insert({
-      data_source_id: parent.data_source_id,
-      workflow_id: parent.workflow_id,
-      kind: "revise",
-      status: "pending",
-      params: {
-        sessionSamples: params.sessionSamples ?? 5,
-        userSamples: params.userSamples ?? 4,
-        includeAudio: params.includeAudio ?? true,
-        focus: params.focus ?? "",
-      } as unknown as JsonObject,
-      feedback: feedback.trim(),
-      parent_template_id: parentTemplateId,
-      created_by: userId,
-    } as never)
-    .select("id")
-    .single();
-
-  if (error || !data) throw new ActionError(`创建规划任务失败：${error?.message ?? "unknown"}`);
+  let created: { id: string };
+  try {
+    created = await one<{ id: string }>(
+      `insert into planning_jobs
+         (data_source_id, workflow_id, kind, status, params, feedback, parent_template_id, created_by)
+       values ($1, $2, 'revise', 'pending', $3::jsonb, $4, $5, $6)
+       returning id`,
+      [
+        parent.data_source_id,
+        parent.workflow_id,
+        JSON.stringify({
+          sessionSamples: params.sessionSamples ?? 5,
+          userSamples: params.userSamples ?? 4,
+          includeAudio: params.includeAudio ?? true,
+          focus: params.focus ?? "",
+        }),
+        feedback.trim(),
+        parentTemplateId,
+        userId,
+      ],
+    );
+  } catch (err) {
+    throw new ActionError(`创建规划任务失败：${(err as Error).message}`);
+  }
   revalidatePath(`/sources/${parent.data_source_id}/studio`);
-  return { jobId: data.id as string };
+  return { jobId: created.id };
 }
 
 export async function confirmTemplate(templateId: string): Promise<void> {
-  const { supabase } = await requireSession();
-  const { data: tpl } = await supabase
-    .from("analysis_templates")
-    .select("id, data_source_id")
-    .eq("id", templateId)
-    .maybeSingle();
+  await requireSession();
+  const tpl = await maybeOne<{ data_source_id: string }>(
+    `select data_source_id from analysis_templates where id = $1`,
+    [templateId],
+  );
   if (!tpl) throw new ActionError("模板不存在");
 
-  const { error: demote } = await supabase
-    .from("analysis_templates")
-    .update({ status: "archived" } as never)
-    .eq("data_source_id", tpl.data_source_id)
-    .eq("status", "confirmed");
-  if (demote) throw new ActionError(`更新模板状态失败：${demote.message}`);
-
-  const { error } = await supabase
-    .from("analysis_templates")
-    .update({ status: "confirmed" } as never)
-    .eq("id", templateId);
-  if (error) throw new ActionError(`确认模板失败：${error.message}`);
+  try {
+    // Exactly one template per source may be `confirmed`, so archive the
+    // incumbent and promote this one together.
+    await tx(async (client) => {
+      await execute(
+        `update analysis_templates set status = 'archived'
+         where data_source_id = $1 and status = 'confirmed'`,
+        [tpl.data_source_id],
+        client,
+      );
+      await execute(`update analysis_templates set status = 'confirmed' where id = $1`, [templateId], client);
+    });
+  } catch (err) {
+    throw new ActionError(`确认模板失败：${(err as Error).message}`);
+  }
 
   revalidatePath(`/sources/${tpl.data_source_id}/studio`);
   revalidatePath(`/sources/${tpl.data_source_id}`);
@@ -130,79 +133,85 @@ export async function updateTemplatePrompt(
     report_prompt?: string;
   },
 ): Promise<{ id: string; version: number }> {
-  const { supabase, userId } = await requireSession();
-  const { data: tpl } = await supabase
-    .from("analysis_templates")
-    .select("*")
-    .eq("id", templateId)
-    .maybeSingle();
+  const { userId } = await requireSession();
+  const tpl = await maybeOne<{ data_source_id: string; version: number }>(
+    `select data_source_id, version from analysis_templates where id = $1`,
+    [templateId],
+  );
   if (!tpl) throw new ActionError("模板不存在");
 
-  const { data: last } = await supabase
-    .from("analysis_templates")
-    .select("version")
-    .eq("data_source_id", tpl.data_source_id)
-    .order("version", { ascending: false })
-    .limit(1);
-  const version = ((last?.[0]?.version as number) ?? 0) + 1;
-
-  const { data: created, error } = await supabase
-    .from("analysis_templates")
-    .insert({
-      data_source_id: tpl.data_source_id,
-      workflow_id: tpl.workflow_id,
-      version,
-      status: "draft",
-      session_prompt: patch.session_prompt ?? tpl.session_prompt,
-      user_prompt: patch.user_prompt ?? tpl.user_prompt,
-      global_prompt: patch.global_prompt ?? tpl.global_prompt,
-      report_prompt: patch.report_prompt ?? tpl.report_prompt,
-      metric_schema: tpl.metric_schema as never,
-      business_desc: tpl.business_desc,
-      extra_schema: tpl.extra_schema as never,
-      samples: tpl.samples as never,
-      rationale: `基于 v${tpl.version} 手工编辑生成`,
-      parent_id: tpl.id,
-      created_by: userId,
-    } as never)
-    .select("id, version")
-    .single();
-
-  if (error || !created) throw new ActionError(`保存失败：${error?.message ?? "unknown"}`);
-  revalidatePath(`/sources/${tpl.data_source_id}/studio`);
-  return { id: created.id as string, version: created.version as number };
+  try {
+    // Carry every unedited field over from the parent row, and take the next
+    // version number in the same statement so two concurrent saves cannot pick
+    // the same one (the unique index on (data_source_id, version) is the
+    // backstop).
+    const created = await one<{ id: string; version: number }>(
+      `insert into analysis_templates
+         (data_source_id, workflow_id, version, status, session_prompt, user_prompt,
+          global_prompt, report_prompt, metric_schema, business_desc, extra_schema, samples,
+          rationale, parent_id, created_by)
+       select t.data_source_id, t.workflow_id,
+              (select coalesce(max(version), 0) + 1 from analysis_templates
+                where data_source_id = t.data_source_id),
+              'draft',
+              coalesce($2, t.session_prompt), coalesce($3, t.user_prompt),
+              coalesce($4, t.global_prompt), coalesce($5, t.report_prompt),
+              t.metric_schema, t.business_desc, t.extra_schema, t.samples,
+              '基于 v' || t.version || ' 手工编辑生成', t.id, $6
+       from analysis_templates t where t.id = $1
+       returning id, version`,
+      [
+        templateId,
+        patch.session_prompt ?? null,
+        patch.user_prompt ?? null,
+        patch.global_prompt ?? null,
+        patch.report_prompt ?? null,
+        userId,
+      ],
+    );
+    revalidatePath(`/sources/${tpl.data_source_id}/studio`);
+    return { id: created.id, version: created.version };
+  } catch (err) {
+    throw new ActionError(`保存失败：${(err as Error).message}`);
+  }
 }
 
 export async function startPreview(
   templateId: string,
   params: { sessions?: number; useAudio?: boolean; concurrency?: number } = {},
 ): Promise<{ previewId: string }> {
-  const { supabase, userId } = await requireSession();
-  const { data: tpl } = await supabase
-    .from("analysis_templates")
-    .select("id, data_source_id")
-    .eq("id", templateId)
-    .maybeSingle();
+  const { userId } = await requireSession();
+  const tpl = await maybeOne<{ data_source_id: string }>(
+    `select data_source_id from analysis_templates where id = $1`,
+    [templateId],
+  );
   if (!tpl) throw new ActionError("模板不存在");
 
-  const { data, error } = await supabase
-    .from("template_previews")
-    .insert({
-      template_id: templateId,
-      data_source_id: tpl.data_source_id,
-      status: "pending",
-      params: {
-        sessions: params.sessions ?? 12,
-        useAudio: params.useAudio ?? false,
-        concurrency: params.concurrency ?? 3,
-      } as unknown as JsonObject,
-      progress: { stage: "queued", done: 0, total: params.sessions ?? 12 } as unknown as JsonObject,
-      created_by: userId,
-    } as never)
-    .select("id")
-    .single();
-
-  if (error || !data) throw new ActionError(`创建预览失败：${error?.message ?? "unknown"}`);
+  const sessions = params.sessions ?? 12;
+  let created: { id: string };
+  try {
+    created = await one<{ id: string }>(
+      `insert into template_previews
+         (template_id, data_source_id, status, params, progress, sessions, concurrency, created_by)
+       values ($1, $2, 'pending', $3::jsonb, $4::jsonb, $5, $6, $7)
+       returning id`,
+      [
+        templateId,
+        tpl.data_source_id,
+        JSON.stringify({
+          sessions,
+          useAudio: params.useAudio ?? false,
+          concurrency: params.concurrency ?? 3,
+        }),
+        JSON.stringify({ stage: "queued", done: 0, total: sessions }),
+        sessions,
+        params.concurrency ?? 3,
+        userId,
+      ],
+    );
+  } catch (err) {
+    throw new ActionError(`创建预览失败：${(err as Error).message}`);
+  }
   revalidatePath(`/sources/${tpl.data_source_id}/studio`);
-  return { previewId: data.id as string };
+  return { previewId: created.id };
 }

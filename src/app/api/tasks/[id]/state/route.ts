@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase/server";
+import { maybeOne, query } from "@/lib/db";
+import { currentUser } from "@/lib/auth";
+import type { JsonObject } from "@/lib/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -7,45 +9,41 @@ export const dynamic = "force-dynamic";
 /** GET /api/tasks/[id]/state — live status polling (task row, recent logs, result tallies). */
 export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  if (!(await currentUser())) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
 
   const after = new URL(req.url).searchParams.get("after");
+  const afterId = after !== null && Number.isFinite(Number(after)) ? Number(after) : null;
 
-  let logQuery = supabase
-    .from("task_logs")
-    .select("id, level, stage, message, created_at")
-    .eq("task_id", id)
-    .order("id", { ascending: false })
-    .limit(60);
-  if (after) logQuery = logQuery.gt("id", Number(after));
-
-  const tallyCount = async (status: string) => {
-    const { count } = await supabase
-      .from("task_session_results")
-      .select("id", { count: "exact", head: true })
-      .eq("task_id", id)
-      .eq("status", status);
-    return count ?? 0;
-  };
-
-  const [{ data: task }, { data: logs }, success, failed] = await Promise.all([
-    supabase
-      .from("analysis_tasks")
-      .select("id, name, status, stage, progress, stats, error, started_at, finished_at, heartbeat_at")
-      .eq("id", id)
-      .maybeSingle(),
-    logQuery,
-    tallyCount("success"),
-    tallyCount("failed"),
+  const [task, logs, tallies] = await Promise.all([
+    maybeOne<JsonObject>(
+      `select id, name, status, stage, progress, stats, error, started_at, finished_at, heartbeat_at
+       from analysis_tasks where id = $1`,
+      [id],
+    ),
+    query<JsonObject>(
+      `select id, level, stage, message, created_at
+       from task_logs
+       where task_id = $1 and ($2::bigint is null or id > $2)
+       order by id desc
+       limit 60`,
+      [id, afterId],
+    ),
+    // Both tallies in one pass over the task's rows.
+    query<{ status: string; n: number }>(
+      `select status, count(*)::int as n
+       from task_session_results
+       where task_id = $1 and status in ('success', 'failed')
+       group by status`,
+      [id],
+    ),
   ]);
+
+  const success = tallies.find((t) => t.status === "success")?.n ?? 0;
+  const failed = tallies.find((t) => t.status === "failed")?.n ?? 0;
 
   return NextResponse.json({
     task,
-    logs: (logs ?? []).reverse(),
+    logs: logs.reverse(),
     resultCounts: { success, failed, total: success + failed },
   });
 }

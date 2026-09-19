@@ -1,4 +1,4 @@
-import type { SupabaseClient } from "@supabase/supabase-js";
+import { MODEL_URL_TTL, signedUrls } from "@/lib/storage";
 import { chat, chatJson, type ContentPart } from "./ai";
 import type {
   GlobalAnalysis,
@@ -48,19 +48,12 @@ export async function mapLimit<T, R>(
 /* ------------------------------------------------------------------- audio */
 
 export async function signedAudioUrls(
-  supabase: SupabaseClient,
   paths: string[],
-  expiresIn = 3600,
+  expiresIn = MODEL_URL_TTL,
 ): Promise<Map<string, string>> {
-  const out = new Map<string, string>();
-  const unique = [...new Set(paths.filter(Boolean))].slice(0, 200);
-  await mapLimit(unique, 6, async (p) => {
-    const { data } = await supabase.storage.from("audio").createSignedUrl(p, expiresIn, {
-      download: false,
-    });
-    if (data?.signedUrl) out.set(p, data.signedUrl);
-  });
-  return out;
+  // The model service fetches these URLs itself, so they have to stay valid for
+  // the whole analysis call, and the bucket stays private.
+  return signedUrls([...new Set(paths.filter(Boolean))].slice(0, 200), expiresIn);
 }
 
 /* ---------------------------------------------------------- session 层分析 */
@@ -78,7 +71,6 @@ export interface SessionInput {
 }
 
 export interface AnalyzeSessionOptions {
-  supabase: SupabaseClient;
   session: SessionInput;
   template: Template;
   useAudio: boolean;
@@ -129,9 +121,9 @@ async function buildSessionContent(opts: AnalyzeSessionOptions, payload: string)
   const content: ContentPart[] = [{ type: "text", text: payload }];
   if (!opts.useAudio || opts.maxAudiosPerSession <= 0 || opts.session.audio_count <= 0) return content;
 
-  const audios = await loadSessionAudio(opts.supabase, opts.session.id, opts.maxAudiosPerSession);
+  const audios = await loadSessionAudio(opts.session.id, opts.maxAudiosPerSession);
   if (!audios.length) return content;
-  const urls = await signedAudioUrls(opts.supabase, audios.map((a) => a.audio_path));
+  const urls = await signedAudioUrls(audios.map((a) => a.audio_path));
   for (const a of audios) {
     const url = urls.get(a.audio_path);
     if (url) content.push({ type: "input_audio", input_audio: { data: url, format: normalizeFormat(a.audio_format) } });

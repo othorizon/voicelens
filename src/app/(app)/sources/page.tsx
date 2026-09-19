@@ -1,7 +1,6 @@
 import Link from "next/link";
 import type { Metadata } from "next";
 import { Database, MessagesSquare, Users, ArrowUpRight, AudioLines } from "lucide-react";
-import { createClient } from "@/lib/supabase/server";
 import { listDataSources } from "@/lib/queries";
 import { PageHeader, EmptyState } from "@/components/ui-kit";
 import { Button } from "@/components/ui/button";
@@ -12,8 +11,7 @@ export const metadata: Metadata = { title: "数据源" };
 export const dynamic = "force-dynamic";
 
 export default async function SourcesPage() {
-  const supabase = await createClient();
-  const sources = await listDataSources(supabase);
+  const sources = await listDataSources();
 
   return (
     <>

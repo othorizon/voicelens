@@ -12,7 +12,7 @@ import {
   Sparkles,
   Workflow,
 } from "lucide-react";
-import { createClient } from "@/lib/supabase/server";
+import { maybeOne } from "@/lib/db";
 import { sourceStats, listBatches } from "@/lib/queries";
 import { StatCard, EmptyState, StatusBadge } from "@/components/ui-kit";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
@@ -26,11 +26,19 @@ export const dynamic = "force-dynamic";
 
 export default async function SourceOverviewPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const supabase = await createClient();
-  const [{ data: source }, stats, batches] = await Promise.all([
-    supabase.from("data_sources").select("id, name, description, extra_schema, created_at").eq("id", id).maybeSingle(),
-    sourceStats(supabase, id),
-    listBatches(supabase, id),
+  const [source, stats, batches] = await Promise.all([
+    maybeOne<{
+      id: string;
+      name: string;
+      description: string;
+      extra_schema: unknown;
+      created_at: string;
+    }>(
+      `select id, name, description, extra_schema, created_at from data_sources where id = $1`,
+      [id],
+    ),
+    sourceStats(id),
+    listBatches(id),
   ]);
 
   if (!source) return <EmptyState title="数据源不存在" />;

@@ -2,8 +2,9 @@
 
 import { revalidatePath } from "next/cache";
 import { requireSession, ActionError } from "./common";
+import { callJson, execute, maybeOne, one, scalar } from "@/lib/db";
 import { defaultGraph } from "@/lib/workflow/graph";
-import type { ExtraFieldDef, JsonObject } from "@/lib/types";
+import type { ExtraFieldDef } from "@/lib/types";
 
 export interface DataSourceInput {
   name: string;
@@ -12,81 +13,91 @@ export interface DataSourceInput {
 }
 
 export async function createDataSource(input: DataSourceInput): Promise<{ id: string }> {
-  const { supabase, userId } = await requireSession();
+  const { userId } = await requireSession();
   const name = input.name?.trim();
   if (!name) throw new ActionError("请填写数据源名称");
 
-  const { data, error } = await supabase
-    .from("data_sources")
-    .insert({
-      name,
-      description: input.description?.trim() ?? "",
-      extra_schema: (input.extra_schema ?? []) as unknown as JsonObject,
-      created_by: userId,
-    })
-    .select("id")
-    .single();
+  try {
+    const created = await one<{ id: string }>(
+      `insert into data_sources (name, description, extra_schema, created_by)
+       values ($1, $2, $3::jsonb, $4)
+       returning id`,
+      [name, input.description?.trim() ?? "", JSON.stringify(input.extra_schema ?? []), userId],
+    );
 
-  if (error) throw new ActionError(`创建数据源失败：${error.message}`);
+    const graph = defaultGraph();
+    await execute(
+      `insert into workflows (data_source_id, name, graph, config, is_active, created_by)
+       values ($1, $2, $3::jsonb, '{}'::jsonb, true, $4)`,
+      [created.id, `${name} · 默认分析流`, JSON.stringify(graph), userId],
+    );
 
-  const graph = defaultGraph();
-  const { error: wfError } = await supabase.from("workflows").insert({
-    data_source_id: data.id as string,
-    name: `${name} · 默认分析流`,
-    graph: graph as unknown as JsonObject,
-    config: {} as JsonObject,
-    is_active: true,
-    created_by: userId,
-  } as never);
-  if (wfError) throw new ActionError(`创建默认工作流失败：${wfError.message}`);
-
-  revalidatePath("/sources");
-  revalidatePath("/dashboard");
-  return { id: data.id as string };
+    revalidatePath("/sources");
+    revalidatePath("/dashboard");
+    return { id: created.id };
+  } catch (err) {
+    if (err instanceof ActionError) throw err;
+    throw new ActionError(`创建数据源失败：${(err as Error).message}`);
+  }
 }
 
 export async function updateDataSource(
   id: string,
   patch: { name?: string; description?: string },
 ): Promise<void> {
-  const { supabase } = await requireSession();
-  const updates: JsonObject = {};
-  if (patch.name !== undefined) updates.name = patch.name.trim();
-  if (patch.description !== undefined) updates.description = patch.description;
-  if (!Object.keys(updates).length) return;
+  await requireSession();
+  if (patch.name === undefined && patch.description === undefined) return;
 
-  const { error } = await supabase.from("data_sources").update(updates as never).eq("id", id);
-  if (error) throw new ActionError(`保存失败：${error.message}`);
+  try {
+    // coalesce leaves a column untouched when its parameter is null.
+    await execute(
+      `update data_sources
+       set name = coalesce($2, name),
+           description = coalesce($3, description),
+           updated_at = now()
+       where id = $1`,
+      [id, patch.name?.trim() ?? null, patch.description ?? null],
+    );
+  } catch (err) {
+    throw new ActionError(`保存失败：${(err as Error).message}`);
+  }
   revalidatePath(`/sources/${id}`);
   revalidatePath("/sources");
   revalidatePath("/dashboard");
 }
 
 export async function saveExtraSchema(id: string, schema: ExtraFieldDef[]): Promise<void> {
-  const { supabase } = await requireSession();
+  await requireSession();
   for (const f of schema) {
     if (!f.name?.trim()) throw new ActionError("存在未命名的 extra 字段");
   }
   const names = schema.map((f) => f.name);
   if (new Set(names).size !== names.length) throw new ActionError("extra 字段名不可重复");
 
-  const { error } = await supabase
-    .from("data_sources")
-    .update({ extra_schema: schema as unknown as JsonObject })
-    .eq("id", id);
-  if (error) throw new ActionError(`保存 schema 失败：${error.message}`);
+  try {
+    await execute(
+      `update data_sources set extra_schema = $2::jsonb, updated_at = now() where id = $1`,
+      [id, JSON.stringify(schema)],
+    );
+  } catch (err) {
+    throw new ActionError(`保存 schema 失败：${(err as Error).message}`);
+  }
   revalidatePath(`/sources/${id}`);
 }
 
 export async function inferSchemaFromData(id: string): Promise<ExtraFieldDef[]> {
-  const { supabase } = await requireSession();
-  const { data, error } = await supabase.rpc("extra_histogram", {
-    p_data_source_id: id,
-    p_max_values: 20,
-  });
-  if (error) throw new ActionError(`读取字段分布失败：${error.message}`);
+  await requireSession();
+  let data: { key: string; values: { name: string; value: number }[] }[] | null;
+  try {
+    data = await callJson<{ key: string; values: { name: string; value: number }[] }[]>(
+      "extra_histogram",
+      [id, 20],
+    );
+  } catch (err) {
+    throw new ActionError(`读取字段分布失败：${(err as Error).message}`);
+  }
 
-  const rows = (data ?? []) as { key: string; values: { name: string; value: number }[] }[];
+  const rows = data ?? [];
   const current = await getExtraSchema(id);
   const existing = new Map(current.map((c) => [c.name, c]));
 
@@ -119,31 +130,44 @@ function pretty(key: string) {
 }
 
 async function getExtraSchema(id: string): Promise<ExtraFieldDef[]> {
-  const { supabase } = await requireSession();
-  const { data } = await supabase.from("data_sources").select("extra_schema").eq("id", id).maybeSingle();
-  return ((data?.extra_schema as ExtraFieldDef[] | null) ?? []) as ExtraFieldDef[];
+  await requireSession();
+  const schema = await scalar<ExtraFieldDef[]>(
+    `select extra_schema from data_sources where id = $1`,
+    [id],
+  );
+  return schema ?? [];
 }
 
 export async function deleteDataSource(id: string): Promise<void> {
-  const { supabase } = await requireSession();
-  const { error } = await supabase.from("data_sources").delete().eq("id", id);
-  if (error) throw new ActionError(`删除失败：${error.message}`);
+  await requireSession();
+  try {
+    // Sessions, messages, workflows, templates and tasks cascade from here.
+    await execute(`delete from data_sources where id = $1`, [id]);
+  } catch (err) {
+    throw new ActionError(`删除失败：${(err as Error).message}`);
+  }
   revalidatePath("/sources");
   revalidatePath("/dashboard");
 }
 
 export async function deleteBatch(batchId: string): Promise<{ messages: number; sessions: number }> {
-  const { supabase } = await requireSession();
-  const { data: batch } = await supabase
-    .from("import_batches")
-    .select("id, data_source_id")
-    .eq("id", batchId)
-    .maybeSingle();
+  await requireSession();
+  const batch = await maybeOne<{ id: string; data_source_id: string }>(
+    `select id, data_source_id from import_batches where id = $1`,
+    [batchId],
+  );
   if (!batch) throw new ActionError("批次不存在");
 
-  const { data, error } = await supabase.rpc("delete_import_batch", { p_batch_id: batchId });
-  if (error) throw new ActionError(`删除批次失败：${error.message}`);
-  const result = (data ?? {}) as { deleted_messages?: number; deleted_sessions?: number };
+  let result: { deleted_messages?: number; deleted_sessions?: number };
+  try {
+    result =
+      (await callJson<{ deleted_messages?: number; deleted_sessions?: number }>(
+        "delete_import_batch",
+        [batchId],
+      )) ?? {};
+  } catch (err) {
+    throw new ActionError(`删除批次失败：${(err as Error).message}`);
+  }
 
   revalidatePath(`/sources/${batch.data_source_id}`);
   revalidatePath(`/sources/${batch.data_source_id}/data`);

@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { createClient } from "@/lib/supabase/server";
+import { count as countRows, maybeOne, query } from "@/lib/db";
 import { Studio } from "@/components/studio/studio";
 import type { ExtraFieldDef, JsonObject } from "@/lib/types";
 
@@ -8,49 +8,58 @@ export const dynamic = "force-dynamic";
 
 export default async function StudioPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const supabase = await createClient();
-
-  const [{ data: source }, { data: templates }, { data: jobs }, { data: previews }, { data: wf }, { count }] =
-    await Promise.all([
-      supabase.from("data_sources").select("id, name, description, extra_schema").eq("id", id).maybeSingle(),
-      supabase
-        .from("analysis_templates")
-        .select(
-          "id, version, status, rationale, feedback, created_at, parent_id, metric_schema, samples, session_prompt, user_prompt, global_prompt, report_prompt",
-        )
-        .eq("data_source_id", id)
-        .order("version", { ascending: false })
-        .limit(50),
-      supabase
-        .from("planning_jobs")
-        .select("id, status, kind, feedback, error, created_at, finished_at, progress, template_id")
-        .eq("data_source_id", id)
-        .order("created_at", { ascending: false })
-        .limit(10),
-      supabase
-        .from("template_previews")
-        .select("id, template_id, status, progress, error, created_at, finished_at, html, stats, session_results, user_results")
-        .eq("data_source_id", id)
-        .order("created_at", { ascending: false })
-        .limit(5),
-      supabase.from("workflows").select("id").eq("data_source_id", id).order("updated_at", { ascending: false }).limit(1).maybeSingle(),
-      supabase.from("sessions").select("id", { count: "exact", head: true }).eq("data_source_id", id),
-    ]);
+  const [source, templates, jobs, previews, wf, count] = await Promise.all([
+    maybeOne<{ id: string; name: string; description: string; extra_schema: unknown }>(
+      `select id, name, description, extra_schema from data_sources where id = $1`,
+      [id],
+    ),
+    query<JsonObject>(
+      `select id, version, status, rationale, feedback, created_at, parent_id, metric_schema,
+              samples, session_prompt, user_prompt, global_prompt, report_prompt
+       from analysis_templates
+       where data_source_id = $1
+       order by version desc
+       limit 50`,
+      [id],
+    ),
+    query<JsonObject>(
+      `select id, status, kind, feedback, error, created_at, finished_at, progress, template_id
+       from planning_jobs
+       where data_source_id = $1
+       order by created_at desc
+       limit 10`,
+      [id],
+    ),
+    query<JsonObject>(
+      `select id, template_id, status, progress, error, created_at, finished_at, html, stats,
+              session_results, user_results
+       from template_previews
+       where data_source_id = $1
+       order by created_at desc
+       limit 5`,
+      [id],
+    ),
+    maybeOne<{ id: string }>(
+      `select id from workflows where data_source_id = $1 order by updated_at desc limit 1`,
+      [id],
+    ),
+    countRows(`select count(*) from sessions where data_source_id = $1`, [id]),
+  ]);
 
   if (!source) return <div className="p-8 text-sm text-muted-foreground">数据源不存在</div>;
 
   return (
     <Studio
       sourceId={id}
-      workflowId={(wf?.id as string | undefined) ?? null}
-      sourceName={source.name as string}
-      description={(source.description as string) ?? ""}
+      workflowId={wf?.id ?? null}
+      sourceName={source.name}
+      description={source.description ?? ""}
       extraSchema={((source.extra_schema as ExtraFieldDef[] | null) ?? []) as ExtraFieldDef[]}
-      sessionCount={count ?? 0}
+      sessionCount={count}
       initial={{
-        templates: (templates ?? []) as never,
-        jobs: (jobs ?? []) as never,
-        previews: ((previews ?? []) as JsonObject[]).map((p) => ({ ...p, hasHtml: Boolean(p.html) })) as never,
+        templates: templates as never,
+        jobs: jobs as never,
+        previews: previews.map((p) => ({ ...p, hasHtml: Boolean(p.html) })) as never,
       }}
     />
   );

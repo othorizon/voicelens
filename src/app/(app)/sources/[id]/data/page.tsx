@@ -1,7 +1,7 @@
 import Link from "next/link";
 import type { Metadata } from "next";
 import { Search, MessagesSquare, AudioLines, ChevronLeft, ChevronRight, UserRound } from "lucide-react";
-import { createClient } from "@/lib/supabase/server";
+import { count as countRows, query } from "@/lib/db";
 import { EmptyState } from "@/components/ui-kit";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -24,46 +24,55 @@ export default async function DataPage({
 }) {
   const { id } = await params;
   const sp = await searchParams;
-  const supabase = await createClient();
   const page = Math.max(1, Number(sp.page ?? 1));
   const q = sp.q?.trim() ?? "";
   const user = sp.user?.trim() ?? "";
+  // Whitelisted, never interpolated from raw input.
   const sort = sp.sort === "turns" ? "turn_count" : "started_at";
 
-  let query = supabase
-    .from("sessions")
-    .select("id, session_key, user_key, started_at, ended_at, turn_count, audio_count, char_count, extra", {
-      count: "exact",
-    })
-    .eq("data_source_id", id)
-    .order(sort, { ascending: false, nullsFirst: false })
-    .range((page - 1) * PAGE_SIZE, page * PAGE_SIZE - 1);
+  // The filters are optional, so each one is a null-guarded predicate rather
+  // than a conditionally built query.
+  const where = `data_source_id = $1
+       and ($2::text is null or session_key ilike '%' || $2 || '%')
+       and ($3::text is null or user_key = $3)`;
+  const filters = [id, q || null, user || null];
 
-  if (q) query = query.ilike("session_key", `%${q}%`);
-  if (user) query = query.eq("user_key", user);
-
-  const [{ data: sessions, count }, usersRes] = await Promise.all([
-    query,
-    supabase.from("sessions").select("user_key").eq("data_source_id", id).limit(4000),
+  const [sessions, count, users] = await Promise.all([
+    query<JsonObject>(
+      `select id, session_key, user_key, started_at, ended_at, turn_count, audio_count,
+              char_count, extra
+       from sessions
+       where ${where}
+       order by ${sort} desc nulls last
+       limit $4 offset $5`,
+      [...filters, PAGE_SIZE, (page - 1) * PAGE_SIZE],
+    ),
+    countRows(`select count(*) from sessions where ${where}`, filters),
+    query<{ user_key: string }>(
+      `select distinct user_key from sessions where data_source_id = $1 order by user_key limit 4000`,
+      [id],
+    ),
   ]);
 
-  const userList = [...new Set(((usersRes.data ?? []) as { user_key: string }[]).map((u) => u.user_key))].sort();
+  const userList = users.map((u) => u.user_key);
 
   const selectedKey = sp.session;
-  const selected = (sessions ?? []).find((s) => s.session_key === selectedKey) ?? null;
+  const selected = sessions.find((s) => s.session_key === selectedKey) ?? null;
 
   let detail: { session: JsonObject; messages: JsonObject[] } | null = null;
   if (selected) {
-    const { data: msgs } = await supabase
-      .from("messages")
-      .select("seq, role, content_text, occurred_at, audio_path, extra")
-      .eq("session_id", selected.id)
-      .order("seq", { ascending: true })
-      .limit(600);
-    detail = { session: selected as unknown as JsonObject, messages: (msgs ?? []) as JsonObject[] };
+    const msgs = await query<JsonObject>(
+      `select seq, role, content_text, occurred_at, audio_path, extra
+       from messages
+       where session_id = $1
+       order by seq
+       limit 600`,
+      [selected.id],
+    );
+    detail = { session: selected, messages: msgs };
   }
 
-  const totalPages = Math.max(1, Math.ceil((count ?? 0) / PAGE_SIZE));
+  const totalPages = Math.max(1, Math.ceil(count / PAGE_SIZE));
 
   const qs = (next: Record<string, string | number | undefined>) => {
     const p = new URLSearchParams();
@@ -103,7 +112,7 @@ export default async function DataPage({
           </Button>
         )}
         <div className="ml-auto flex items-center gap-1.5 text-[12px] text-muted-foreground">
-          <span className="num">{count ?? 0}</span> 个会话
+          <span className="num">{count}</span> 个会话
           <span className="mx-1 opacity-40">·</span>
           排序
           <Button asChild size="sm" variant={sp.sort === "turns" ? "secondary" : "ghost"} className="h-7 px-2 text-[11.5px]">
@@ -115,7 +124,7 @@ export default async function DataPage({
         </div>
       </form>
 
-      {!(sessions ?? []).length ? (
+      {!sessions.length ? (
         <EmptyState
           icon={MessagesSquare}
           title={count ? "没有匹配的会话" : "这个数据源还没有会话数据"}
@@ -132,7 +141,7 @@ export default async function DataPage({
         <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.05fr)]">
           <div className="space-y-2">
             <div className="grid gap-2">
-              {(sessions ?? []).map((s) => {
+              {sessions.map((s) => {
                 const active = s.session_key === selectedKey;
                 const extra = (s.extra ?? {}) as JsonObject;
                 return (

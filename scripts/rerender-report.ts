@@ -7,7 +7,7 @@
  */
 import { config } from "dotenv";
 config({ path: ".env.local" });
-import { createClient } from "@supabase/supabase-js";
+import { closePool, execute, maybeOne, one, query, scalar } from "../src/lib/db";
 import { renderReportHtml } from "../src/lib/engine/report-html";
 import { buildDrillData } from "../src/lib/engine/plan";
 import type { JsonObject, ReportSpec } from "../src/lib/types";
@@ -19,59 +19,72 @@ if (!taskId) {
 }
 
 async function main() {
-  const anon = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, {
-    auth: { persistSession: false },
-  });
-  const { data: signIn, error: signErr } = await anon.auth.signInWithPassword({
-    email: process.env.SUPABASE_SERVICE_EMAIL!,
-    password: process.env.SUPABASE_SERVICE_PASSWORD!,
-  });
-  if (signErr) throw signErr;
-  const sb = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, {
-    global: { headers: { Authorization: `Bearer ${signIn.session!.access_token}` } },
-    auth: { persistSession: false },
-  });
-
-  const { data: task } = await sb
-    .from("analysis_tasks")
-    .select("id, name, status, report, scope_type, range_start, range_end, data_source_id, template_id")
-    .eq("id", taskId)
-    .maybeSingle();
+  const task = await maybeOne<{
+    id: string;
+    name: string;
+    status: string;
+    report: ReportSpec | null;
+    scope_type: string;
+    range_start: string | null;
+    range_end: string | null;
+    data_source_id: string;
+    template_id: string | null;
+  }>(
+    `select id, name, status, report, scope_type, range_start, range_end, data_source_id, template_id
+     from analysis_tasks where id = $1`,
+    [taskId],
+  );
   if (!task) throw new Error(`task ${taskId} not found`);
   if (!task.report) throw new Error("task has no stored report spec");
 
-  const { data: tpl } = await sb.from("analysis_templates").select("version").eq("id", task.template_id).maybeSingle();
+  const templateVersion = task.template_id
+    ? await scalar<number>(`select version from analysis_templates where id = $1`, [task.template_id])
+    : null;
 
-  const [{ data: sessRes }, { data: userRes }] = await Promise.all([
-    sb.from("task_session_results").select("session_pk, session_key, user_key, result").eq("task_id", taskId).eq("status", "success"),
-    sb.from("task_user_results").select("user_key, session_count, result").eq("task_id", taskId).eq("status", "success"),
+  const [sessRes, userRes] = await Promise.all([
+    query<{ session_pk: string; session_key: string; user_key: string; result: JsonObject }>(
+      `select session_pk, session_key, user_key, result
+       from task_session_results
+       where task_id = $1 and status = 'success'`,
+      [taskId],
+    ),
+    query<{ user_key: string; session_count: number; result: JsonObject }>(
+      `select user_key, session_count, result
+       from task_user_results
+       where task_id = $1 and status = 'success'`,
+      [taskId],
+    ),
   ]);
 
-  const keys = (sessRes ?? []).map((r) => r.session_pk as string);
-  const { data: sessions } = keys.length
-    ? await sb.from("sessions").select("id, session_key, user_key, started_at, turn_count, digest").in("id", keys)
-    : { data: [] };
-  const byId = new Map((sessions ?? []).map((s) => [s.id as string, s as JsonObject]));
+  const keys = sessRes.map((r) => r.session_pk);
+  const sessions = keys.length
+    ? await query<JsonObject>(
+        `select id, session_key, user_key, started_at, turn_count, digest
+         from sessions where id = any($1::uuid[])`,
+        [keys],
+      )
+    : [];
+  const byId = new Map(sessions.map((s) => [s.id as string, s]));
 
-  const sessionResults = (sessRes ?? []).map((r) => ({
-    session_key: r.session_key as string,
-    user_key: r.user_key as string,
+  const sessionResults = sessRes.map((r) => ({
+    session_key: r.session_key,
+    user_key: r.user_key,
     result: r.result as never,
   }));
 
-  const drillSessions = (sessRes ?? []).map((r) => {
-    const meta = byId.get(r.session_pk as string);
+  const drillSessions = sessRes.map((r) => {
+    const meta = byId.get(r.session_pk);
     return {
-      session_key: r.session_key as string,
-      user_key: r.user_key as string,
+      session_key: r.session_key,
+      user_key: r.user_key,
       started_at: (meta?.started_at as string | null) ?? null,
       turn_count: Number(meta?.turn_count ?? 0),
       digest: String(meta?.digest ?? ""),
     };
   });
 
-  const userResults = (userRes ?? []).map((u) => ({
-    user_key: u.user_key as string,
+  const userResults = userRes.map((u) => ({
+    user_key: u.user_key,
     result: u.result as never,
   }));
 
@@ -83,25 +96,27 @@ async function main() {
       : "增量未分析";
 
   const html = renderReportHtml({
-    spec: task.report as ReportSpec,
+    spec: task.report,
     drill,
     generatedAt: new Date().toISOString(),
     scopeNote: `${rangeNote} · ${sessionResults.length} 会话 · ${userResults.length} 用户`,
-    templateVersion: (tpl?.version as number | undefined) ?? null,
-    taskName: task.name as string,
+    templateVersion: templateVersion ?? null,
+    taskName: task.name,
   });
 
-  const { error } = await sb.from("analysis_tasks").update({ report_html: html }).eq("id", taskId);
-  if (error) throw error;
+  await execute(`update analysis_tasks set report_html = $2 where id = $1`, [taskId, html]);
 
   console.log(
     `re-rendered ${taskId}: ${html.length} bytes · ${sessionResults.length} sessions · ${drill.users.length} drill users · ${
-      (task.report as ReportSpec).sections?.length
+      task.report.sections?.length
     } sections`,
   );
 }
 
-main().catch((e) => {
-  console.error("FAILED:", e instanceof Error ? e.message : e);
-  process.exit(1);
-});
+main()
+  .then(() => closePool())
+  .catch(async (e) => {
+    console.error("FAILED:", e instanceof Error ? e.message : e);
+    await closePool().catch(() => {});
+    process.exit(1);
+  });

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase/server";
+import { count as countRows, maybeOne, query } from "@/lib/db";
+import { currentUser } from "@/lib/auth";
 import { digestToTranscript } from "@/lib/engine/plan";
 import type { JsonObject } from "@/lib/types";
 
@@ -15,11 +16,7 @@ const PAGE = 50;
  */
 export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
-  const supabase = await createClient();
-  const {
-    data: { user: auth },
-  } = await supabase.auth.getUser();
-  if (!auth) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  if (!(await currentUser())) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
 
   const url = new URL(req.url);
   const level = url.searchParams.get("level") ?? "users";
@@ -29,32 +26,34 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
   const page = Math.max(1, Number(url.searchParams.get("page") ?? 1));
 
   if (level === "session") {
-    const { data: result } = await supabase
-      .from("task_session_results")
-      .select("session_pk, session_key, user_key, status, result, tokens, duration_ms")
-      .eq("task_id", id)
-      .eq("session_key", sessionKey)
-      .maybeSingle();
+    const result = await maybeOne<JsonObject>(
+      `select session_pk, session_key, user_key, status, result, tokens, duration_ms
+       from task_session_results
+       where task_id = $1 and session_key = $2`,
+      [id, sessionKey],
+    );
 
     let transcript: ReturnType<typeof digestToTranscript> = [];
     let meta: JsonObject | null = null;
     if (result?.session_pk) {
-      const [{ data: session }, { data: msgs }] = await Promise.all([
-        supabase
-          .from("sessions")
-          .select("session_key, user_key, started_at, ended_at, turn_count, audio_count, extra, digest")
-          .eq("id", result.session_pk)
-          .maybeSingle(),
-        supabase
-          .from("messages")
-          .select("seq, role, content_text, occurred_at, audio_path, extra")
-          .eq("session_id", result.session_pk)
-          .order("seq", { ascending: true })
-          .limit(800),
+      const [session, msgs] = await Promise.all([
+        maybeOne<JsonObject>(
+          `select session_key, user_key, started_at, ended_at, turn_count, audio_count, extra, digest
+           from sessions where id = $1`,
+          [result.session_pk],
+        ),
+        query<JsonObject>(
+          `select seq, role, content_text, occurred_at, audio_path, extra
+           from messages
+           where session_id = $1
+           order by seq
+           limit 800`,
+          [result.session_pk],
+        ),
       ]);
-      meta = (session ?? null) as JsonObject | null;
-      transcript = msgs?.length
-        ? (msgs as JsonObject[]).map((m) => ({
+      meta = session;
+      transcript = msgs.length
+        ? msgs.map((m) => ({
             role: String(m.role),
             text: String(m.content_text ?? ""),
             at: (m.occurred_at as string | null) ?? undefined,
@@ -62,23 +61,30 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
             audio_path: (m.audio_path as string | null) ?? undefined,
             extra: (m.extra as JsonObject) ?? undefined,
           }))
-        : digestToTranscript(String((session as JsonObject | null)?.digest ?? ""));
+        : digestToTranscript(String(session?.digest ?? ""));
     }
 
     return NextResponse.json({ result, meta, transcript });
   }
 
   if (level === "sessions") {
-    let query = supabase
-      .from("task_session_results")
-      .select("session_key, user_key, status, result, tokens", { count: "exact" })
-      .eq("task_id", id)
-      .order("session_key", { ascending: true })
-      .range((page - 1) * PAGE, page * PAGE - 1);
-    if (userKey) query = query.eq("user_key", userKey);
-    if (q) query = query.or(`session_key.ilike.%${q}%,user_key.ilike.%${q}%`);
-    const { data, count } = await query;
-    const rows = (data ?? []) as JsonObject[];
+    // Both filters are optional; `q` matches either key. Values stay bound as
+    // parameters so a search string can never reach the statement text.
+    const where = `task_id = $1
+         and ($2::text is null or user_key = $2)
+         and ($3::text is null or session_key ilike '%' || $3 || '%' or user_key ilike '%' || $3 || '%')`;
+    const filters = [id, userKey || null, q || null];
+    const [rows, total] = await Promise.all([
+      query<JsonObject>(
+        `select session_key, user_key, status, result, tokens
+         from task_session_results
+         where ${where}
+         order by session_key
+         limit $4 offset $5`,
+        [...filters, PAGE, (page - 1) * PAGE],
+      ),
+      countRows(`select count(*) from task_session_results where ${where}`, filters),
+    ]);
     return NextResponse.json({
       rows: rows.map((r) => {
         const res = (r.result ?? {}) as JsonObject;
@@ -95,21 +101,25 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
           tags: res.tags ?? [],
         };
       }),
-      total: count ?? rows.length,
+      total,
       page,
     });
   }
 
   // level === "users"
-  let query = supabase
-    .from("task_user_results")
-    .select("user_key, session_count, status, result", { count: "exact" })
-    .eq("task_id", id)
-    .order("session_count", { ascending: false })
-    .range((page - 1) * PAGE, page * PAGE - 1);
-  if (q) query = query.ilike("user_key", `%${q}%`);
-  const { data, count } = await query;
-  const rows = (data ?? []) as JsonObject[];
+  const userWhere = `task_id = $1 and ($2::text is null or user_key ilike '%' || $2 || '%')`;
+  const userFilters = [id, q || null];
+  const [rows, total] = await Promise.all([
+    query<JsonObject>(
+      `select user_key, session_count, status, result
+       from task_user_results
+       where ${userWhere}
+       order by session_count desc
+       limit $3 offset $4`,
+      [...userFilters, PAGE, (page - 1) * PAGE],
+    ),
+    countRows(`select count(*) from task_user_results where ${userWhere}`, userFilters),
+  ]);
 
   return NextResponse.json({
     rows: rows.map((r) => {
@@ -126,7 +136,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
         metrics: res.metrics ?? [],
       };
     }),
-    total: count ?? rows.length,
+    total,
     page,
   });
 }

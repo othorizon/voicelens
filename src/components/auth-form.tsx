@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { toast } from "sonner";
 import { Loader2, ArrowRight, Waves } from "lucide-react";
-import { createClient } from "@/lib/supabase/client";
+import { loginAction, registerAction } from "@/lib/actions/auth";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -14,26 +14,19 @@ import { Card, CardContent } from "@/components/ui/card";
 export function AuthForm({ mode }: { mode: "login" | "register" }) {
   const router = useRouter();
   const isRegister = mode === "register";
-  const [email, setEmail] = useState(isRegister ? "" : "demo@voicelens.ai");
-  const [password, setPassword] = useState(isRegister ? "" : "voicelens123");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setBusy(true);
-    const supabase = createClient();
     try {
-      if (isRegister) {
-        const { error } = await supabase.rpc("register_user", {
-          p_email: email,
-          p_password: password,
-          p_display_name: name || null,
-        });
-        if (error) throw error;
-      }
-      const { error } = await supabase.auth.signInWithPassword({ email, password });
-      if (error) throw error;
+      // The password only ever travels to the server action; the browser holds
+      // no database credential of any kind.
+      if (isRegister) await registerAction(email, password, name || null);
+      else await loginAction(email, password);
       toast.success(isRegister ? "账号已创建，欢迎加入" : "登录成功");
       router.replace("/dashboard");
       router.refresh();

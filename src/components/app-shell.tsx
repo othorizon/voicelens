@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
+import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import {
@@ -16,7 +16,7 @@ import {
   Sun,
   ChevronDown,
 } from "lucide-react";
-import { createClient } from "@/lib/supabase/client";
+import { logoutAction } from "@/lib/actions/auth";
 import { useTheme } from "@/components/theme-provider";
 import { cn, initials } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -52,7 +52,6 @@ export function AppShell({
   children: React.ReactNode;
 }) {
   const pathname = usePathname();
-  const router = useRouter();
   const { theme, toggle } = useTheme();
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
@@ -133,9 +132,8 @@ export function AppShell({
               </DropdownMenuItem>
               <DropdownMenuItem
                 onClick={async () => {
-                  await createClient().auth.signOut();
-                  router.replace("/login");
-                  router.refresh();
+                  // The action clears the HttpOnly cookie and redirects.
+                  await logoutAction();
                 }}
               >
                 <LogOut className="size-4" />
@@ -193,8 +191,7 @@ export function AppShell({
               variant="ghost"
               className="size-8 rounded-full p-0 md:hidden"
               onClick={async () => {
-                await createClient().auth.signOut();
-                router.replace("/login");
+                await logoutAction();
               }}
             >
               <LogOut className="size-4" />

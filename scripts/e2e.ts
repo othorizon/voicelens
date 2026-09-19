@@ -1,8 +1,12 @@
 /**
  * End-to-end smoke test for the analysis pipeline.
  * Run: npx tsx --env-file=.env.local scripts/e2e.ts [--step plan|preview|run]
+ *
+ * Talks to Postgres directly, so the background worker must be running for the
+ * planning / preview / task steps to make progress.
  */
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { closePool, count as countRows, execute, maybeOne, one } from "../src/lib/db";
+import { registerUser, verifyCredentials } from "../src/lib/auth";
 import { buildDemoZip, DEMO_BUSINESS_DESC, DEMO_EXTRA_SCHEMA, generateDemoDataset } from "../src/lib/demo/generate";
 import { importZip } from "../src/lib/engine/import";
 import { defaultGraph, configFromGraph } from "../src/lib/workflow/graph";
@@ -10,72 +14,61 @@ import { defaultGraph, configFromGraph } from "../src/lib/workflow/graph";
 const log = (m: string, extra?: unknown) =>
   console.log(`[${new Date().toISOString().slice(11, 19)}] ${m}`, extra ?? "");
 
-function client(): SupabaseClient {
-  return createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
+const E2E_EMAIL = process.env.E2E_EMAIL ?? "e2e@voicelens.local";
+const E2E_PASSWORD = process.env.E2E_PASSWORD ?? "";
+
+/** Reuse the e2e account if it exists, otherwise create it. */
+async function ensureUser(): Promise<string> {
+  if (!E2E_PASSWORD) {
+    throw new Error("E2E_PASSWORD is not set — pick one and export it before running the smoke test");
+  }
+  try {
+    return (await verifyCredentials(E2E_EMAIL, E2E_PASSWORD)).id;
+  } catch {
+    return (await registerUser(E2E_EMAIL, E2E_PASSWORD, "E2E")).id;
+  }
 }
 
-async function signIn(): Promise<SupabaseClient> {
-  const anon = client();
-  const { data, error } = await anon.auth.signInWithPassword({
-    email: "demo@voicelens.ai",
-    password: "voicelens123",
-  });
-  if (error) throw error;
-  return createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, {
-    global: { headers: { Authorization: `Bearer ${data.session!.access_token}` } },
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-}
+async function ensureSource(userId: string): Promise<string> {
+  const existing = await maybeOne<{ id: string }>(
+    `select id from data_sources where name ilike '%车机语音助手%' limit 1`,
+  );
+  if (existing) return existing.id;
 
-async function ensureSource(supabase: SupabaseClient, userId: string) {
-  const { data: existing } = await supabase
-    .from("data_sources")
-    .select("id, name")
-    .ilike("name", "%车机语音助手%")
-    .limit(1)
-    .maybeSingle();
-  if (existing) return existing.id as string;
+  const created = await one<{ id: string }>(
+    `insert into data_sources (name, description, extra_schema, created_by)
+     values ($1, $2, $3::jsonb, $4)
+     returning id`,
+    ["智能车机语音助手 · 示例数据源", DEMO_BUSINESS_DESC, JSON.stringify(DEMO_EXTRA_SCHEMA), userId],
+  );
 
-  const { data, error } = await supabase
-    .from("data_sources")
-    .insert({
-      name: "智能车机语音助手 · 示例数据源",
-      description: DEMO_BUSINESS_DESC,
-      extra_schema: DEMO_EXTRA_SCHEMA,
-      created_by: userId,
-    })
-    .select("id")
-    .single();
-  if (error) throw error;
   const graph = defaultGraph();
-  const { error: wfErr } = await supabase.from("workflows").insert({
-    data_source_id: data.id,
-    name: "车机语音助手 · 默认分析流",
-    graph,
-    config: configFromGraph(graph),
-    created_by: userId,
-  } as never);
-  if (wfErr) throw wfErr;
-  return data.id as string;
+  await execute(
+    `insert into workflows (data_source_id, name, graph, config, created_by)
+     values ($1, $2, $3::jsonb, $4::jsonb, $5)`,
+    [
+      created.id,
+      "车机语音助手 · 默认分析流",
+      JSON.stringify(graph),
+      JSON.stringify(configFromGraph(graph)),
+      userId,
+    ],
+  );
+  return created.id;
 }
 
-async function waitFor(
-  supabase: SupabaseClient,
+/** Poll a row until `check` passes, logging its status as it goes. */
+async function waitFor<T extends { status?: string; progress?: unknown }>(
   label: string,
-  fn: () => PromiseLike<{ data: unknown }>,
-  check: (row: unknown) => boolean,
+  fetch: () => Promise<T | null>,
+  check: (row: T) => boolean,
   timeoutMs = 15 * 60 * 1000,
-): Promise<unknown> {
+): Promise<T> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    const { data } = await fn();
-    const rows = Array.isArray(data) ? data : data ? [data] : [];
-    const row = rows[0];
+    const row = await fetch();
     if (row && check(row)) return row;
-    const status = (row as { status?: string; progress?: unknown }) ?? {};
-    log(`${label} … ${JSON.stringify(status.status ?? "?")} ${shorten(status.progress)}`);
+    log(`${label} … ${JSON.stringify(row?.status ?? "?")} ${shorten(row?.progress)}`);
     await new Promise((r) => setTimeout(r, 8000));
   }
   throw new Error(`${label} timed out`);
@@ -86,66 +79,68 @@ function shorten(v: unknown) {
   return s.length > 140 ? `${s.slice(0, 140)}…` : s;
 }
 
+const settled = (r: { status?: string }) => ["completed", "failed"].includes(String(r.status));
+
 async function main() {
   const step = process.argv[2] ?? "all";
-  const supabase = await signIn();
-  const { data: me } = await supabase.auth.getUser();
-  const userId = me.user!.id;
-  log("signed in", userId);
+  const userId = await ensureUser();
+  log("e2e user", userId);
 
-  const sourceId = await ensureSource(supabase, userId);
+  const sourceId = await ensureSource(userId);
   log("data source", sourceId);
 
   /* ------------------------------------------------------------ import */
   if (step === "all" || step === "import") {
-    const { count } = await supabase.from("sessions").select("id", { count: "exact", head: true }).eq("data_source_id", sourceId);
-    if (!count) {
+    const sessions = await countRows(`select count(*) from sessions where data_source_id = $1`, [sourceId]);
+    if (!sessions) {
       const dataset = generateDemoDataset({ sessions: 60, users: 26, seed: 42 });
       log("demo dataset", { sessions: dataset.sessions, records: dataset.records.length, audios: dataset.audios });
       const zip = await buildDemoZip(dataset);
       log("zip built", `${(zip.byteLength / 1024).toFixed(0)} KB`);
-      const res = await importZip(supabase, sourceId, zip.buffer as ArrayBuffer, "demo.zip", userId, (m, e) => log(`import: ${m}`, e));
+      const res = await importZip(sourceId, zip.buffer as ArrayBuffer, "demo.zip", userId, (m, e) =>
+        log(`import: ${m}`, e),
+      );
       log("import done", res);
     } else {
-      log("data already imported, skipping", { sessions: count });
+      log("data already imported, skipping", { sessions });
     }
   }
 
-  const { data: wf } = await supabase.from("workflows").select("id, graph").eq("data_source_id", sourceId).limit(1).maybeSingle();
-  const workflowId = wf?.id as string;
+  const wf = await maybeOne<{ id: string; graph: unknown }>(
+    `select id, graph from workflows where data_source_id = $1 limit 1`,
+    [sourceId],
+  );
+  const workflowId = wf?.id ?? null;
 
   /* ------------------------------------------------------------- plan */
-  let templateId: string | null = null;
-  const { data: tpl } = await supabase
-    .from("analysis_templates")
-    .select("id, version")
-    .eq("data_source_id", sourceId)
-    .order("version", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  templateId = (tpl?.id as string) ?? null;
+  let templateId: string | null =
+    (
+      await maybeOne<{ id: string }>(
+        `select id from analysis_templates where data_source_id = $1 order by version desc limit 1`,
+        [sourceId],
+      )
+    )?.id ?? null;
 
   if (!templateId && (step === "all" || step === "plan")) {
-    const { data: job, error } = await supabase
-      .from("planning_jobs")
-      .insert({
-        data_source_id: sourceId,
-        workflow_id: workflowId,
-        kind: "create",
-        status: "pending",
-        params: { sessionSamples: 5, userSamples: 4, includeAudio: true, focus: "" },
-        created_by: userId,
-      } as never)
-      .select("id")
-      .single();
-    if (error) throw error;
+    const job = await one<{ id: string }>(
+      `insert into planning_jobs (data_source_id, workflow_id, kind, status, params, created_by)
+       values ($1, $2, 'create', 'pending', $3::jsonb, $4)
+       returning id`,
+      [
+        sourceId,
+        workflowId,
+        JSON.stringify({ sessionSamples: 5, userSamples: 4, includeAudio: true, focus: "" }),
+        userId,
+      ],
+    );
     log("planning job created", job.id);
-    const done = (await waitFor(
-      supabase,
+
+    const done = await waitFor<{ status: string; error: string | null; template_id: string | null }>(
       "planning",
-      () => supabase.from("planning_jobs").select("*").eq("id", job.id).maybeSingle(),
-      (r) => ["completed", "failed"].includes(String((r as { status: string }).status)),
-    )) as { status: string; error: string | null; template_id: string | null };
+      () =>
+        maybeOne(`select status, error, template_id, progress from planning_jobs where id = $1`, [job.id]),
+      settled,
+    );
     if (done.status !== "completed") throw new Error(`planning failed: ${done.error}`);
     templateId = done.template_id;
     log("template ready", templateId);
@@ -153,34 +148,39 @@ async function main() {
 
   /* ---------------------------------------------------------- confirm */
   if (templateId) {
-    await supabase.from("analysis_templates").update({ status: "archived" } as never).eq("data_source_id", sourceId).eq("status", "confirmed");
-    await supabase.from("analysis_templates").update({ status: "confirmed" } as never).eq("id", templateId);
+    await execute(
+      `update analysis_templates set status = 'archived'
+       where data_source_id = $1 and status = 'confirmed'`,
+      [sourceId],
+    );
+    await execute(`update analysis_templates set status = 'confirmed' where id = $1`, [templateId]);
     log("template confirmed", templateId);
   }
 
   /* ----------------------------------------------------------- preview */
   if (step === "all" || step === "preview") {
     if (!templateId) throw new Error("no template, cannot preview");
-    const { data: pv, error } = await supabase
-      .from("template_previews")
-      .insert({
-        template_id: templateId,
-        data_source_id: sourceId,
-        status: "pending",
-        params: { sessions: 8, useAudio: false, concurrency: 3 },
-        progress: { stage: "queued", done: 0, total: 8 },
-        created_by: userId,
-      } as never)
-      .select("id")
-      .single();
-    if (error) throw error;
+    const pv = await one<{ id: string }>(
+      `insert into template_previews
+         (template_id, data_source_id, status, params, progress, sessions, concurrency, created_by)
+       values ($1, $2, 'pending', $3::jsonb, $4::jsonb, 8, 3, $5)
+       returning id`,
+      [
+        templateId,
+        sourceId,
+        JSON.stringify({ sessions: 8, useAudio: false, concurrency: 3 }),
+        JSON.stringify({ stage: "queued", done: 0, total: 8 }),
+        userId,
+      ],
+    );
     log("preview created", pv.id);
-    const done = (await waitFor(
-      supabase,
+
+    const done = await waitFor<{ status: string; error: string | null; html: string | null }>(
       "preview",
-      () => supabase.from("template_previews").select("id, status, progress, error, html, stats").eq("id", pv.id).maybeSingle(),
-      (r) => ["completed", "failed"].includes(String((r as { status: string }).status)),
-    )) as { status: string; error: string | null; html: string | null };
+      () =>
+        maybeOne(`select status, error, html, progress from template_previews where id = $1`, [pv.id]),
+      settled,
+    );
     if (done.status !== "completed") throw new Error(`preview failed: ${done.error}`);
     log("preview html bytes", (done.html ?? "").length);
   }
@@ -193,48 +193,49 @@ async function main() {
     config.session.concurrency = 5;
     config.report.topUsers = 30;
 
-    const { data: task, error } = await supabase
-      .from("analysis_tasks")
-      .insert({
-        data_source_id: sourceId,
-        template_id: templateId,
-        workflow_id: workflowId,
-        name: "E2E 冒烟测试 · 增量分析",
-        scope_type: "incremental",
-        status: "pending",
-        stage: "queued",
-        config,
-        progress: { stage: "queued", total: 0, done: 0 },
-        created_by: userId,
-      } as never)
-      .select("id")
-      .single();
-    if (error) throw error;
+    const task = await one<{ id: string }>(
+      `insert into analysis_tasks
+         (data_source_id, template_id, workflow_id, name, scope_type, status, stage, config,
+          progress, created_by)
+       values ($1, $2, $3, $4, 'incremental', 'pending', 'queued', $5::jsonb, $6::jsonb, $7)
+       returning id`,
+      [
+        sourceId,
+        templateId,
+        workflowId,
+        "E2E 冒烟测试 · 增量分析",
+        JSON.stringify(config),
+        JSON.stringify({ stage: "queued", total: 0, done: 0 }),
+        userId,
+      ],
+    );
     log("task created", task.id);
 
-    const done = (await waitFor(
-      supabase,
+    const done = await waitFor<{ status: string; error: string | null; stats: unknown }>(
       "task",
-      () => supabase.from("analysis_tasks").select("id, status, stage, progress, error, stats").eq("id", task.id).maybeSingle(),
-      (r) => ["completed", "failed", "cancelled"].includes(String((r as { status: string }).status)),
+      () =>
+        maybeOne(`select status, error, stats, progress from analysis_tasks where id = $1`, [task.id]),
+      (r) => ["completed", "failed", "cancelled"].includes(String(r.status)),
       30 * 60 * 1000,
-    )) as { status: string; error: string | null; stats: unknown };
+    );
     if (done.status !== "completed") throw new Error(`task failed: ${done.error}`);
     log("task completed", done.stats);
 
-    const { data: full } = await supabase
-      .from("analysis_tasks")
-      .select("report_html, report")
-      .eq("id", task.id)
-      .single();
-    log("report html bytes", (full?.report_html as string | null)?.length ?? 0);
-    log("report sections", ((full?.report as { sections?: unknown[] } | null)?.sections ?? []).length);
+    const full = await one<{ report_html: string | null; report: { sections?: unknown[] } | null }>(
+      `select report_html, report from analysis_tasks where id = $1`,
+      [task.id],
+    );
+    log("report html bytes", full.report_html?.length ?? 0);
+    log("report sections", (full.report?.sections ?? []).length);
   }
 
   log("E2E OK");
 }
 
-main().catch((e) => {
-  console.error("E2E FAILED:", e);
-  process.exit(1);
-});
+main()
+  .then(() => closePool())
+  .catch(async (e) => {
+    console.error("E2E FAILED:", e);
+    await closePool().catch(() => {});
+    process.exit(1);
+  });

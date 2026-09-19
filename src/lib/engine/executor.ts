@@ -1,4 +1,4 @@
-import type { SupabaseClient } from "@supabase/supabase-js";
+import { callJson, execute, scalar } from "@/lib/db";
 import { chatJson } from "./ai";
 import { describeExtraSchema } from "./prompts";
 import { resolveScope, loadSessions, loadSessionAudio } from "./sampler";
@@ -56,49 +56,46 @@ export interface RunOptions {
 }
 
 export async function log(
-  supabase: SupabaseClient,
   taskId: string,
   level: string,
   stage: string | null,
   message: string,
   payload?: JsonObject,
 ) {
-  await supabase.from("task_logs").insert({
-    task_id: taskId,
-    level,
-    stage,
-    message: message.slice(0, 1900),
-    payload: payload ?? null,
-  });
+  await execute(
+    `insert into task_logs (task_id, level, stage, message, payload)
+     values ($1, $2, $3, $4, $5::jsonb)`,
+    [taskId, level, stage, message.slice(0, 1900), payload ? JSON.stringify(payload) : null],
+  );
 }
 
-export async function heartbeat(supabase: SupabaseClient, taskId: string, progress?: JsonObject) {
-  await supabase
-    .from("analysis_tasks")
-    .update({ heartbeat_at: new Date().toISOString(), ...(progress ? { progress } : {}) })
-    .eq("id", taskId);
+export async function heartbeat(taskId: string, progress?: JsonObject) {
+  await execute(
+    `update analysis_tasks
+     set heartbeat_at = now(), progress = coalesce($2::jsonb, progress)
+     where id = $1`,
+    [taskId, progress ? JSON.stringify(progress) : null],
+  );
 }
 
 /** Full pipeline: collect → session → user → global → report. */
-export async function runTask(
-  supabase: SupabaseClient,
-  task: TaskRow,
-  config: WorkflowConfig,
-): Promise<void> {
+export async function runTask(task: TaskRow, config: WorkflowConfig): Promise<void> {
   const taskId = task.id;
   const startedAt = new Date().toISOString();
-  await supabase
-    .from("analysis_tasks")
-    .update({ status: "running", stage: "collect", started_at: startedAt, heartbeat_at: startedAt })
-    .eq("id", taskId);
-  await log(supabase, taskId, "info", "collect", "任务开始执行");
+  await execute(
+    `update analysis_tasks
+     set status = 'running', stage = 'collect', started_at = $2, heartbeat_at = $2
+     where id = $1`,
+    [taskId, startedAt],
+  );
+  await log(taskId, "info", "collect", "任务开始执行");
 
   try {
     /* ------------------------------------------------------- 1. scope */
     // The scope chosen when the task was launched wins over the workflow
     // default: the same flow can be run incrementally or over a time window.
     const mode = task.scope_type === "range" ? "range" : task.scope_type === "incremental" ? "incremental" : config.scope.mode;
-    const scope = await resolveScope(supabase, task.data_source_id, {
+    const scope = await resolveScope(task.data_source_id, {
       mode,
       rangeStart: task.range_start,
       rangeEnd: task.range_end,
@@ -113,13 +110,11 @@ export async function runTask(
       );
     }
 
-    await supabase
-      .from("analysis_tasks")
-      .update({
-        progress: { total: scope.sessionIds.length, done: 0, stage: "collect", mode: scope.mode },
-      })
-      .eq("id", taskId);
-    await log(supabase, taskId, "info", "collect", `范围确定：${scope.sessionIds.length} 个会话（${scope.mode}）`, {
+    await execute(`update analysis_tasks set progress = $2::jsonb where id = $1`, [
+      taskId,
+      JSON.stringify({ total: scope.sessionIds.length, done: 0, stage: "collect", mode: scope.mode }),
+    ]);
+    await log(taskId, "info", "collect", `范围确定：${scope.sessionIds.length} 个会话（${scope.mode}）`, {
       mode: scope.mode,
       count: scope.sessionIds.length,
     });
@@ -127,7 +122,7 @@ export async function runTask(
     const extraHint = describeExtraSchema(task.dataSource.extra_schema as ExtraFieldDef[]);
 
     /* --------------------------------------------- 2. session 层分析 */
-    await supabase.from("analysis_tasks").update({ stage: "session_analysis" } as never).eq("id", taskId);
+    await execute(`update analysis_tasks set stage = 'session_analysis' where id = $1`, [taskId]);
 
     let done = 0;
     let succeeded = 0;
@@ -137,9 +132,9 @@ export async function runTask(
 
     const CHUNK = 40;
     for (let i = 0; i < scope.sessionIds.length; i += CHUNK) {
-      await assertNotCancelled(supabase, taskId);
+      await assertNotCancelled(taskId);
       const slice = scope.sessionIds.slice(i, i + CHUNK);
-      const sessions = await loadSessions(supabase, slice, { maxDigestChars: config.session.maxDigestChars });
+      const sessions = await loadSessions(slice, { maxDigestChars: config.session.maxDigestChars });
 
       const chunkResults = await mapLimit(sessions, config.session.concurrency, async (s) => {
         const session = s as unknown as SessionRecord;
@@ -147,7 +142,6 @@ export async function runTask(
         for (let attempt = 0; attempt <= config.session.retries; attempt++) {
           try {
             const { result, tokens: used } = await analyzeSession({
-              supabase,
               session,
               template: task.template,
               useAudio: config.session.useAudio,
@@ -175,10 +169,35 @@ export async function runTask(
         tokens: r.ok ? r.tokens : 0,
       }));
 
-      const { error: insErr } = await supabase.from("task_session_results").upsert(rows as never, {
-        onConflict: "task_id,session_pk",
-      });
-      if (insErr) await log(supabase, taskId, "warn", "session_analysis", `写入结果失败: ${insErr.message}`);
+      try {
+        await execute(
+          `insert into task_session_results
+             (task_id, session_pk, session_key, user_key, status, result, error, tokens)
+           select $1, t.session_pk, t.session_key, t.user_key, t.status, t.result, t.error, t.tokens
+           from unnest($2::uuid[], $3::text[], $4::text[], $5::text[], $6::jsonb[], $7::text[], $8::int[])
+             as t(session_pk, session_key, user_key, status, result, error, tokens)
+           on conflict (task_id, session_pk) do update
+             set session_key = excluded.session_key,
+                 user_key = excluded.user_key,
+                 status = excluded.status,
+                 result = excluded.result,
+                 error = excluded.error,
+                 tokens = excluded.tokens,
+                 updated_at = now()`,
+          [
+            taskId,
+            rows.map((r) => r.session_pk),
+            rows.map((r) => r.session_key),
+            rows.map((r) => r.user_key),
+            rows.map((r) => r.status),
+            rows.map((r) => (r.result === null ? null : JSON.stringify(r.result))),
+            rows.map((r) => r.error),
+            rows.map((r) => r.tokens),
+          ],
+        );
+      } catch (err) {
+        await log(taskId, "warn", "session_analysis", `写入结果失败: ${(err as Error).message}`);
+      }
 
       for (const r of chunkResults) {
         done++;
@@ -188,14 +207,14 @@ export async function runTask(
         } else {
           failed++;
           if (failed <= 5) {
-            await log(supabase, taskId, "warn", "session_analysis", `会话 ${r.session.session_key} 分析失败`, {
+            await log(taskId, "warn", "session_analysis", `会话 ${r.session.session_key} 分析失败`, {
               error: (r.error ?? "").slice(0, 400),
             });
           }
         }
       }
 
-      await heartbeat(supabase, taskId, {
+      await heartbeat(taskId, {
         total: scope.sessionIds.length,
         done,
         succeeded,
@@ -204,7 +223,6 @@ export async function runTask(
         stage: "session_analysis",
       });
       await log(
-        supabase,
         taskId,
         "info",
         "session_analysis",
@@ -217,8 +235,8 @@ export async function runTask(
     }
 
     /* ------------------------------------------------ 3. user 层汇总 */
-    await supabase.from("analysis_tasks").update({ stage: "user_aggregation" } as never).eq("id", taskId);
-    await log(supabase, taskId, "info", "user_aggregation", "开始用户层汇总");
+    await execute(`update analysis_tasks set stage = 'user_aggregation' where id = $1`, [taskId]);
+    await log(taskId, "info", "user_aggregation", "开始用户层汇总");
 
     const byUser = new Map<string, { session_key: string; result: SessionAnalysis }[]>();
     for (const r of results) {
@@ -226,23 +244,20 @@ export async function runTask(
     }
 
     const userKeys = [...byUser.keys()];
-    await supabase
-      .from("task_user_results")
-      .upsert(
-        userKeys.map((k) => ({
-          task_id: taskId,
-          user_key: k,
-          session_count: (byUser.get(k) ?? []).length,
-          status: "pending",
-        })) as never,
-        { onConflict: "task_id,user_key" },
-      );
+    await execute(
+      `insert into task_user_results (task_id, user_key, session_count, status)
+       select $1, t.user_key, t.session_count, 'pending'
+       from unnest($2::text[], $3::int[]) as t(user_key, session_count)
+       on conflict (task_id, user_key) do update
+         set session_count = excluded.session_count, updated_at = now()`,
+      [taskId, userKeys, userKeys.map((k) => (byUser.get(k) ?? []).length)],
+    );
 
     let uDone = 0;
     const userAgg: { user_key: string; result: UserAnalysis }[] = [];
     const USER_CHUNK = 30;
     for (let i = 0; i < userKeys.length; i += USER_CHUNK) {
-      await assertNotCancelled(supabase, taskId);
+      await assertNotCancelled(taskId);
       const slice = userKeys.slice(i, i + USER_CHUNK);
       const chunk = await mapLimit(slice, config.user.concurrency, async (key) => {
         const all = byUser.get(key)!;
@@ -269,11 +284,30 @@ export async function runTask(
         error: c.error?.slice(0, 600) ?? null,
         updated_at: new Date().toISOString(),
       }));
-      await supabase.from("task_user_results").upsert(rows as never, { onConflict: "task_id,user_key" });
+      await execute(
+        `insert into task_user_results (task_id, user_key, session_count, status, result, error, updated_at)
+         select $1, t.user_key, t.session_count, t.status, t.result, t.error, now()
+         from unnest($2::text[], $3::int[], $4::text[], $5::jsonb[], $6::text[])
+           as t(user_key, session_count, status, result, error)
+         on conflict (task_id, user_key) do update
+           set session_count = excluded.session_count,
+               status = excluded.status,
+               result = excluded.result,
+               error = excluded.error,
+               updated_at = now()`,
+        [
+          taskId,
+          rows.map((r) => r.user_key),
+          rows.map((r) => r.session_count),
+          rows.map((r) => r.status),
+          rows.map((r) => JSON.stringify(r.result)),
+          rows.map((r) => r.error),
+        ],
+      );
 
       for (const c of chunk) userAgg.push({ user_key: c.key, result: c.result });
       uDone += chunk.length;
-      await heartbeat(supabase, taskId, {
+      await heartbeat(taskId, {
         total: scope.sessionIds.length,
         done,
         succeeded,
@@ -283,26 +317,16 @@ export async function runTask(
         userDone: uDone,
         stage: "user_aggregation",
       });
-      await log(supabase, taskId, "info", "user_aggregation", `用户层汇总进度 ${uDone}/${userKeys.length}`);
+      await log(taskId, "info", "user_aggregation", `用户层汇总进度 ${uDone}/${userKeys.length}`);
     }
 
     /* --------------------------------------------- 4. global 层汇总 */
-    await supabase
-      .from("analysis_tasks")
-      .update({ stage: "global_aggregation" } as never)
-      .eq("id", taskId);
-    await log(supabase, taskId, "info", "global_aggregation", "开始全局层汇总");
+    await execute(`update analysis_tasks set stage = 'global_aggregation' where id = $1`, [taskId]);
+    await log(taskId, "info", "global_aggregation", "开始全局层汇总");
 
-    const { data: sessionStats } = await supabase.rpc("task_session_stats", {
-      p_task_id: taskId,
-      p_scope: "all",
-      p_user_key: null,
-    });
-    const { data: userStats } = await supabase.rpc("task_user_stats", { p_task_id: taskId });
-    const distributions = await extraHistogramForSessions(
-      supabase,
-      results.map((r) => r.session.id),
-    );
+    const sessionStats = await callJson<JsonObject>("task_session_stats", [taskId, "all", null]);
+    const userStats = await callJson<JsonObject>("task_user_stats", [taskId]);
+    const distributions = await extraHistogramForSessions(results.map((r) => r.session.id));
 
     const overview = computeStats(results);
     const stats = Object.assign({}, overview, { from_db: sessionStats ?? null }) as JsonObject;
@@ -320,17 +344,18 @@ export async function runTask(
       config.global.maxUsersInPrompt,
     );
 
-    await supabase
-      .from("task_global_result")
-      .upsert({
-        task_id: taskId,
-        status: "success",
-        result: globalResult as unknown as JsonObject,
-        error: null,
-        updated_at: new Date().toISOString(),
-      } as never, { onConflict: "task_id" });
+    await execute(
+      `insert into task_global_result (task_id, status, result, error, updated_at)
+       values ($1, 'success', $2::jsonb, null, now())
+       on conflict (task_id) do update
+         set status = excluded.status,
+             result = excluded.result,
+             error = excluded.error,
+             updated_at = now()`,
+      [taskId, JSON.stringify(globalResult)],
+    );
 
-    await heartbeat(supabase, taskId, {
+    await heartbeat(taskId, {
       total: scope.sessionIds.length,
       done,
       succeeded,
@@ -340,14 +365,11 @@ export async function runTask(
       userDone: uDone,
       stage: "global_aggregation",
     });
-    await log(supabase, taskId, "info", "global_aggregation", "全局层汇总完成");
+    await log(taskId, "info", "global_aggregation", "全局层汇总完成");
 
     /* ------------------------------------------------ 5. 报告生成 */
-    await supabase
-      .from("analysis_tasks")
-      .update({ stage: "report_generation" } as never)
-      .eq("id", taskId);
-    await log(supabase, taskId, "info", "report", "开始生成报告");
+    await execute(`update analysis_tasks set stage = 'report_generation' where id = $1`, [taskId]);
+    await log(taskId, "info", "report", "开始生成报告");
 
     const topUsers = [...userAgg]
       .sort((a, b) => b.result.session_count - a.result.session_count)
@@ -379,7 +401,7 @@ export async function runTask(
     });
 
     if (overrides.length) {
-      await log(supabase, taskId, "warn", "report", `指标口径校正：覆盖 ${overrides.length} 个 KPI`, {
+      await log(taskId, "warn", "report", `指标口径校正：覆盖 ${overrides.length} 个 KPI`, {
         overrides: overrides.map((o) => ({ label: o.label, field: o.field, was: o.was, now: o.now })),
       });
     }
@@ -403,23 +425,22 @@ export async function runTask(
       taskName: task.name,
     });
 
-    await supabase.from("task_reports").insert({
-      task_id: taskId,
-      kind: "final",
-      title: spec.title ?? task.name,
-      report: spec as unknown as JsonObject,
-      html,
-      created_by: task.createdBy,
-    } as never);
+    await execute(
+      `insert into task_reports (task_id, kind, title, report, html, created_by)
+       values ($1, 'final', $2, $3::jsonb, $4, $5)`,
+      [taskId, spec.title ?? task.name, JSON.stringify(spec), html, task.createdBy],
+    );
 
-    await supabase
-      .from("analysis_tasks")
-      .update({
-        status: "completed",
-        stage: "done",
-        report: spec as unknown as JsonObject,
-        report_html: html,
-        stats: {
+    await execute(
+      `update analysis_tasks
+       set status = 'completed', stage = 'done', report = $2::jsonb, report_html = $3,
+           stats = $4::jsonb, progress = $5::jsonb, heartbeat_at = now(), finished_at = now()
+       where id = $1`,
+      [
+        taskId,
+        JSON.stringify(spec),
+        html,
+        JSON.stringify({
           sessions_total: scope.sessionIds.length,
           sessions_ok: succeeded,
           sessions_failed: failed,
@@ -428,10 +449,8 @@ export async function runTask(
           duration_ms: Date.now() - Date.parse(startedAt),
           model: process.env.AI_MODEL ?? "qwen3.8-omni-flash",
           metric_overrides: overrides.length,
-        },
-        heartbeat_at: new Date().toISOString(),
-        finished_at: new Date().toISOString(),
-        progress: {
+        }),
+        JSON.stringify({
           total: scope.sessionIds.length,
           done,
           succeeded,
@@ -440,23 +459,20 @@ export async function runTask(
           userTotal: userKeys.length,
           userDone: uDone,
           stage: "done",
-        },
-      })
-      .eq("id", taskId);
+        }),
+      ],
+    );
 
-    await log(supabase, taskId, "info", "report", `报告生成完成，共 ${spec.sections.length} 个章节`);
+    await log(taskId, "info", "report", `报告生成完成，共 ${spec.sections.length} 个章节`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await supabase
-      .from("analysis_tasks")
-      .update({
-        status: message.includes("cancelled") ? "cancelled" : "failed",
-        error: message.slice(0, 1500),
-        finished_at: new Date().toISOString(),
-        heartbeat_at: new Date().toISOString(),
-      })
-      .eq("id", taskId);
-    await log(supabase, taskId, "error", null, `任务失败: ${message.slice(0, 1500)}`);
+    await execute(
+      `update analysis_tasks
+       set status = $2, error = $3, finished_at = now(), heartbeat_at = now()
+       where id = $1`,
+      [taskId, message.includes("cancelled") ? "cancelled" : "failed", message.slice(0, 1500)],
+    );
+    await log(taskId, "error", null, `任务失败: ${message.slice(0, 1500)}`);
     throw err;
   }
 }
@@ -510,11 +526,9 @@ function fallbackUser(key: string, sessions: { session_key: string; result: Sess
   };
 }
 
-async function assertNotCancelled(supabase: SupabaseClient, taskId: string) {
-  const { data } = await supabase.from("analysis_tasks").select("status").eq("id", taskId).single();
-  if ((data as { status?: string } | null)?.status === "cancelled") {
-    throw new Error("task cancelled by user");
-  }
+async function assertNotCancelled(taskId: string) {
+  const status = await scalar<string>(`select status from analysis_tasks where id = $1`, [taskId]);
+  if (status === "cancelled") throw new Error("task cancelled by user");
 }
 
 function sleep(ms: number) {

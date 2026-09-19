@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { ReactFlowProvider } from "@xyflow/react";
-import { createClient } from "@/lib/supabase/server";
+import { count, maybeOne } from "@/lib/db";
 import { WorkflowCanvas } from "@/components/workflow-canvas";
 import { normalizeGraph, type WfGraph } from "@/lib/workflow/graph";
 import { EmptyState } from "@/components/ui-kit";
@@ -13,21 +13,18 @@ export const dynamic = "force-dynamic";
 
 export default async function WorkflowPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const supabase = await createClient();
+  const wf = await maybeOne<{ id: string; name: string; graph: unknown }>(
+    `select id, name, graph from workflows
+     where data_source_id = $1
+     order by updated_at desc
+     limit 1`,
+    [id],
+  );
 
-  const { data: wf } = await supabase
-    .from("workflows")
-    .select("id, name, graph")
-    .eq("data_source_id", id)
-    .order("updated_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  const { count: confirmed } = await supabase
-    .from("analysis_templates")
-    .select("id", { count: "exact", head: true })
-    .eq("data_source_id", id)
-    .eq("status", "confirmed");
+  const confirmed = await count(
+    `select count(*) from analysis_templates where data_source_id = $1 and status = 'confirmed'`,
+    [id],
+  );
 
   if (!wf) {
     return (

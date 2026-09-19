@@ -11,7 +11,7 @@ import {
   MessagesSquare,
   Users,
 } from "lucide-react";
-import { createClient } from "@/lib/supabase/server";
+import { maybeOne } from "@/lib/db";
 import { sourceStats } from "@/lib/queries";
 import { SourceNav } from "@/components/source-nav";
 import { Button } from "@/components/ui/button";
@@ -27,15 +27,15 @@ export default async function SourceLayout({
   params: Promise<{ id: string }>;
 }) {
   const { id } = await params;
-  const supabase = await createClient();
-  const { data: source } = await supabase
-    .from("data_sources")
-    .select("id, name, extra_schema, status")
-    .eq("id", id)
-    .maybeSingle();
+  const source = await maybeOne<{
+    id: string;
+    name: string;
+    extra_schema: unknown;
+    status: string;
+  }>(`select id, name, extra_schema, status from data_sources where id = $1`, [id]);
 
   if (!source) notFound();
-  const stats = await sourceStats(supabase, id);
+  const stats = await sourceStats(id);
 
   return (
     <div className="flex min-h-full flex-col">
