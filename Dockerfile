@@ -64,5 +64,6 @@ RUN chmod 755 /usr/local/bin/voicelens
 USER node
 EXPOSE 3000
 
+# 刻意不设 CMD：设了就等于永远给入口脚本传一个参数，VOICELENS_ROLE 将永远不生效
+# （托管平台通常只能填环境变量）。默认角色由入口脚本兜底，仍然是 web。
 ENTRYPOINT ["voicelens"]
-CMD ["web"]

@@ -8,6 +8,9 @@
 #
 # 其它参数原样执行，方便 `docker run ... voicelens bash` 或跑 scripts/ 下的脚本。
 #
+# 角色也可以用环境变量 VOICELENS_ROLE 指定（不传参数时生效），给 Dokploy / Coolify 这类
+# 只让填环境变量、或者改命令会连 ENTRYPOINT 一起覆盖掉的平台用：VOICELENS_ROLE=all 即可。
+#
 # web / all 认 VOICELENS_MIGRATE_ON_START=true：起服务前先跑一次迁移。
 # db/apply.ts 没有互斥锁，所以同一个库上只让一个容器开这个开关。
 set -euo pipefail
@@ -21,8 +24,20 @@ migrate_if_requested() {
   esac
 }
 
-role="${1:-web}"
-if [ "$#" -gt 0 ]; then shift; fi
+if [ "$#" -gt 0 ]; then
+  role="$1"
+  shift
+else
+  # 没带参数才看环境变量；写错了直接报错退出，别让它掉进下面的「原样执行」分支
+  role="${VOICELENS_ROLE:-web}"
+  case "$role" in
+    web | worker | all | migrate) ;;
+    *)
+      echo "[entrypoint] VOICELENS_ROLE=${role} 不是有效角色（web | worker | all | migrate）" >&2
+      exit 64
+      ;;
+  esac
+fi
 
 case "$role" in
   web)

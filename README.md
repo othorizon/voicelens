@@ -101,6 +101,34 @@ docker run -d --name voicelens --restart unless-stopped \
 `VOICELENS_MIGRATE_ON_START=true` 会在起服务前跑一次迁移（`db/apply.ts` 没有互斥锁，
 同一个库别让两个容器同时开这个开关）。
 
+角色也可以用环境变量选：不带命令参数时，`VOICELENS_ROLE=all`（或 `web` / `worker` / `migrate`）
+等价于把角色写在命令里，给只能填环境变量的托管平台用。命令参数优先级高于环境变量。
+
+### 部署到 Dokploy / Coolify 这类 PaaS（单实例）
+
+以 Dokploy 为例，一个 Application 就能跑起来：
+
+1. **Create Application**,源选 GitHub / Git 仓库。
+2. **Build Type** 选 `Dockerfile`:Dockerfile Path 填 `Dockerfile_cn`（官方源填 `Dockerfile`）,
+   Docker Context Path 填 `.`,Docker Build Stage 留空。
+3. **Build Time Arguments**（可选，构建时）：`NPM_REGISTRY`、`APT_MIRROR`、`TZ`,不填就用文件里的默认值。
+4. **Environment**（运行时）：照 `.env.local.example` 填 `DATABASE_URL`、`AUTH_SECRET`、`S3_*`、`AI_*`,再加两条：
+   - `VOICELENS_ROLE=all` —— 一个实例里同时跑 Web 与 Worker
+   - `VOICELENS_MIGRATE_ON_START=true` —— 启动时自动建表
+5. **Domains**:Host 填域名，Container Port 填 `3000`,打开 HTTPS（Let's Encrypt）。
+6. Deploy。
+
+用环境变量而不是平台的 Run Command 来选角色，是因为这类平台改命令时常把 ENTRYPOINT 一起覆盖掉。
+
+**Replicas 保持 1**:`all` 模式每个实例都自带一个 Worker。多副本时队列本身是安全的
+（`for update skip locked` 不会重复领任务），但 `VOICELENS_MIGRATE_ON_START` 会多个实例同时迁移，
+有冲突风险。要扩容就建两个 Application（一个 `VOICELENS_ROLE=web` 配域名，一个 `VOICELENS_ROLE=worker`
+不配域名），或者直接用平台的 Docker Compose 部署吃仓库里的 `docker-compose.yml`。
+
+用平台的 Compose 部署时有两点要注意：选 **Docker Compose** 而不是 **Stack** 模式（Stack 模式不支持
+`build:`）；本仓库的 compose 用 `env_file: .env.local`,而平台注入的通常是 `.env`,需要改成平台的写法
+或直接在 compose 里写 `environment:`。
+
 ### 方式三：手动两个容器
 
 ```bash
@@ -178,7 +206,9 @@ zip 压缩包 = 一个对话 JSONL（层级任意）＋ 音频文件（可选，
 | `S3_FORCE_PATH_STYLE` | 路径风格寻址；OSS/S3 用默认 false，MinIO 需 true |
 | `AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` | 模型服务（OpenAI 兼容 Chat Completions） |
 | `AI_ENABLE_THINKING` | 深度思考默认开关（默认 false，规划与报告单独开启） |
-| `WORKER_POLL_MS` | Worker 轮询间隔
+| `WORKER_POLL_MS` | Worker 轮询间隔 |
+| `VOICELENS_ROLE` | 仅容器：不带命令参数时跑哪个角色（`web` 默认 / `worker` / `all` / `migrate`） |
+| `VOICELENS_MIGRATE_ON_START` | 仅容器：`web`/`all` 启动前自动应用迁移（默认关） |
 
 ## 安全边界
 
