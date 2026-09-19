@@ -63,6 +63,39 @@ npm run worker                     # 后台 Worker（另开一个进程，必须
 `worker` 与 Web 是两个独立进程：Web 只接受请求、写作业；Worker 轮询队列执行长任务，
 进度与日志写回任务对象，Web 端每 3 秒轮询刷新。Worker 重启会自动把孤儿作业重新入队。
 
+## 容器部署
+
+两份 Dockerfile 产出的镜像内容完全一致，只差依赖源与时区：
+
+| 文件 | 适用网络 | 差异 |
+|---|---|---|
+| `Dockerfile` | 能直连官方源 | npm 官方源，时区 UTC |
+| `Dockerfile_cn` | 国内 | npm 源 `registry.npmmirror.com`、apt 源 `mirrors.aliyun.com`，时区 `Asia/Shanghai`（UTC+8） |
+
+一个镜像承载三种角色，用第一个参数选择：`web`（默认）/ `worker` / `migrate`。
+
+```bash
+docker build -f Dockerfile_cn -t voicelens:latest .   # 官方源用 -f Dockerfile
+
+docker run --rm     --env-file .env.local                                voicelens:latest migrate
+docker run -d --name voicelens-web    --env-file .env.local -p 3000:3000 voicelens:latest
+docker run -d --name voicelens-worker --env-file .env.local              voicelens:latest worker
+```
+
+- `--env-file` 直接读 `.env.local`，但**值不要加引号**：docker 会把引号当字面量读进去。
+- Web 与 Worker 是两个容器、同一套环境变量；Worker 不常驻的话任务只会排队不执行。
+  `migrate --dry` 只列待执行的迁移；镜像里的其它命令原样执行，例如
+  `docker run --rm --env-file .env.local voicelens:latest node_modules/.bin/tsx scripts/rerender-report.ts <task-id>`。
+- 容器无状态：数据在 Postgres、音频在对象存储，不用挂卷；进程以非 root（uid 1000）运行。
+- 镜像源与时区都是 build-arg，换一家只改参数：
+  `--build-arg NPM_REGISTRY=https://mirrors.cloud.tencent.com/npm/`、`--build-arg APT_MIRROR=mirrors.tuna.tsinghua.edu.cn`、`--build-arg TZ=UTC`。
+- 基础镜像（docker.io）拉不动时，给 dockerd 配 `registry-mirrors`，或
+  `--build-arg NODE_IMAGE=docker.m.daocloud.io/library/node:22-bookworm-slim`。
+
+时区影响两处可见行为：报告里的「生成时间」按容器时区渲染；导入数据中**不带时区**的时间戳
+（`2026-09-01 08:12:04`）按容器时区解释后转成 UTC 落库。`Dockerfile_cn` 取 +8 是因为国内导出的
+日志通常就是北京时间；如果你的日志本来是 UTC，运行时加 `-e TZ=UTC` 覆盖即可。
+
 ## 数据格式
 
 zip 压缩包 = 一个对话 JSONL（层级任意）＋ 音频文件（可选，层级任意）。

@@ -1,0 +1,110 @@
+# VoiceLens 部署镜像（国内网络版）。与 Dockerfile 的构建产物、角色、环境变量完全一致，
+# 只多做两件事：把依赖源换成国内镜像，把时区固定为 Asia/Shanghai（UTC+8）。
+#
+#   docker build -f Dockerfile_cn -t voicelens:latest .
+#   docker run --rm     --env-file .env.local                  voicelens:latest migrate
+#   docker run -d --name voicelens-web    --env-file .env.local -p 3000:3000 voicelens:latest
+#   docker run -d --name voicelens-worker --env-file .env.local voicelens:latest worker
+#
+# 镜像源都是 --build-arg 可覆盖的，换一家只改参数、不用改这个文件：
+#   --build-arg NPM_REGISTRY=https://mirrors.cloud.tencent.com/npm/
+#   --build-arg APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+#   --build-arg TZ=UTC
+#
+# 基础镜像（docker.io）拉不动时，两个办法：
+#   1. 给 dockerd 配加速：/etc/docker/daemon.json 写
+#      { "registry-mirrors": ["https://docker.m.daocloud.io"] }，再 systemctl restart docker；
+#   2. 直接指定带仓库前缀的镜像名：
+#      --build-arg NODE_IMAGE=docker.m.daocloud.io/library/node:22-bookworm-slim
+
+ARG NODE_IMAGE=node:22-bookworm-slim
+
+# ---------------------------------------------------------------- base
+# 镜像源与时区只配一次，build 与 runtime 两个阶段都从这里继承。
+FROM ${NODE_IMAGE} AS base
+
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+ARG APT_MIRROR=mirrors.aliyun.com
+ARG TZ=Asia/Shanghai
+
+# npm 走国内源；顺手放宽重试与超时，跨境抖动时不至于一次失败就整个构建挂掉。
+# 原生依赖（@node-rs/argon2、esbuild）的预编译包也走同一个源，不需要额外的 *_binary_host。
+ENV TZ=${TZ} \
+    NPM_CONFIG_REGISTRY=${NPM_REGISTRY} \
+    NPM_CONFIG_FETCH_RETRIES=5 \
+    NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT=120000 \
+    NPM_CONFIG_FETCH_TIMEOUT=600000 \
+    NEXT_TELEMETRY_DISABLED=1
+
+# 时区固定在 UTC+8，有两处可见影响：
+#   1. 报告里的「生成时间」等 toLocaleString("zh-CN") 输出北京时间，而不是 UTC；
+#   2. 导入数据中不带时区的时间戳（如 "2026-09-01 08:12:04"）按 +8 解释
+#      （落库仍是 UTC，见 src/lib/engine/normalize.ts，变的只是解释口径）。
+# 如果导出日志本身就是 UTC，用 --build-arg TZ=UTC 或运行时 -e TZ=UTC 覆盖。
+RUN set -eu; \
+    # apt 源：bookworm 的 deb822 格式与老式 sources.list 都换掉
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
+      if [ -f "$f" ]; then \
+        sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" "$f"; \
+      fi; \
+    done; \
+    # 基础镜像自带 zoneinfo，缺了才走 apt 装 tzdata——这样 apt 镜像不可达时构建照样能过
+    if [ ! -e "/usr/share/zoneinfo/${TZ}" ]; then \
+      apt-get update; \
+      apt-get install -y --no-install-recommends tzdata; \
+      rm -rf /var/lib/apt/lists/*; \
+    fi; \
+    ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime; \
+    echo "${TZ}" > /etc/timezone; \
+    echo "timezone -> $(date '+%Y-%m-%d %H:%M:%S %z')"
+
+# ---------------------------------------------------------------- build
+# 装全量依赖（next build 需要 typescript / tailwind 等 devDependencies）→ 构建 →
+# 就地剪掉 devDependencies，剪完的 node_modules 直接交给运行阶段，省一次完整安装。
+FROM base AS build
+WORKDIR /app
+
+# 先只拷依赖清单：package.json / package-lock.json 没变时这层走缓存
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+COPY . .
+# 构建期不连数据库：页面全是 force-dynamic，连接池是懒初始化的，
+# 所以这里不需要 DATABASE_URL 之类的运行时凭据。
+#
+# typescript 是 devDependency，但 next start 每次启动都要加载 next.config.ts：
+# 剪掉之后 Next 会在容器启动时自己 npm install typescript，既慢又要求运行期能连外网
+# （离线或只读文件系统下直接起不来）。所以先把构建期装好的那份挪到一边，剪完再放回去
+# ——typescript 没有自身依赖，整目录搬移即可，也不用为此多连一次镜像源。
+RUN npm run build \
+ && mv node_modules/typescript /tmp/typescript \
+ && npm prune --omit=dev \
+ && mv /tmp/typescript node_modules/typescript \
+ && npm cache clean --force \
+ && rm -rf .next/cache
+
+# ---------------------------------------------------------------- runtime
+FROM base AS runtime
+WORKDIR /app
+ENV NODE_ENV=production \
+    PORT=3000
+
+# 运行期要三样东西：构建产物 .next、生产依赖 node_modules、
+# 以及 Worker 与迁移直接用 tsx 执行的 TS 源码（worker/、db/、被 worker 引用的 src/）。
+COPY --from=build --chown=node:node /app/node_modules ./node_modules
+COPY --from=build --chown=node:node /app/.next ./.next
+COPY --chown=node:node public ./public
+COPY --chown=node:node src ./src
+COPY --chown=node:node worker ./worker
+COPY --chown=node:node db ./db
+COPY --chown=node:node scripts ./scripts
+COPY --chown=node:node package.json package-lock.json next.config.ts tsconfig.json ./
+COPY docker/entrypoint.sh /usr/local/bin/voicelens
+RUN chmod 755 /usr/local/bin/voicelens
+
+# 基础镜像自带的非 root 账号（uid 1000）
+USER node
+EXPOSE 3000
+
+ENTRYPOINT ["voicelens"]
+CMD ["web"]

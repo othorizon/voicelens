@@ -1,0 +1,30 @@
+# 构建上下文只需要源码与依赖清单。
+# node_modules 必须排除：镜像里的原生依赖（@node-rs/argon2、esbuild）按容器平台重装，
+# 直接拷进去会带入宿主机平台的二进制。
+
+.git
+.gitignore
+.github
+
+node_modules
+.next
+out
+build
+coverage
+.vercel
+
+# 凭据绝不进镜像，运行时用 --env-file / -e 注入
+.env
+.env.*
+
+Dockerfile
+Dockerfile_cn
+.dockerignore
+docker-compose*.yml
+
+*.log
+*.tsbuildinfo
+next-env.d.ts
+.DS_Store
+.vscode
+.idea
