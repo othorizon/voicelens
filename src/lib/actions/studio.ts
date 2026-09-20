@@ -107,6 +107,44 @@ export async function startReplanning(
   return { jobId: created.id };
 }
 
+/**
+ * Iterate the cheap way: apply the feedback to the selected template's prompts
+ * and save the result as the next version, with no re-sampling and no audio.
+ *
+ * Same starting point as `startReplanning` (a template plus a note), different
+ * bill: replanning reads the data again and rewrites all four prompts, this one
+ * edits the prompts that the note actually touches.
+ */
+export async function startPromptRefine(
+  parentTemplateId: string,
+  feedback: string,
+): Promise<{ jobId: string }> {
+  const { session, dataSourceId } = await requireTemplateAccess(parentTemplateId);
+  const userId = session.userId;
+  if (!feedback.trim()) throw new ActionError("请填写修改建议");
+
+  // The guard already proved this row exists and is the caller's.
+  const parent = await one<{ workflow_id: string | null }>(
+    `select workflow_id from analysis_templates where id = $1`,
+    [parentTemplateId],
+  );
+
+  let created: { id: string };
+  try {
+    created = await one<{ id: string }>(
+      `insert into planning_jobs
+         (data_source_id, workflow_id, kind, status, params, feedback, parent_template_id, created_by)
+       values ($1, $2, 'refine', 'pending', '{}'::jsonb, $3, $4, $5)
+       returning id`,
+      [dataSourceId, parent.workflow_id, feedback.trim(), parentTemplateId, userId],
+    );
+  } catch (err) {
+    throw new ActionError(`创建修改任务失败：${(err as Error).message}`);
+  }
+  revalidatePath(`/sources/${dataSourceId}/studio`);
+  return { jobId: created.id };
+}
+
 export async function confirmTemplate(templateId: string): Promise<void> {
   const { dataSourceId } = await requireTemplateAccess(templateId);
 

@@ -267,6 +267,118 @@ ${REPORT_SPEC_CONTRACT}
   return messages;
 }
 
+/* ---------------------------------------------------- 按建议定点修改模板 */
+
+/**
+ * The cheap half of the feedback loop: apply the reviewer's notes to the
+ * template that is already there, instead of planning one again from scratch.
+ *
+ * Nothing is re-sampled and no audio is played, so the model is told plainly
+ * that it cannot see the data — its only inputs are the existing prompts and
+ * the note. That is also why every untouched prompt is carried over verbatim
+ * by the caller rather than rewritten here: a model asked to "keep the rest"
+ * will still quietly paraphrase it.
+ */
+export function buildRefineMessages(input: {
+  dataSourceName: string;
+  businessDesc: string;
+  extraSchema: ExtraFieldDef[];
+  feedback: string;
+  previous: {
+    version: number;
+    session_prompt: string;
+    user_prompt: string;
+    global_prompt: string;
+    report_prompt: string;
+    metric_schema?: unknown;
+    rationale?: string;
+  };
+}) {
+  const system = `你是一名精通提示工程的对话数据分析专家，正在维护一个「语音对话数据分析平台」的分析提示词模板。
+
+这一次你做的是**定点修改**，不是重新规划：
+- 平台没有重新抽样，也没有重新试听音频，你看不到任何原始对话数据。
+- 你手上只有现有模板的全文和用户的修改建议，请只依据这两者作答，不要凭空引入新的数据事实。
+- 与建议无关的部分一律保持原样，改动范围越小越好。`;
+
+  const user = `# 数据源
+名称：${input.dataSourceName}
+业务描述：
+"""
+${input.businessDesc || "（未填写）"}
+"""
+
+# extra 字段 schema（修改指标口径时必须遵守）
+${describeExtraSchema(input.extraSchema)}
+
+# 现有模板 v${input.previous.version}
+${input.previous.rationale ? `## 当初的规划说明
+${truncate(input.previous.rationale, 1200)}
+` : ""}
+## metric_schema
+${JSON.stringify(input.previous.metric_schema ?? {}, null, 1)}
+
+## session_prompt（会话层）
+"""
+${input.previous.session_prompt}
+"""
+
+## user_prompt（用户层）
+"""
+${input.previous.user_prompt}
+"""
+
+## global_prompt（全局层）
+"""
+${input.previous.global_prompt}
+"""
+
+## report_prompt（报告生成）
+"""
+${input.previous.report_prompt}
+"""
+
+# 用户在看过预览报告后提出的修改建议
+"""
+${input.feedback}
+"""
+
+# 你的任务
+判断这条建议要落到哪几段提示词上，只改这几段，输出一个 JSON 对象：
+
+{
+  "change_note": "你改了什么、为什么这样改，以及建议里有哪些部分你无法只靠改提示词实现（120-300 字）",
+  "changed": ["session_prompt"],
+  "session_prompt": "改动后的完整提示词全文；没改这一段就省略这个键",
+  "user_prompt": "同上",
+  "global_prompt": "同上",
+  "report_prompt": "同上",
+  "metric_schema": {
+    "session": [{ "key": "英文键", "label": "中文名", "unit": "单位", "desc": "计算口径" }],
+    "user": [{ "key": "", "label": "", "unit": "", "desc": "" }],
+    "global": [{ "key": "", "label": "", "unit": "", "desc": "" }]
+  }
+}
+
+硬性要求：
+1. changed 只列出你实际改动的键名，取值范围是 session_prompt | user_prompt | global_prompt | report_prompt。
+   至少要改动一段——如果建议完全落不到提示词上，也要挑出最接近的一段做出可执行的调整，并在 change_note 里说明。
+2. 被改动的提示词必须输出**完整全文**，不得输出 diff、省略号、「（其余同上）」这类占位写法；
+   没有改动的提示词直接省略该键，平台会原样沿用旧版本。
+3. 原模板里的 JSON 输出契约、字段取值范围、"只输出 JSON"这类纪律条款必须原样保留，不得删改。
+4. 建议涉及新增/删除/改口径的指标时，要同步更新 metric_schema 与相关层的提示词，
+   并保证 session / user / global 三层的 metric key 命名一致、可自底向上聚合。
+   metric_schema 只在确实需要调整时输出；输出时给出完整的三层结构。
+5. 提示词用中文书写（业务字段名保留英文键）。
+6. 只输出 JSON 对象本身，不要 Markdown 代码块、不要额外解释。`;
+
+  const messages: ChatMessage[] = [
+    { role: "system", content: system },
+    { role: "user", content: user },
+  ];
+  return messages;
+}
+
 /* ---------------------------------------------------------- 报告生成提示词 */
 
 export function buildReportMessages(input: {

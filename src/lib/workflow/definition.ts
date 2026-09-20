@@ -147,7 +147,7 @@ export const NODE_DEFS: Record<NodeKind, NodeDef> = {
     kind: "preview",
     label: "预览报告",
     group: "规划",
-    description: "用模板跑抽样数据生成预览报告，支持反馈迭代",
+    description: "用选中的模板版本跑抽样数据生成预览报告，支持反馈迭代",
     icon: "eye",
     accent: "var(--chart-1)",
     params: [

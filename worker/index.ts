@@ -4,7 +4,8 @@
  * Polls Postgres for four kinds of jobs and runs them out-of-band so the web
  * app never holds a long HTTP request:
  *   1. import_batches     -> 解压对象存储里的压缩包并入库
- *   2. planning_jobs      -> AI 规划，产出 analysis_templates 新版本
+ *   2. planning_jobs      -> AI 规划（create/revise）或按建议改配置（refine），
+ *                            两者都产出 analysis_templates 的新版本
  *   3. template_previews  -> 基于模板 + 抽样数据生成预览报告
  *   4. analysis_tasks     -> 全量三层分析与报告输出
  *
@@ -13,7 +14,15 @@
  */
 import "dotenv/config";
 import { closePool, execute, maybeOne, one, query, scalar } from "../src/lib/db";
-import { planTemplate, buildPreview, fallbackTemplate, type DataSourceLike } from "../src/lib/engine/plan";
+import {
+  planTemplate,
+  buildPreview,
+  fallbackTemplate,
+  refinePlan,
+  PROMPT_LABEL,
+  type DataSourceLike,
+  type TemplateConfig,
+} from "../src/lib/engine/plan";
 import { runTask, log } from "../src/lib/engine/executor";
 import { importZip } from "../src/lib/engine/import";
 import { configFromGraph, normalizeGraph } from "../src/lib/workflow/graph";
@@ -157,6 +166,11 @@ interface PlanningJob extends JsonObject {
 }
 
 async function handlePlanning(job: PlanningJob) {
+  // Two ways into this queue: plan the template again from freshly sampled
+  // data, or edit the one that is already there. They share the row and the
+  // claim, and nothing below applies to the second.
+  if (job.kind === "refine") return handleRefine(job);
+
   const source = await loadSource(job.data_source_id);
   if (!source) throw new Error("数据源不存在");
 
@@ -241,6 +255,92 @@ async function handlePlanning(job: PlanningJob) {
      set status = 'completed', template_id = $2, finished_at = now(), progress = $3::jsonb
      where id = $1`,
     [job.id, tpl.id, JSON.stringify({ step: "done", version: tpl.version })],
+  );
+}
+
+/**
+ * `kind = 'refine'`: carry the feedback into the parent template's prompts and
+ * save the result as the next version. No sampling, no audio, no full rewrite —
+ * one text call against prompts we already have.
+ *
+ * Everything the parent recorded about the data it was planned from
+ * (business_desc, extra_schema, the sampling snapshot) is carried over as-is,
+ * because this run did not look at the data and has nothing newer to say about
+ * it.
+ */
+async function handleRefine(job: PlanningJob) {
+  if (!job.parent_template_id) throw new Error("按建议修改配置缺少来源模板");
+
+  const source = await loadSource(job.data_source_id);
+  if (!source) throw new Error("数据源不存在");
+
+  const parent = await maybeOne<TemplateConfig>(
+    `select version, session_prompt, user_prompt, global_prompt, report_prompt,
+            metric_schema, rationale
+     from analysis_templates where id = $1`,
+    [job.parent_template_id],
+  );
+  if (!parent) throw new Error("来源模板不存在");
+  if (!job.feedback?.trim()) throw new Error("按建议修改配置缺少修改建议");
+
+  const runtime = await resolveRuntime(job.data_source_id);
+
+  await execute(`update planning_jobs set progress = $2::jsonb where id = $1`, [
+    job.id,
+    JSON.stringify({ step: "refining" }),
+  ]);
+
+  const out = await refinePlan({
+    dataSource: source,
+    runtime,
+    feedback: job.feedback,
+    previous: parent,
+  });
+
+  const touched = out.changed.map((k) => PROMPT_LABEL[k]).join("、");
+  const rationale = [
+    `基于 v${parent.version} 按修改建议直接修改配置（未重新抽样、未重新试听音频）。`,
+    `改动范围：${touched}提示词。`,
+    out.change_note ? `\n\n${out.change_note}` : "",
+  ].join("");
+
+  let tpl: { id: string; version: number };
+  try {
+    tpl = await one<{ id: string; version: number }>(
+      `insert into analysis_templates
+         (data_source_id, workflow_id, version, status, session_prompt, user_prompt,
+          global_prompt, report_prompt, metric_schema, business_desc, extra_schema, samples,
+          rationale, feedback, parent_id, created_by)
+       select t.data_source_id, coalesce($2::uuid, t.workflow_id),
+              (select coalesce(max(version), 0) + 1 from analysis_templates
+                where data_source_id = t.data_source_id),
+              'draft', $3, $4, $5, $6, $7::jsonb,
+              t.business_desc, t.extra_schema, t.samples,
+              $8, $9, t.id, $10
+       from analysis_templates t where t.id = $1
+       returning id, version`,
+      [
+        job.parent_template_id,
+        job.workflow_id,
+        out.session_prompt,
+        out.user_prompt,
+        out.global_prompt,
+        out.report_prompt,
+        JSON.stringify(out.metric_schema ?? {}),
+        rationale,
+        job.feedback,
+        job.created_by,
+      ],
+    );
+  } catch (err) {
+    throw new Error(`保存模板失败: ${(err as Error).message}`);
+  }
+
+  await execute(
+    `update planning_jobs
+     set status = 'completed', template_id = $2, finished_at = now(), progress = $3::jsonb
+     where id = $1`,
+    [job.id, tpl.id, JSON.stringify({ step: "done", version: tpl.version, changed: out.changed })],
   );
 }
 

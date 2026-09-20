@@ -1,6 +1,6 @@
 /**
  * End-to-end smoke test for the analysis pipeline.
- * Run: npx tsx --env-file=.env.local scripts/e2e.ts [--step plan|preview|run]
+ * Run: npx tsx --env-file=.env.local scripts/e2e.ts [import|plan|preview|refine|run]
  *
  * Talks to Postgres directly, so the background worker must be running for the
  * planning / preview / task steps to make progress.
@@ -218,6 +218,50 @@ async function main() {
     );
     if (done.status !== "completed") throw new Error(`preview failed: ${done.error}`);
     log("preview html bytes", (done.html ?? "").length);
+  }
+
+  /* ------------------------------------------------------------ refine */
+  // The cheap half of the feedback loop: a note turns into the next version
+  // without re-sampling. What it must prove is that a new version arrives and
+  // that it is not a verbatim copy of the one it came from.
+  if (step === "all" || step === "refine") {
+    if (!templateId) throw new Error("no template, cannot refine");
+    const parent = await one<{ version: number; report_prompt: string }>(
+      `select version, report_prompt from analysis_templates where id = $1`,
+      [templateId],
+    );
+    const job = await one<{ id: string }>(
+      `insert into planning_jobs
+         (data_source_id, workflow_id, kind, status, params, feedback, parent_template_id, created_by)
+       values ($1, $2, 'refine', 'pending', '{}'::jsonb, $3, $4, $5)
+       returning id`,
+      [
+        sourceId,
+        workflowId,
+        "报告里加一个「语音链路专项」章节，先讲 ASR 误识别与 TTS 打断，再讲整体解决率。",
+        templateId,
+        userId,
+      ],
+    );
+    log("refine job created", job.id);
+
+    const done = await waitFor<{ status: string; error: string | null; template_id: string | null }>(
+      "refine",
+      () =>
+        maybeOne(`select status, error, template_id, progress from planning_jobs where id = $1`, [job.id]),
+      settled,
+    );
+    if (done.status !== "completed") throw new Error(`refine failed: ${done.error}`);
+
+    const next = await one<{ version: number; report_prompt: string; parent_id: string | null }>(
+      `select version, report_prompt, parent_id from analysis_templates where id = $1`,
+      [done.template_id],
+    );
+    if (next.parent_id !== templateId) throw new Error("refine: new version does not point at its parent");
+    if (next.report_prompt === parent.report_prompt) {
+      log("refine: report_prompt unchanged (模型可能把改动落在了别的层)");
+    }
+    log("refined template", { from: `v${parent.version}`, to: `v${next.version}` });
   }
 
   /* -------------------------------------------------------------- run */

@@ -18,11 +18,13 @@ import {
   GitBranch,
   CircleAlert,
   Calculator,
+  Wand2,
 } from "lucide-react";
 import {
   confirmTemplate,
   startPlanning,
   startPreview,
+  startPromptRefine,
   startReplanning,
   type PlanningParams,
 } from "@/lib/actions/studio";
@@ -185,11 +187,32 @@ export function Studio({
   useEffect(() => setEstimate(null), [scope.type, scope.start, scope.end]);
 
   const confirmed = state.templates.find((t) => t.status === "confirmed");
+  // Versions are numbered per data source, so iterating an older one still
+  // lands on max + 1 — promising v3 while the source is already on v5 would be
+  // a lie every time someone goes back to compare.
+  const nextVersion = (state.templates[0]?.version ?? 0) + 1;
   const latestPreview = state.previews.find((p) => p.status === "completed" && p.hasHtml);
+  // A preview is a report *of one template version*. Previewing already runs
+  // the selected version, so the page shows that version's preview when it has
+  // one, and only falls back to the newest one — clearly labelled — when it
+  // does not. Reading v2's report while v3 is selected is how a rerun gets
+  // mistaken for "the change did nothing".
+  const selectedPreview = state.previews.find(
+    (p) => p.template_id === selected?.id && p.status === "completed" && p.hasHtml,
+  );
+  const shownPreview = selectedPreview ?? latestPreview;
+  const shownVersion = versionOf(state.templates, shownPreview?.template_id);
+  const previewIsStale = Boolean(shownPreview && selected && shownPreview.template_id !== selected.id);
   // Only the newest preview's failure is worth showing: an older one has
   // already been answered by whatever ran after it.
   const failedPreview =
     !activePreview && state.previews[0]?.status === "failed" ? state.previews[0] : null;
+  // Same rule for planning jobs, split by where the button that starts them
+  // lives: planning in the card above, refine down in the preview card.
+  const lastPlanJob = state.jobs.find((j) => j.kind !== "refine") ?? null;
+  const lastRefineJob = state.jobs.find((j) => j.kind === "refine") ?? null;
+  const planFailure = !activeJob && lastPlanJob?.status === "failed" ? lastPlanJob : null;
+  const refineFailure = !activeJob && lastRefineJob?.status === "failed" ? lastRefineJob : null;
 
   async function guard(fn: () => Promise<void>, key: string) {
     setBusy(key);
@@ -226,6 +249,25 @@ export function Studio({
       setShowPreview(false);
       await poll();
       void res;
+    };
+  }
+
+  /**
+   * The other half of the feedback loop: hand the note straight to the model
+   * that owns the prompts, which edits them in place. No sampling, so none of
+   * the planning params apply and nothing is written back to the workflow.
+   */
+  function refine_() {
+    return async () => {
+      if (!selected) {
+        toast.error("请先完成规划生成模板");
+        return;
+      }
+      await startPromptRefine(selected.id, feedback);
+      toast.success(`已按修改建议调整 v${selected.version} 的配置，正在生成新版本`);
+      setFeedback("");
+      setShowPreview(false);
+      await poll();
     };
   }
 
@@ -303,7 +345,13 @@ export function Studio({
 
   const steps = [
     { n: 1, title: "规划", done: state.templates.length > 0, active: !state.templates.length, hint: "三层抽样 → 生成提示词模板" },
-    { n: 2, title: "预览", done: Boolean(latestPreview), active: state.templates.length > 0 && !latestPreview, hint: "抽样报告 → 提交修改建议" },
+    {
+      n: 2,
+      title: "预览",
+      done: Boolean(latestPreview),
+      active: state.templates.length > 0 && !latestPreview,
+      hint: "抽样报告 → 改配置 / 重新规划",
+    },
     { n: 3, title: "确认并生成", done: Boolean(confirmed), active: Boolean(latestPreview) && !confirmed, hint: "锁定模板 → 启动全量分析" },
   ];
 
@@ -423,19 +471,11 @@ export function Studio({
             />
           </div>
 
-          {activeJob && <JobProgress job={activeJob} />}
-
-          {state.jobs.filter((j) => j.status === "failed").slice(0, 1).map((j) => (
-            <div key={j.id} className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/8 p-3 text-[12px] text-destructive">
-              <CircleAlert className="mt-0.5 size-3.5 shrink-0" />
-              <div className="min-w-0 flex-1">
-                <div className="font-medium">规划失败</div>
-                <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-destructive/10 p-2.5 text-[11px] leading-relaxed">
-                  {String(j.error ?? "未知错误")}
-                </pre>
-              </div>
-            </div>
-          ))}
+          {/* A refine job is started from the preview card below, and reports
+              there: progress that lands two cards away from the button reads as
+              nothing having happened. */}
+          {activeJob && activeJob.kind !== "refine" && <JobProgress job={activeJob} />}
+          {planFailure && <JobFailure job={planFailure} />}
         </CardContent>
       </Card>
 
@@ -561,14 +601,17 @@ export function Studio({
                 2. 预览报告
               </CardTitle>
               <CardDescription className="max-w-3xl text-[12.5px] leading-relaxed">
-                用当前模板跑一小批抽样数据，真实走完「会话分析 → 用户汇总 → 全局汇总 → 报告渲染」，
-                让你在启动全量分析前先看到报告长什么样。不满意就在下面写修改建议，回到规划重新生成模板。
+                用<b>当前选中的模板版本</b>
+                {selected ? `（v${selected.version}）` : ""}
+                跑一小批抽样数据，真实走完「会话分析 → 用户汇总 → 全局汇总 → 报告渲染」，
+                让你在启动全量分析前先看到报告长什么样。换一个版本再点一次，就能横向对比两版的报告。
+                不满意就在下面写修改建议：既可以让模型直接改这一版的配置，也可以带着意见回到规划重新生成一版。
               </CardDescription>
             </div>
             <div className="flex items-center gap-2">
-              {latestPreview && (
+              {shownPreview && (
                 <Button size="sm" variant="ghost" className="h-8" onClick={() => setShowPreview((v) => !v)}>
-                  {showPreview ? "收起预览" : "查看最近预览"}
+                  {showPreview ? "收起预览" : `查看 v${shownVersion} 预览`}
                 </Button>
               )}
               <Button
@@ -583,7 +626,9 @@ export function Studio({
                 ) : (
                   <Play className="size-3.5" />
                 )}
-                {latestPreview ? "重新生成预览" : "生成预览"}
+                {selected
+                  ? `基于 v${selected.version} ${selectedPreview ? "重新生成预览" : "生成预览"}`
+                  : "生成预览"}
               </Button>
             </div>
           </div>
@@ -618,8 +663,13 @@ export function Studio({
                   <div key={p.id} className="flex items-center gap-2 text-[11.5px] text-muted-foreground">
                     <StatusBadge status={p.status} />
                     <span className="num">{formatDate(String(p.created_at))}</span>
-                    <span className="truncate">
-                      v{state.templates.find((t) => t.id === p.template_id)?.version ?? "?"}
+                    <span
+                      className={cn(
+                        "num truncate",
+                        p.template_id === selected?.id && "font-semibold text-foreground",
+                      )}
+                    >
+                      v{versionOf(state.templates, p.template_id)}
                     </span>
                   </div>
                 ))}
@@ -628,27 +678,39 @@ export function Studio({
             </div>
           </div>
 
-          {activePreview && <PreviewProgress preview={activePreview} />}
+          {activePreview && (
+            <PreviewProgress
+              preview={activePreview}
+              version={versionOf(state.templates, activePreview.template_id)}
+            />
+          )}
           {failedPreview && <PreviewFailure preview={failedPreview} />}
-          {latestPreview && <PreviewFallbacks preview={latestPreview} />}
+          {shownPreview && <PreviewFallbacks preview={shownPreview} />}
 
-          {showPreview && latestPreview ? (
+          {previewIsStale && selected ? (
+            <div className="rounded-xl border border-border/70 bg-muted/25 p-3 text-[11.5px] leading-relaxed text-muted-foreground">
+              当前选中的是 <b className="num text-foreground">v{selected.version}</b>，但它还没有预览报告；
+              下面展示的是 <b className="num text-foreground">v{shownVersion}</b> 的那一份。点上方
+              「基于 v{selected.version} 生成预览」用选中的版本重跑一次。
+            </div>
+          ) : null}
+
+          {showPreview && shownPreview ? (
             <div className="space-y-2">
               <div className="flex items-center gap-2">
                 <span className="num text-[11.5px] text-muted-foreground">
-                  {formatDate(String(latestPreview.created_at))} · 模板 v
-                  {state.templates.find((t) => t.id === latestPreview.template_id)?.version ?? "?"}
+                  {formatDate(String(shownPreview.created_at))} · 模板 v{shownVersion}
                 </span>
                 <Button asChild size="sm" variant="ghost" className="ml-auto h-7 text-[11.5px]">
-                  <a href={`/api/report/preview/${latestPreview.id}`} target="_blank" rel="noreferrer">
+                  <a href={`/api/report/preview/${shownPreview.id}`} target="_blank" rel="noreferrer">
                     <ExternalLink className="size-3" />
                     新窗口打开
                   </a>
                 </Button>
               </div>
               <iframe
-                key={latestPreview.id}
-                src={`/api/report/preview/${latestPreview.id}`}
+                key={shownPreview.id}
+                src={`/api/report/preview/${shownPreview.id}`}
                 title="预览报告"
                 className="h-[640px] w-full rounded-xl border border-border/70 bg-white"
               />
@@ -659,8 +721,8 @@ export function Studio({
             <div className="rounded-xl border border-border/70 bg-muted/20 p-3.5">
               <Label className="text-[11.5px] font-medium">对报告内容提出修改建议</Label>
               <p className="mt-1 mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
-                提交后会带着上一版模板 + 你的意见回到规划阶段，生成新的模板版本与新的预览，直到你满意为止。
-                例如：「章节顺序改成先讲问题再讲成绩」「打断率要按噪音等级分组」「KPI 里加上 TTS P90 延迟」。
+                写下希望报告改进的地方，例如「章节顺序改成先讲问题再讲成绩」「打断率要按噪音等级分组」
+                「KPI 里加上 TTS P90 延迟」。两种落地方式都会生成新的模板版本，改完记得基于新版本再跑一次预览。
               </p>
               <Textarea
                 value={feedback}
@@ -669,18 +731,37 @@ export function Studio({
                 placeholder="写下你希望报告改进的地方…"
                 className="text-[12.5px]"
               />
-              <div className="mt-2.5 flex items-center gap-2">
-                <Button
-                  size="sm"
+              {activeJob?.kind === "refine" ? (
+                <div className="mt-2.5">
+                  <JobProgress job={activeJob} />
+                </div>
+              ) : null}
+              {refineFailure ? (
+                <div className="mt-2.5">
+                  <JobFailure job={refineFailure} />
+                </div>
+              ) : null}
+              <div className="mt-2.5 grid gap-2.5 md:grid-cols-2">
+                <FeedbackAction
+                  icon={busy === "refine" || activeJob ? Loader2 : Wand2}
+                  spinning={busy === "refine" || Boolean(activeJob)}
+                  title="按建议直接改配置"
+                  desc="不重新抽样、不重新试听音频，模型只在现有提示词上改动建议涉及的部分，几十秒完成。适合口径微调、章节顺序、增删指标。"
+                  onClick={() => void guard(refine_(), "refine")}
+                  disabled={!feedback.trim() || Boolean(activeJob)}
+                  primary
+                />
+                <FeedbackAction
+                  icon={busy === "revise" || activeJob ? Loader2 : Send}
+                  spinning={busy === "revise" || Boolean(activeJob)}
+                  title="带建议重新规划"
+                  desc="重新抽样（按上方规划参数，可含试听音频）并整套重写四段提示词。适合分析方向本身要换，或数据在这之后有较大变化。"
                   onClick={() => void guard(plan_("revise"), "revise")}
                   disabled={!feedback.trim() || Boolean(activeJob)}
-                >
-                  {busy === "revise" || activeJob ? <Loader2 className="size-3.5 animate-spin" /> : <Send className="size-3.5" />}
-                  提交修改建议并重新规划
-                </Button>
-                <span className="text-[11px] text-muted-foreground">
-                  基于 v{selected.version} · 会生成 v{(selected.version ?? 0) + 1}
-                </span>
+                />
+              </div>
+              <div className="mt-2 text-[11px] text-muted-foreground">
+                两者都基于 v{selected.version}，生成 v{nextVersion}（父版本保留，可随时切回）。
               </div>
             </div>
           ) : (
@@ -829,6 +910,52 @@ export function Studio({
   );
 }
 
+/** The version label of a template id, for rows that only carry the id. */
+function versionOf(templates: TemplateRow[], templateId: string | null | undefined): string {
+  const v = templates.find((t) => t.id === templateId)?.version;
+  return v === undefined ? "?" : String(v);
+}
+
+/** One of the two ways a piece of feedback can become a new template version. */
+function FeedbackAction({
+  icon: Icon,
+  spinning,
+  title,
+  desc,
+  onClick,
+  disabled,
+  primary,
+}: {
+  icon: typeof Send;
+  spinning: boolean;
+  title: string;
+  desc: string;
+  onClick: () => void;
+  disabled: boolean;
+  primary?: boolean;
+}) {
+  return (
+    <div
+      className={cn(
+        "flex flex-col gap-2 rounded-lg border p-3",
+        primary ? "border-primary/45 bg-accent/30" : "border-border/70 bg-card",
+      )}
+    >
+      <p className="text-[11px] leading-relaxed text-muted-foreground">{desc}</p>
+      <Button
+        size="sm"
+        variant={primary ? "default" : "outline"}
+        className="mt-auto h-8 w-full"
+        onClick={onClick}
+        disabled={disabled}
+      >
+        <Icon className={cn("size-3.5", spinning && "animate-spin")} />
+        {title}
+      </Button>
+    </div>
+  );
+}
+
 function NumField({
   label,
   value,
@@ -860,10 +987,36 @@ function NumField({
   );
 }
 
+function JobFailure({ job }: { job: JobRow }) {
+  return (
+    <div className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/8 p-3 text-[12px] text-destructive">
+      <CircleAlert className="mt-0.5 size-3.5 shrink-0" />
+      <div className="min-w-0 flex-1">
+        <div className="font-medium">{JOB_KIND_LABEL[String(job.kind)] ?? "规划"}失败</div>
+        <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-destructive/10 p-2.5 text-[11px] leading-relaxed">
+          {String(job.error ?? "未知错误")}
+        </pre>
+      </div>
+    </div>
+  );
+}
+
+const JOB_KIND_LABEL: Record<string, string> = {
+  create: "规划",
+  revise: "重新规划",
+  refine: "按建议改配置",
+};
+
 function JobProgress({ job }: { job: JobRow }) {
   const step = String((job.progress as JsonObject)?.step ?? "");
   const label =
-    step === "sampling" ? "三层抽样中" : job.status === "pending" ? "排队中" : "模型正在生成提示词模板";
+    job.status === "pending"
+      ? "排队中"
+      : job.kind === "refine"
+        ? "正在按修改建议调整配置"
+        : step === "sampling"
+          ? "三层抽样中"
+          : "模型正在生成提示词模板";
   return (
     <div className="rounded-xl border border-primary/35 bg-accent/40 p-3.5">
       <div className="flex items-center gap-2 text-[12.5px] font-medium">
@@ -877,7 +1030,7 @@ function JobProgress({ job }: { job: JobRow }) {
       </div>
       <Progress value={job.status === "running" ? 55 : 12} className="mt-2.5 h-1" />
       <p className="mt-2 text-[11.5px] leading-relaxed text-muted-foreground">
-        {job.kind === "revise" && job.feedback
+        {job.feedback
           ? `修改意见：${job.feedback}`
           : "规划耗时约 30–90 秒（取决于是否试听音频），完成后会自动出现在右侧模板列表。"}
       </p>
@@ -938,7 +1091,7 @@ function PreviewFallbacks({ preview }: { preview: PreviewRow }) {
   );
 }
 
-function PreviewProgress({ preview }: { preview: PreviewRow }) {
+function PreviewProgress({ preview, version }: { preview: PreviewRow; version: string }) {
   const p = (preview.progress ?? {}) as { stage?: string; done?: number; total?: number; message?: string };
   const stageLabel: Record<string, string> = {
     collect: "选取预览样本",
@@ -957,6 +1110,7 @@ function PreviewProgress({ preview }: { preview: PreviewRow }) {
       <div className="flex items-center gap-2 text-[12.5px] font-medium">
         <Loader2 className="size-3.5 animate-spin text-primary" />
         {stageLabel[String(p.stage ?? "")] ?? "处理中"}
+        <span className="text-[11px] font-normal text-muted-foreground">基于 v{version}</span>
         <span className="num ml-auto text-[11px] text-muted-foreground">
           {done} / {total}
         </span>

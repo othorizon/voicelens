@@ -5,6 +5,7 @@ import { PLAN_AUDIO_KIND, stageOptions, textModelKind } from "@/lib/models/mode"
 import {
   describeExtraSchema,
   buildPlanningMessages,
+  buildRefineMessages,
   renderSamples,
   GLOBAL_JSON_CONTRACT,
   REPORT_SPEC_CONTRACT,
@@ -241,6 +242,132 @@ export async function planTemplate(input: PlanInput): Promise<PlanOutput> {
       ...(usage ? {} : {}),
     },
   };
+}
+
+/* ------------------------------------------------ refine（按建议改配置） */
+
+export type PromptKey = "session_prompt" | "user_prompt" | "global_prompt" | "report_prompt";
+
+export const PROMPT_KEYS: PromptKey[] = [
+  "session_prompt",
+  "user_prompt",
+  "global_prompt",
+  "report_prompt",
+];
+
+export const PROMPT_LABEL: Record<PromptKey, string> = {
+  session_prompt: "会话层",
+  user_prompt: "用户层",
+  global_prompt: "全局层",
+  report_prompt: "报告生成",
+};
+
+export interface TemplateConfig {
+  version: number;
+  session_prompt: string;
+  user_prompt: string;
+  global_prompt: string;
+  report_prompt: string;
+  metric_schema?: unknown;
+  rationale?: string;
+}
+
+export interface RefineInput {
+  dataSource: DataSourceLike;
+  runtime: AnalysisRuntime;
+  feedback: string;
+  previous: TemplateConfig;
+}
+
+export interface RefineOutput {
+  session_prompt: string;
+  user_prompt: string;
+  global_prompt: string;
+  report_prompt: string;
+  metric_schema: { session: unknown[]; user: unknown[]; global: unknown[] };
+  /** What the model says it changed, for the version's rationale. */
+  change_note: string;
+  /** The prompts that actually differ from the parent version. */
+  changed: PromptKey[];
+}
+
+export interface RefineResult extends Partial<Record<PromptKey, string>> {
+  change_note?: string;
+  changed?: unknown;
+  metric_schema?: { session?: unknown[]; user?: unknown[]; global?: unknown[] };
+}
+
+/**
+ * Fold the model's answer onto the parent version. Pure, and deliberately
+ * suspicious of the answer: the parent is the baseline, and a prompt only
+ * changes when the model sent back text that actually differs from it.
+ *
+ * The `changed` list the model sends is a claim about its own answer, not a
+ * record of what happened, so it is recomputed here from the text: a prompt it
+ * rewrote without listing still counts, and one it listed without rewriting
+ * does not.
+ */
+export function applyRefineResult(previous: TemplateConfig, data: RefineResult): RefineOutput {
+  const prompts = {} as Record<PromptKey, string>;
+  const changed: PromptKey[] = [];
+  for (const key of PROMPT_KEYS) {
+    const next = typeof data[key] === "string" ? (data[key] as string).trim() : "";
+    const prev = previous[key] ?? "";
+    if (next && next !== prev.trim()) {
+      prompts[key] = next;
+      changed.push(key);
+    } else {
+      prompts[key] = prev;
+    }
+  }
+
+  if (!changed.length) {
+    throw new Error(
+      "按建议修改配置失败：模型没有对任何一段提示词做出改动。请把建议写得更具体（指明要改哪一层、改成什么），或改用「重新规划」。",
+    );
+  }
+
+  const prevSchema = (previous.metric_schema ?? {}) as Record<string, unknown[]>;
+  const nextSchema = (data.metric_schema ?? {}) as Record<string, unknown[] | undefined>;
+  const layer = (k: "session" | "user" | "global") =>
+    Array.isArray(nextSchema[k]) ? (nextSchema[k] as unknown[]) : (prevSchema[k] ?? []);
+
+  return {
+    ...prompts,
+    metric_schema: { session: layer("session"), user: layer("user"), global: layer("global") },
+    change_note: String(data.change_note ?? "").trim(),
+    changed,
+  };
+}
+
+/**
+ * Apply the reviewer's note to an existing template without planning again.
+ *
+ * The full loop (`planTemplate` with `feedback`) re-samples three layers, may
+ * re-listen to audio and rewrites all four prompts from scratch — right when
+ * the data changed or the direction is wrong, wasteful when the note is "把
+ * KPI 里加上 TTS P90 延迟". This path sends only the existing prompts and the
+ * note, and keeps every prompt the model did not return exactly as it was: the
+ * parent version is the baseline, not a suggestion.
+ */
+export async function refinePlan(input: RefineInput): Promise<RefineOutput> {
+  const previous = input.previous;
+  const messages = buildRefineMessages({
+    dataSourceName: input.dataSource.name,
+    businessDesc: input.dataSource.description,
+    extraSchema: input.dataSource.extra_schema ?? [],
+    feedback: input.feedback,
+    previous,
+  });
+
+  const { data } = await chatJson<RefineResult>(messages, {
+    model: requireModel(input.runtime, textModelKind(input.runtime.mode), "按建议修改配置"),
+    temperature: 0.4,
+    label: "按建议修改配置",
+    ...stageOptions(input.runtime.stages, "plan"),
+  });
+
+  return applyRefineResult(previous, data);
 }
 
 /* ------------------------------------------------------- fallback prompts */
