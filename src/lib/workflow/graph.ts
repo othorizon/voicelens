@@ -44,8 +44,11 @@ function def(kind: NodeKind): Record<string, unknown> {
 
 /**
  * Default pipeline: 数据源 → 范围 → 规划 → 模板 → 预览 → 会话分析 →
- * 用户汇总 → 全局汇总 → 报告 → 结果。Row 2 runs right-to-left so the canvas
- * reads as an S and stays compact.
+ * 用户汇总 → 全局汇总 → 报告 → 结果。Both rows run left-to-right: every node
+ * takes its edge on the left and hands it off on the right, so a row laid out
+ * the other way draws each step pointing backwards. Only the wrap from the end
+ * of row 1 to the start of row 2 travels right-to-left, as a line rather than
+ * as the whole row.
  */
 export function defaultGraph(): WfGraph {
   const top: { id: string; kind: NodeKind; label: string; stage: string }[] = [
@@ -74,7 +77,7 @@ export function defaultGraph(): WfGraph {
     ...bottom.map((n, i) => ({
       id: n.id,
       type: "wf",
-      position: { x: (bottom.length - 1 - i) * STEP, y: BOTTOM_Y },
+      position: { x: i * STEP, y: BOTTOM_Y },
       data: { kind: n.kind, label: n.label, stage: n.stage, params: def(n.kind) },
     })),
   );
@@ -166,12 +169,41 @@ export function validateGraph(graph: WfGraph): string[] {
   return problems;
 }
 
+/** Where row 2 sat back when it was laid out right-to-left. */
+const LEGACY_BOTTOM_X: Record<string, number> = {
+  session: 4 * STEP,
+  user: 3 * STEP,
+  global: 2 * STEP,
+  report: 1 * STEP,
+  output: 0,
+};
+
+/**
+ * Graphs stored before row 2 was turned around still carry the old positions,
+ * and nothing rewrites them — so lay that row out again on read. Only a row
+ * still sitting exactly where the old default put it qualifies: once anyone has
+ * dragged a node, the arrangement is theirs and stays untouched.
+ */
+function straightenLegacyRow(nodes: WfNode[]): WfNode[] {
+  const legacy = nodes.filter(
+    (n) => n.position?.y === BOTTOM_Y && LEGACY_BOTTOM_X[n.id] === n.position?.x,
+  );
+  if (legacy.length !== Object.keys(LEGACY_BOTTOM_X).length) return nodes;
+
+  const order = Object.keys(LEGACY_BOTTOM_X);
+  return nodes.map((n) =>
+    n.id in LEGACY_BOTTOM_X
+      ? { ...n, position: { ...n.position, x: order.indexOf(n.id) * STEP } }
+      : n,
+  );
+}
+
 export function normalizeGraph(raw: unknown): WfGraph {
   if (!raw || typeof raw !== "object") return defaultGraph();
   const g = raw as Partial<WfGraph>;
   if (!Array.isArray(g.nodes) || g.nodes.length === 0) return defaultGraph();
   return {
-    nodes: g.nodes as WfNode[],
+    nodes: straightenLegacyRow(g.nodes as WfNode[]),
     edges: Array.isArray(g.edges) ? (g.edges as WfEdge[]) : [],
   };
 }
