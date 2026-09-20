@@ -148,7 +148,7 @@ async function audioImpression(
         { role: "system", content: `你是一名语音对话数据分析专家。数据源业务背景：${dataSource.description || dataSource.name}` },
         { role: "user", content: parts as never },
       ],
-      { model, temperature: 0.4, maxTokens: 2000 },
+      { model, temperature: 0.4, maxTokens: 2000, label: "规划试听音频" },
     );
     return res.text.trim();
   } catch {
@@ -208,6 +208,7 @@ export async function planTemplate(input: PlanInput): Promise<PlanOutput> {
     temperature: 0.5,
     maxTokens: 14000,
     thinking: true,
+    label: "AI 规划",
   });
 
   if (!data.session_prompt || !data.user_prompt || !data.global_prompt || !data.report_prompt) {
@@ -378,6 +379,15 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
   const extraHint = describeExtraSchema(dataSource.extra_schema);
   let done = 0;
   const audioUse = { sessionsWithAudio: 0, clipsAttached: 0, clipsUnavailable: 0 };
+  // A layer that falls back keeps the preview alive but silently lowers its
+  // quality, so every fallback is recorded and reported with the result — an
+  // "all 12 sessions failed" preview used to look exactly like a good one.
+  const failures: { stage: string; key: string; message: string }[] = [];
+  const noteFailure = (stage: string, key: string, err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(`[preview] ${stage} ${key} 失败: ${message}`);
+    failures.push({ stage, key, message: message.slice(0, 400) });
+  };
   const results = await mapLimit(sessions, input.concurrency ?? 3, async (s) => {
     try {
       // Same runner as the full task, so the preview can never disagree with
@@ -395,6 +405,7 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
       audioUse.clipsUnavailable += audio.requested - audio.attached;
       return { session: s, result };
     } catch (err) {
+      noteFailure("会话层分析", s.session_key, err);
       return {
         session: s,
         result: normalizeSessionResult(
@@ -431,7 +442,8 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
         input.runtime,
       );
       return { user_key: key, result };
-    } catch {
+    } catch (err) {
+      noteFailure("用户层汇总", key, err);
       const list = byUser.get(key)!;
       return {
         user_key: key,
@@ -515,7 +527,9 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
     sessionResults,
     userResults: userAgg,
     globalResult: globalResult as JsonObject,
-    stats,
+    // `failures` rides along with the stats rather than the model-facing copy:
+    // the workbench needs to show it, the report prompt must not see it.
+    stats: { ...stats, failures: failures.slice(0, 20), failure_count: failures.length },
     spec,
     html,
   };

@@ -387,7 +387,7 @@ async function tick() {
     void run("planning", planning.id, () => handlePlanning(planning), async (err) => {
       await execute(
         `update planning_jobs set status = 'failed', error = $2, finished_at = now() where id = $1`,
-        [planning.id, err.slice(0, 1500)],
+        [planning.id, err.slice(0, 4000)],
       );
     });
   }
@@ -400,7 +400,7 @@ async function tick() {
     void run("preview", preview.id, () => handlePreview(preview), async (err) => {
       await execute(
         `update template_previews set status = 'failed', error = $2, finished_at = now() where id = $1`,
-        [preview.id, err.slice(0, 1500)],
+        [preview.id, err.slice(0, 4000)],
       );
     });
   }
@@ -411,7 +411,7 @@ async function tick() {
     void run("task", task.id, () => handleTask(task), async (err) => {
       await execute(
         `update analysis_tasks set status = 'failed', error = $2, finished_at = now() where id = $1`,
-        [task.id, err.slice(0, 1500)],
+        [task.id, err.slice(0, 4000)],
       );
       await log(task.id, "error", null, `任务失败: ${err.slice(0, 600)}`);
     });
@@ -425,7 +425,11 @@ async function run(kind: string, id: string, fn: () => Promise<void>, onError: (
     console.log(`[worker] ${kind} ${id} done`);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    // The stack goes to the container log too: the message alone is what the UI
+    // shows, and when a job dies three layers down the operator needs the frame
+    // it died in to know which of them it was.
     console.error(`[worker] ${kind} ${id} failed:`, msg);
+    if (e instanceof Error && e.stack) console.error(e.stack);
     try {
       await onError(msg);
     } catch {

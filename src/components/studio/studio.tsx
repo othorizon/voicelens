@@ -186,6 +186,10 @@ export function Studio({
 
   const confirmed = state.templates.find((t) => t.status === "confirmed");
   const latestPreview = state.previews.find((p) => p.status === "completed" && p.hasHtml);
+  // Only the newest preview's failure is worth showing: an older one has
+  // already been answered by whatever ran after it.
+  const failedPreview =
+    !activePreview && state.previews[0]?.status === "failed" ? state.previews[0] : null;
 
   async function guard(fn: () => Promise<void>, key: string) {
     setBusy(key);
@@ -424,9 +428,11 @@ export function Studio({
           {state.jobs.filter((j) => j.status === "failed").slice(0, 1).map((j) => (
             <div key={j.id} className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/8 p-3 text-[12px] text-destructive">
               <CircleAlert className="mt-0.5 size-3.5 shrink-0" />
-              <div>
+              <div className="min-w-0 flex-1">
                 <div className="font-medium">规划失败</div>
-                <div className="mt-0.5 leading-relaxed opacity-90">{String(j.error ?? "未知错误")}</div>
+                <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-destructive/10 p-2.5 text-[11px] leading-relaxed">
+                  {String(j.error ?? "未知错误")}
+                </pre>
               </div>
             </div>
           ))}
@@ -623,6 +629,8 @@ export function Studio({
           </div>
 
           {activePreview && <PreviewProgress preview={activePreview} />}
+          {failedPreview && <PreviewFailure preview={failedPreview} />}
+          {latestPreview && <PreviewFallbacks preview={latestPreview} />}
 
           {showPreview && latestPreview ? (
             <div className="space-y-2">
@@ -873,6 +881,59 @@ function JobProgress({ job }: { job: JobRow }) {
           ? `修改意见：${job.feedback}`
           : "规划耗时约 30–90 秒（取决于是否试听音频），完成后会自动出现在右侧模板列表。"}
       </p>
+    </div>
+  );
+}
+
+/**
+ * The worker writes the failure to `template_previews.error`; without this the
+ * page just kept offering "生成预览" and the reason lived only in the container
+ * log, which is not where the person who pressed the button is looking.
+ */
+function PreviewFailure({ preview }: { preview: PreviewRow }) {
+  return (
+    <div className="space-y-2 rounded-xl border border-destructive/40 bg-destructive/8 p-3.5 text-[12px] text-destructive">
+      <div className="flex items-center gap-2 font-medium">
+        <CircleAlert className="size-3.5 shrink-0" />
+        预览失败
+        <span className="num ml-auto text-[11px] font-normal opacity-80">
+          {formatDate(String(preview.finished_at ?? preview.created_at))}
+        </span>
+      </div>
+      <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-destructive/10 p-2.5 text-[11px] leading-relaxed">
+        {String(preview.error ?? "未知错误")}
+      </pre>
+      <p className="text-[11px] opacity-80">
+        同一条错误也会写进 Worker 日志（docker logs 里以 [worker] preview 开头）。
+      </p>
+    </div>
+  );
+}
+
+/**
+ * A preview whose session or user layer fell back still renders a report — one
+ * written from placeholder text. Saying so keeps a degraded preview from being
+ * read as a verdict on the template.
+ */
+function PreviewFallbacks({ preview }: { preview: PreviewRow }) {
+  const stats = (preview.stats ?? {}) as {
+    failure_count?: number;
+    failures?: { stage?: string; key?: string; message?: string }[];
+  };
+  const count = Number(stats.failure_count ?? 0);
+  if (!count) return null;
+  const first = stats.failures?.[0];
+  return (
+    <div className="space-y-1.5 rounded-xl border border-amber-500/40 bg-amber-500/10 p-3.5 text-[12px] text-amber-700 dark:text-amber-400">
+      <div className="flex items-center gap-2 font-medium">
+        <CircleAlert className="size-3.5 shrink-0" />
+        本次预览有 {count} 处分析失败并使用了兜底文案，报告结论会偏离真实数据
+      </div>
+      {first ? (
+        <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-amber-500/10 p-2.5 text-[11px] leading-relaxed">
+          {`${first.stage ?? "分析"} ${first.key ?? ""}：${first.message ?? ""}`}
+        </pre>
+      ) : null}
     </div>
   );
 }

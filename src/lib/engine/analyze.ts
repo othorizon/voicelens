@@ -124,6 +124,7 @@ export async function analyzeSession(opts: AnalyzeSessionOptions): Promise<Sessi
   // no clips, or whose clips all failed to sign, is a text-only session.
   const strategy = sessionStrategy(runtime.mode, clips.length > 0);
   const system = `${template.session_prompt}${JSON_RULE}`;
+  const label = `会话层分析（${session.session_key}）`;
 
   const done = (result: SessionAnalysis, tokens: number): SessionAnalysisRun => ({
     result: normalizeSessionResult(result, session),
@@ -141,14 +142,14 @@ export async function analyzeSession(opts: AnalyzeSessionOptions): Promise<Sessi
       // rejects an `input_audio` part, so this must stay true even if the
       // routing table in @/lib/models/mode is changed later.
       const content = kind === "omni" && clips.length ? withAudio(payload, clips) : payload;
-      const pass = await sessionJson([sys(system), user(content)], model);
+      const pass = await sessionJson([sys(system), user(content)], model, label);
       return done(pass.result, pass.tokens);
     }
 
     case "omni_then_refine": {
       const omni = requireModel(runtime, "omni", "会话层音频分析");
       const multimodal = requireModel(runtime, "multimodal", "会话层二次优化");
-      const first = await sessionJson([sys(system), user(withAudio(payload, clips))], omni);
+      const first = await sessionJson([sys(system), user(withAudio(payload, clips))], omni, `${label} · 音频`);
       // The refine pass gets the transcript and v1 but no audio, so the prompt
       // tells it to keep v1's audio-derived claims rather than second-guess
       // what it cannot hear.
@@ -160,6 +161,7 @@ export async function analyzeSession(opts: AnalyzeSessionOptions): Promise<Sessi
           user(REFINE_PROMPT),
         ],
         multimodal,
+        `${label} · 二次优化`,
       );
       return done(second.result, first.tokens + second.tokens);
     }
@@ -178,11 +180,12 @@ export async function analyzeSession(opts: AnalyzeSessionOptions): Promise<Sessi
             ...clips,
           ]),
         ],
-        { model: omni, temperature: 0.4, maxTokens: 1500 },
+        { model: omni, temperature: 0.4, maxTokens: 1500, label: `${label} · 音频转述` },
       );
       const pass = await sessionJson(
         [sys(system), user(`${renderAudioObservation(heard.text)}\n\n${payload}`)],
         multimodal,
+        label,
       );
       return done(pass.result, heard.usage.total_tokens + pass.tokens);
     }
@@ -200,8 +203,9 @@ function user(content: string | ContentPart[]): ChatMessage {
 async function sessionJson(
   messages: ChatMessage[],
   model: ModelRuntime,
+  label: string,
 ): Promise<{ result: SessionAnalysis; tokens: number }> {
-  const res = await chatJson<SessionAnalysis>(messages, { model, temperature: 0.3 });
+  const res = await chatJson<SessionAnalysis>(messages, { model, temperature: 0.3, label });
   return { result: res.data, tokens: res.usage.total_tokens };
 }
 
@@ -344,7 +348,11 @@ export async function aggregateUser(
       },
       { role: "user", content: payload },
     ],
-    { model: requireModel(runtime, textModelKind(runtime.mode), "用户层汇总"), temperature: 0.3 },
+    {
+      model: requireModel(runtime, textModelKind(runtime.mode), "用户层汇总"),
+      temperature: 0.3,
+      label: `用户层汇总（${input.user_key}）`,
+    },
   );
 
   const known = new Set(input.sessions.map((s) => s.session_key));
@@ -409,6 +417,7 @@ export async function aggregateGlobal(
       model: requireModel(runtime, textModelKind(runtime.mode), "全局层汇总"),
       temperature: 0.35,
       maxTokens: 12000,
+      label: "全局层汇总",
     },
   );
 
@@ -487,6 +496,8 @@ export async function generateReport(input: {
     model: requireModel(input.runtime, textModelKind(input.runtime.mode), "报告生成"),
     temperature: 0.45,
     maxTokens: 8000,
+    thinking: false,
+    label: "报告生成",
   });
   const base = normalizeReportSpec(res.data, input.title);
   const { spec, overrides } = reconcileWithGroundTruth(base, input.groundTruth);
