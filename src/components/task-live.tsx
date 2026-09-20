@@ -3,8 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { CheckCircle2, CircleAlert, Loader2, Play, RotateCcw, XCircle, Terminal } from "lucide-react";
-import { cancelTask, rerunTask } from "@/lib/actions/tasks";
+import { CheckCircle2, CircleAlert, Loader2, Play, RefreshCw, RotateCcw, XCircle, Terminal } from "lucide-react";
+import { cancelTask, rerunReport, rerunTask } from "@/lib/actions/tasks";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
@@ -53,7 +53,7 @@ export function TaskLive({
   const [counts, setCounts] = useState({ success: 0, failed: 0, total: 0 });
   const [busy, setBusy] = useState(false);
   const lastLogId = useRef<number | undefined>(undefined);
-  const active = ["pending", "running", "aggregating", "reporting"].includes(state.status);
+  const active = ["pending", "running", "aggregating", "reporting", "report_pending"].includes(state.status);
 
   const poll = useCallback(async () => {
     try {
@@ -171,6 +171,31 @@ export function TaskLive({
                 variant="outline"
                 className="h-7 text-[11.5px]"
                 disabled={busy}
+                title="复用已有的三层分析结果，只重新设计并生成报告页面"
+                onClick={async () => {
+                  setBusy(true);
+                  try {
+                    await rerunReport(taskId);
+                    toast.success("已排队重新生成报告");
+                    await poll();
+                  } catch (e) {
+                    toast.error(e instanceof Error ? e.message : "重新生成报告失败");
+                  } finally {
+                    setBusy(false);
+                  }
+                }}
+              >
+                <RefreshCw className="size-3.5" />
+                重新生成报告
+              </Button>
+            )}
+            {!active && canRerun && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 text-[11.5px]"
+                disabled={busy}
+                title="从头重跑整条三层分析链路"
                 onClick={async () => {
                   setBusy(true);
                   try {
