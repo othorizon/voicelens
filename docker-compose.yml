@@ -18,6 +18,13 @@ x-voicelens: &voicelens
   image: voicelens:latest
   env_file: .env.local
   restart: unless-stopped
+  # 容器本身不写磁盘（导入是流式的，不落临时文件），但 docker 默认的 json-file
+  # 日志驱动是**不封顶**的，长期跑下来宿主机磁盘只会涨不会降。封到 3 x 10MB。
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
 
 services:
   web:

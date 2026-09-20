@@ -159,6 +159,10 @@ Web 只接受请求、写作业；Worker 跑的是几分钟到几十分钟、反
 - 对象存储的 Bucket 要配 CORS（浏览器直传上传用）与「碎片过期」生命周期规则，见
   〈[Bucket 必配：跨域（CORS）规则](#bucket-必配跨域cors规则)〉。这两条都在控制台上配，不在代码里。
 - 容器无状态：数据在 Postgres、音频在对象存储，不用挂卷；进程以非 root（uid 1000）运行。
+  导入也不落临时文件（压缩包在桶里就地按条目读），所以容器磁盘不会随数据量增长。
+- compose 里给两个服务都封了容器日志（3 × 10MB）。docker 默认的 json-file 驱动**不封顶**，
+  是这套部署里唯一一处会让宿主机磁盘单调增长的地方；手工 `docker run` 记得自己加
+  `--log-opt max-size=10m --log-opt max-file=3`。
 - `migrate --dry` 只列待执行的迁移；镜像里的其它命令原样执行，例如
   `docker run --rm --env-file .env.local voicelens:latest node_modules/.bin/tsx scripts/rerender-report.ts <task-id>`。
 - 镜像源与时区都是 build-arg，换一家只改参数：
@@ -244,7 +248,9 @@ Worker 入库时也不把压缩包读进内存：用 **HTTP Range 就地读**桶
   要求接入点公网可达（填了内网接入点 `oss-*-internal.aliyuncs.com` 就拉不到，浏览器直传同理）。
 
 另外建议再加一条**生命周期规则**清理「未完成的分片上传」（OSS：Bucket → 数据管理 → 生命周期 →
-碎片过期天数，设 7 天）。中断后再也没人续传的上传，分片会一直占着存储且不计入对象列表。
+碎片过期天数，设 7 天）。中断后再也没人续传的上传，分片会一直占着存储且不计入对象列表——
+这是桶里唯一一处不会自己消失的残留：成功导入后暂存的压缩包会立即删除，删除批次时也会连
+带删掉它，只有「上传到一半就再没人管」的分片需要靠这条规则兜底。
 
 其它 S3 兼容存储同理，只是入口名字不同：AWS S3 在 Bucket → Permissions → CORS，填
 `{"AllowedOrigins":["https://…"],"AllowedMethods":["PUT"],"AllowedHeaders":["*"]}`；MinIO 默认
