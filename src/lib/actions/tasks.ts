@@ -3,6 +3,8 @@
 import { revalidatePath } from "next/cache";
 import { requireSourceAccess, requireTaskAccess, ActionError } from "./common";
 import { execute, maybeOne, one } from "@/lib/db";
+import { countScope, resolveScope } from "@/lib/engine/sampler";
+import { configFromGraph, normalizeGraph } from "@/lib/workflow/graph";
 import type { JsonObject } from "@/lib/types";
 
 export interface CreateTaskInput {
@@ -103,6 +105,127 @@ export async function createAnalysisTask(input: CreateTaskInput): Promise<{ task
   revalidatePath(`/sources/${input.dataSourceId}`);
   revalidatePath("/dashboard");
   return { taskId: created.id };
+}
+
+interface ScopeTotals extends JsonObject {
+  sessions: number;
+  users: number;
+  turns: number;
+  chars: number;
+  audio_clips: number;
+  audio_clips_sent: number;
+  first_at: string | null;
+  last_at: string | null;
+}
+
+export interface ScopeEstimate {
+  mode: "incremental" | "range";
+  /** Sessions this run would actually take. */
+  sessions: number;
+  /** Sessions the scope matches; anything past `sessions` waits for a later run. */
+  matched: number;
+  /** The workflow's session cap, 0 when it is off. */
+  limit: number;
+  users: number;
+  turns: number;
+  chars: number;
+  audioClips: number;
+  /** Clips that would reach the model — 0 while the session node has audio off. */
+  audioClipsSent: number;
+  useAudio: boolean;
+  firstAt: string | null;
+  lastAt: string | null;
+  /** One call per session, one per user, plus the global and report passes. */
+  modelCalls: number;
+}
+
+/**
+ * What a task launched right now would chew through. It resolves the scope with
+ * the same `resolveScope` the executor runs, under the config the worker would
+ * load from this workflow, so the numbers are the run's own rather than a
+ * second guess at them.
+ */
+export async function estimateTaskScope(input: {
+  dataSourceId: string;
+  workflowId: string | null;
+  scopeType?: "incremental" | "range";
+  rangeStart?: string | null;
+  rangeEnd?: string | null;
+}): Promise<ScopeEstimate> {
+  await requireSourceAccess(input.dataSourceId);
+
+  let config = configFromGraph(null);
+  if (input.workflowId) {
+    const wf = await maybeOne<{ graph: unknown }>(
+      `select graph from workflows where id = $1 and data_source_id = $2`,
+      [input.workflowId, input.dataSourceId],
+    );
+    if (!wf) throw new ActionError("工作流不存在");
+    config = configFromGraph(normalizeGraph(wf.graph));
+  }
+
+  // Same precedence as the executor: the scope picked at launch wins, and the
+  // workflow's own mode only decides when the task carries neither.
+  const mode =
+    input.scopeType === "range"
+      ? "range"
+      : input.scopeType === "incremental"
+        ? "incremental"
+        : config.scope.mode === "range"
+          ? "range"
+          : "incremental";
+  const rangeStart = input.rangeStart ?? null;
+  const rangeEnd = input.rangeEnd ?? null;
+  if (mode === "range" && !rangeStart && !rangeEnd) {
+    throw new ActionError("按时间范围分析时请至少设置一个时间边界");
+  }
+
+  const [scope, matched] = await Promise.all([
+    resolveScope(input.dataSourceId, { mode, rangeStart, rangeEnd, limit: config.scope.maxSessions }),
+    countScope(input.dataSourceId, { mode, rangeStart, rangeEnd }),
+  ]);
+
+  const empty: ScopeTotals = {
+    sessions: 0,
+    users: 0,
+    turns: 0,
+    chars: 0,
+    audio_clips: 0,
+    audio_clips_sent: 0,
+    first_at: null,
+    last_at: null,
+  };
+  const totals = scope.sessionIds.length
+    ? await one<ScopeTotals>(
+        `select count(*)::int                                     as sessions,
+                count(distinct user_key)::int                     as users,
+                coalesce(sum(turn_count), 0)::int                 as turns,
+                coalesce(sum(char_count), 0)::float8              as chars,
+                coalesce(sum(audio_count), 0)::int                as audio_clips,
+                coalesce(sum(least(audio_count, $2::int)), 0)::int as audio_clips_sent,
+                min(started_at)                                   as first_at,
+                max(started_at)                                   as last_at
+         from sessions
+         where id = any($1::uuid[])`,
+        [scope.sessionIds, Math.max(0, config.session.maxAudiosPerSession)],
+      )
+    : empty;
+
+  return {
+    mode,
+    sessions: Number(totals.sessions),
+    matched,
+    limit: config.scope.maxSessions,
+    users: Number(totals.users),
+    turns: Number(totals.turns),
+    chars: Number(totals.chars),
+    audioClips: Number(totals.audio_clips),
+    audioClipsSent: config.session.useAudio ? Number(totals.audio_clips_sent) : 0,
+    useAudio: config.session.useAudio,
+    firstAt: totals.first_at ? new Date(totals.first_at).toISOString() : null,
+    lastAt: totals.last_at ? new Date(totals.last_at).toISOString() : null,
+    modelCalls: Number(totals.sessions) + Number(totals.users) + (Number(totals.sessions) ? 2 : 0),
+  };
 }
 
 export async function cancelTask(taskId: string): Promise<void> {

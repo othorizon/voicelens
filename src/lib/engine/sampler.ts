@@ -15,6 +15,11 @@ export interface ScopeOptions {
   limit: number;
 }
 
+/** A null bound means "unbounded on that side". */
+const IN_RANGE = `data_source_id = $1
+     and ($2::timestamptz is null or started_at >= $2)
+     and ($3::timestamptz is null or started_at <= $3)`;
+
 /** Decide which sessions this run should cover. */
 export async function resolveScope(
   dataSourceId: string,
@@ -23,12 +28,9 @@ export async function resolveScope(
   const limit = options.limit > 0 ? options.limit : 100000;
 
   if (options.mode === "range") {
-    // A null bound means "unbounded on that side".
     const rows = await query<{ id: string }>(
       `select id from sessions
-       where data_source_id = $1
-         and ($2::timestamptz is null or started_at >= $2)
-         and ($3::timestamptz is null or started_at <= $3)
+       where ${IN_RANGE}
        order by started_at
        limit $4`,
       [dataSourceId, options.rangeStart ?? null, options.rangeEnd ?? null, limit],
@@ -46,6 +48,27 @@ export async function resolveScope(
     dataSourceId,
   ]);
   return { sessionIds: ids, mode: "incremental", totalAvailable: total || ids.length };
+}
+
+/**
+ * How many sessions the same scope matches with no cap on it. It lives next to
+ * `resolveScope` and shares its predicate, so the two cannot disagree about
+ * what is in range; the gap between them is what the session cap defers to a
+ * later run.
+ */
+export async function countScope(
+  dataSourceId: string,
+  options: Omit<ScopeOptions, "limit">,
+): Promise<number> {
+  if (options.mode === "range") {
+    return countRows(`select count(*) from sessions where ${IN_RANGE}`, [
+      dataSourceId,
+      options.rangeStart ?? null,
+      options.rangeEnd ?? null,
+    ]);
+  }
+  // Counted through the function that defines the set, not a second copy of it.
+  return countRows(`select count(*) from unanalyzed_session_ids($1, $2)`, [dataSourceId, 2147483647]);
 }
 
 export interface SessionLike {
