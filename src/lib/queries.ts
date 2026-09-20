@@ -140,15 +140,47 @@ export async function listWorkflows(ownerId: string | null, dataSourceId?: strin
   })) as unknown as (JsonObject & { id: string; name: string; data_source_id: string })[];
 }
 
-export async function listTemplates(dataSourceId: string) {
-  return query<JsonObject>(
-    `select id, version, status, rationale, feedback, created_at, created_by, metric_schema,
-            samples, parent_id, session_prompt, user_prompt, global_prompt, report_prompt
-     from analysis_templates
-     where data_source_id = $1
-     order by version desc`,
-    [dataSourceId],
-  );
+/**
+ * Everything the analysis studio renders: template versions, planning jobs and
+ * previews. The first render and the poll route both read through here, because
+ * the client replaces its rows wholesale on every poll — a column the poll
+ * leaves out does not go stale, it vanishes from the screen.
+ *
+ * Two columns are trimmed on purpose rather than shipped: a preview's report
+ * html, which the iframe fetches through its own route, and the sampling
+ * snapshot, of which only the audio impression is ever rendered.
+ */
+export async function loadStudioState(dataSourceId: string) {
+  const [templates, jobs, previews] = await Promise.all([
+    query<JsonObject>(
+      `select id, version, status, rationale, feedback, created_at, parent_id, metric_schema,
+              session_prompt, user_prompt, global_prompt, report_prompt,
+              jsonb_build_object('audio_impression', samples -> 'audio_impression') as samples
+       from analysis_templates
+       where data_source_id = $1
+       order by version desc
+       limit 50`,
+      [dataSourceId],
+    ),
+    query<JsonObject>(
+      `select id, status, kind, feedback, error, created_at, finished_at, progress, template_id
+       from planning_jobs
+       where data_source_id = $1
+       order by created_at desc
+       limit 10`,
+      [dataSourceId],
+    ),
+    query<JsonObject>(
+      `select id, template_id, status, progress, error, created_at, finished_at, stats,
+              (html is not null and html <> '') as "hasHtml"
+       from template_previews
+       where data_source_id = $1
+       order by created_at desc
+       limit 5`,
+      [dataSourceId],
+    ),
+  ]);
+  return { templates, jobs, previews };
 }
 
 export async function listTasks(ownerId: string | null, limit = 50, dataSourceId?: string) {
@@ -190,29 +222,6 @@ export interface TaskRow extends JsonObject {
   range_end: string | null;
   data_sources?: { name: string } | null;
   profiles?: { display_name: string | null } | null;
-}
-
-export async function listPreviews(dataSourceId: string) {
-  return query<JsonObject>(
-    `select id, template_id, status, progress, error, created_at, finished_at, stats
-     from template_previews
-     where data_source_id = $1
-     order by created_at desc
-     limit 20`,
-    [dataSourceId],
-  );
-}
-
-export async function listPlanningJobs(dataSourceId: string) {
-  return query<JsonObject>(
-    `select id, status, kind, params, feedback, error, created_at, finished_at, progress,
-            template_id, parent_template_id
-     from planning_jobs
-     where data_source_id = $1
-     order by created_at desc
-     limit 20`,
-    [dataSourceId],
-  );
 }
 
 export async function listBatches(dataSourceId: string) {

@@ -156,7 +156,7 @@ export function Studio({
       setState({
         templates,
         jobs: (json.jobs ?? []) as JobRow[],
-        previews: (json.previews ?? []).map((p) => ({ ...p, hasHtml: Boolean(p.hasHtml) })) as PreviewRow[],
+        previews: (json.previews ?? []) as PreviewRow[],
       });
       if (arrived && templates.length) setSelectedId(templates[0].id);
     } catch {
