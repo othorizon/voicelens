@@ -51,7 +51,8 @@ ENV NODE_ENV=production \
 # 以及 Worker 与迁移直接用 tsx 执行的 TS 源码（worker/、db/、被 worker 引用的 src/）。
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/.next ./.next
-COPY --chown=node:node public ./public
+# 没有 public/：静态资源走 App Router 的约定文件（src/app/icon.svg、apple-icon.png），
+# 构建时已编译进 .next。以后真加了 public/，这里要补一行 COPY，否则运行期 404。
 COPY --chown=node:node src ./src
 COPY --chown=node:node worker ./worker
 COPY --chown=node:node db ./db
