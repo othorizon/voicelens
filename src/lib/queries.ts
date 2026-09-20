@@ -172,6 +172,7 @@ export async function loadStudioState(dataSourceId: string) {
     ),
     query<JsonObject>(
       `select id, template_id, status, progress, error, created_at, finished_at, stats,
+              (params->>'reportOnly')::boolean as "reportOnly",
               (html is not null and html <> '') as "hasHtml"
        from template_previews
        where data_source_id = $1

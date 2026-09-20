@@ -216,6 +216,62 @@ export async function updateTemplatePrompt(
   }
 }
 
+/**
+ * Run a preview's report again over the analysis it already has.
+ *
+ * A preview is looked at, disliked and run again — and usually what wants
+ * changing is the report, not the twelve conversations underneath it. Those
+ * are the expensive part and they are already on the row, so this reuses
+ * them and costs one call.
+ *
+ * It lands as a new preview rather than overwriting the old one: the point
+ * is usually to compare two designs, and the workbench already lists
+ * previews side by side.
+ */
+export async function rerunPreviewReport(previewId: string): Promise<{ previewId: string }> {
+  const source = await maybeOne<{
+    id: string;
+    template_id: string;
+    status: string;
+    params: Record<string, unknown> | null;
+    has_results: boolean;
+  }>(
+    `select id, template_id, status, params,
+            (jsonb_array_length(coalesce(session_results, '[]'::jsonb)) > 0
+             and global_result is not null) as has_results
+     from template_previews where id = $1`,
+    [previewId],
+  );
+  if (!source) throw new ActionError("预览不存在");
+
+  const { session, dataSourceId } = await requireTemplateAccess(source.template_id);
+
+  if (source.status !== "completed") throw new ActionError("只有已完成的预览可以只重新生成报告");
+  if (!source.has_results) throw new ActionError("这份预览没有可复用的分析结果，请完整重跑");
+
+  let created: { id: string };
+  try {
+    created = await one<{ id: string }>(
+      `insert into template_previews
+         (template_id, data_source_id, status, params, progress, created_by)
+       values ($1, $2, 'pending', $3::jsonb, $4::jsonb, $5)
+       returning id`,
+      [
+        source.template_id,
+        dataSourceId,
+        JSON.stringify({ ...(source.params ?? {}), reportOnly: true, sourcePreviewId: previewId }),
+        JSON.stringify({ stage: "report", done: 0, total: 1, message: "排队中（只重新生成报告）" }),
+        session.userId,
+      ],
+    );
+  } catch (err) {
+    throw new ActionError(`重新生成预览报告失败：${(err as Error).message}`);
+  }
+
+  revalidatePath(`/sources/${dataSourceId}/studio`);
+  return { previewId: created.id };
+}
+
 export async function startPreview(
   templateId: string,
   params: { sessions?: number; useAudio?: boolean; concurrency?: number } = {},

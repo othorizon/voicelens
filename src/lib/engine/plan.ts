@@ -613,14 +613,6 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
   progress({ stage: "global_aggregation", done: 1, total: 1 });
 
   progress({ stage: "report", done: 0, total: 1, message: "生成预览报告" });
-  const evidence = collectEvidence(sessionResults);
-  const messageCount = sessions.reduce((n, s) => n + (s.turn_count ?? 0), 0);
-  const groundTruth = deriveGroundTruth(histograms, dataSource.extra_schema ?? [], {
-    sessions: sessionResults.length,
-    messages: messageCount,
-  });
-
-  const drill = buildDrillData(sessions as never, sessionResults, userAgg);
   const audio: AudioUsage = {
     enabled: input.useAudio,
     maxPerSession: PREVIEW_MAX_AUDIOS,
@@ -628,7 +620,105 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
     ...audioUse,
   };
 
-  const scopeNote = `预览样本 ${sessionResults.length} 个会话 / ${userAgg.length} 位用户（非全量）`;
+  const report = await renderPreviewReport({
+    dataSource,
+    runtime: input.runtime,
+    template,
+    sessions: sessions as never,
+    sessionResults: results.map((r) => ({
+      session_key: r.session.session_key,
+      user_key: r.session.user_key,
+      started_at: r.session.started_at ?? null,
+      turn_count: r.session.turn_count ?? 0,
+      result: r.result,
+    })),
+    userResults: userAgg,
+    globalResult: globalResult as JsonObject,
+    stats,
+    histograms,
+    audio,
+    onProgress: (message) => progress({ stage: "report", done: 0, total: 1, message }),
+  });
+  progress({ stage: "report", done: 1, total: 1 });
+
+  return {
+    sessionResults,
+    userResults: userAgg,
+    globalResult: globalResult as JsonObject,
+    // `failures` rides along with the stats rather than the model-facing copy:
+    // the workbench needs to show it, the report prompt must not see it.
+    stats: {
+      ...stats,
+      failures: failures.slice(0, 20),
+      failure_count: failures.length,
+      // Carried so a report-only rerun can state what this run heard instead
+      // of guessing or quietly claiming zero.
+      audio,
+      report_engine: report.engine,
+      report_attempts: report.attempts,
+    },
+    spec: report.spec,
+    html: report.html,
+  };
+}
+
+/* --------------------------------------------------- preview report stage */
+
+export interface PreviewReportInput {
+  dataSource: DataSourceLike;
+  runtime: AnalysisRuntime;
+  template: PreviewInput["template"];
+  /** Session rows, for drill-down transcripts and metadata. */
+  sessions: {
+    session_key: string;
+    user_key: string;
+    started_at: string | null;
+    turn_count: number;
+    digest: string;
+  }[];
+  sessionResults: {
+    session_key: string;
+    user_key: string;
+    started_at?: string | null;
+    turn_count?: number;
+    result: SessionAnalysis;
+  }[];
+  userResults: { user_key: string; result: UserAnalysis }[];
+  globalResult: JsonObject;
+  stats: JsonObject;
+  histograms: HistogramEntry[];
+  audio: AudioUsage;
+  onProgress?: (message: string) => void;
+}
+
+export interface PreviewReportOutput {
+  spec: ReportSpec | null;
+  html: string;
+  engine: "page" | "spec";
+  attempts: number;
+}
+
+/**
+ * The report half of a preview, separated from the analysis that feeds it.
+ *
+ * A preview is looked at, disliked and run again — and most of the time what
+ * wants changing is the report, not the three layers underneath it. Those
+ * layers are the expensive part and they are already stored, so this is
+ * reachable on its own and costs one call.
+ */
+export async function renderPreviewReport(input: PreviewReportInput): Promise<PreviewReportOutput> {
+  const { dataSource, template } = input;
+  const step = input.onProgress ?? (() => {});
+
+  const evidence = collectEvidence(input.sessionResults);
+  const messages = input.sessions.reduce((n, s) => n + (s.turn_count ?? 0), 0);
+  const groundTruth = deriveGroundTruth(input.histograms, dataSource.extra_schema ?? [], {
+    sessions: input.sessionResults.length,
+    messages,
+  });
+
+  const drill = buildDrillData(input.sessions, input.sessionResults, input.userResults);
+  const scopeNote = `预览样本 ${input.sessionResults.length} 个会话 / ${input.userResults.length} 位用户（非全量）`;
   const tone =
     "客观、数据驱动、结论先行；这是预览报告，样本量较小，措辞需要保守，不要使用超出证据强度的判断";
 
@@ -643,21 +733,15 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
     language: "zh",
     tone,
     includeEvidence: true,
-    sessionResults: results.map((r) => ({
-      session_key: r.session.session_key,
-      user_key: r.session.user_key,
-      started_at: r.session.started_at ?? null,
-      turn_count: r.session.turn_count ?? 0,
-      result: r.result,
-    })),
-    userResults: userAgg,
-    globalResult: globalResult as JsonObject,
-    stats,
-    distributions: histograms.map((h) => ({ key: h.key, label: h.key, items: h.values })),
+    sessionResults: input.sessionResults,
+    userResults: input.userResults,
+    globalResult: input.globalResult,
+    stats: input.stats,
+    distributions: input.histograms.map((h) => ({ key: h.key, label: h.key, items: h.values })),
     groundTruth,
     evidence,
-    messages: messageCount,
-    audio,
+    messages,
+    audio: input.audio,
   });
 
   // A preview is a dozen sessions, so its detail rows travel inside the
@@ -673,58 +757,137 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
     brief: template.report_prompt,
     payload,
     snapshot,
-    onStep: (message: string) => progress({ stage: "report", done: 0, total: 1, message }),
+    onStep: step,
   });
 
-  let spec: ReportSpec | null = null;
-  let html = generated.document;
+  if (generated.validation.ok) {
+    return { spec: null, html: generated.document, engine: "page", attempts: generated.attempts };
+  }
 
-  if (!generated.validation.ok) {
-    // The preview is what the operator judges the template by, so it must
-    // exist even when the page could not be made to render.
-    progress({ stage: "report", done: 0, total: 1, message: "页面未通过校验，回退到内置渲染器" });
-    const fallback = await generateReport({
-      template,
-      runtime: input.runtime,
-      title: `${dataSource.name} · 预览报告`,
-      scopeNote,
-      globalResult: globalResult as JsonObject,
-      userResults: userAgg as unknown as { user_key: string; result: JsonObject }[],
-      sessionStats: stats,
-      distributions: histograms,
-      groundTruth,
-      language: "zh",
-      includeEvidence: true,
-      tone,
-      targetSections: 6,
-      evidence,
-    });
-    spec = fallback.spec;
-    html = renderReportHtml({
-      spec,
+  // The preview is what the operator judges the template by, so it must exist
+  // even when the page could not be made to render.
+  step("页面未通过校验，回退到内置渲染器");
+  const fallback = await generateReport({
+    template,
+    runtime: input.runtime,
+    title: `${dataSource.name} · 预览报告`,
+    scopeNote,
+    globalResult: input.globalResult,
+    userResults: input.userResults as unknown as { user_key: string; result: JsonObject }[],
+    sessionStats: input.stats,
+    distributions: input.histograms,
+    groundTruth,
+    language: "zh",
+    includeEvidence: true,
+    tone,
+    targetSections: 6,
+    evidence,
+  });
+
+  return {
+    spec: fallback.spec,
+    html: renderReportHtml({
+      spec: fallback.spec,
       drill,
       generatedAt: new Date().toISOString(),
-      scopeNote: `预览样本 ${sessionResults.length} 个会话 / ${userAgg.length} 位用户`,
-      audio,
-    });
-  }
+      scopeNote: `预览样本 ${input.sessionResults.length} 个会话 / ${input.userResults.length} 位用户`,
+      audio: input.audio,
+    }),
+    engine: "spec",
+    attempts: generated.attempts,
+  };
+}
+
+/**
+ * Redo a preview's report against the analysis it already has.
+ *
+ * The three layers are stored on the preview row, and they are what a preview
+ * spends its time and its tokens on. Regenerating the page is one call, so
+ * iterating on how a report looks does not mean re-analysing the same twelve
+ * conversations every time.
+ *
+ * The session rows themselves are not stored — only their results — so they
+ * are resolved again by key, which `unique (data_source_id, session_key)`
+ * makes exact.
+ */
+export async function buildPreviewReportOnly(input: {
+  dataSource: DataSourceLike;
+  runtime: AnalysisRuntime;
+  template: PreviewInput["template"];
+  stored: {
+    sessionResults: { session_key: string; user_key: string; result: SessionAnalysis }[];
+    userResults: { user_key: string; result: UserAnalysis }[];
+    globalResult: JsonObject;
+    stats: JsonObject;
+  };
+  onProgress?: (p: { stage: string; done: number; total: number; message?: string }) => void;
+}): Promise<PreviewOutput> {
+  const progress = input.onProgress ?? (() => {});
+  const { sessionResults, userResults } = input.stored;
+
+  if (!sessionResults.length) throw new Error("这份预览没有可复用的会话层结果");
+
+  progress({ stage: "collect", done: 0, total: 1, message: "读取已有的分析结果" });
+  const rows = await query<{ id: string }>(
+    `select id from sessions where data_source_id = $1 and session_key = any($2::text[])`,
+    [input.dataSource.id, sessionResults.map((r) => r.session_key)],
+  );
+  const ids = rows.map((r) => r.id);
+  if (!ids.length) throw new Error("原预览的会话已不存在，无法只重新生成报告");
+
+  const sessions = await loadSessions(ids, { maxDigestChars: 20000 });
+  const histograms = await extraHistogramForSessions(ids);
+  const stats = computeStats(sessionResults);
+
+  // What the original run heard. Recomputing it is impossible here and
+  // claiming zero would read as "audio was on and nothing arrived", which is
+  // the one state the header chip is there to call out.
+  const audio = (input.stored.stats?.audio as AudioUsage | undefined) ?? {
+    enabled: false,
+    maxPerSession: PREVIEW_MAX_AUDIOS,
+    sessionsTotal: sessions.length,
+    sessionsWithAudio: 0,
+    clipsAttached: 0,
+    clipsUnavailable: 0,
+  };
+
+  progress({ stage: "report", done: 0, total: 1, message: "重新生成预览报告" });
+  const byKey = new Map(sessions.map((s) => [s.session_key, s]));
+  const report = await renderPreviewReport({
+    dataSource: input.dataSource,
+    runtime: input.runtime,
+    template: input.template,
+    sessions: sessions as never,
+    sessionResults: sessionResults.map((r) => ({
+      ...r,
+      started_at: byKey.get(r.session_key)?.started_at ?? null,
+      turn_count: byKey.get(r.session_key)?.turn_count ?? 0,
+    })),
+    userResults,
+    globalResult: input.stored.globalResult,
+    stats,
+    histograms,
+    audio,
+    onProgress: (message) => progress({ stage: "report", done: 0, total: 1, message }),
+  });
   progress({ stage: "report", done: 1, total: 1 });
 
   return {
     sessionResults,
-    userResults: userAgg,
-    globalResult: globalResult as JsonObject,
-    // `failures` rides along with the stats rather than the model-facing copy:
-    // the workbench needs to show it, the report prompt must not see it.
+    userResults,
+    globalResult: input.stored.globalResult,
     stats: {
       ...stats,
-      failures: failures.slice(0, 20),
-      failure_count: failures.length,
-      report_engine: generated.validation.ok ? "page" : "spec",
-      report_attempts: generated.attempts,
+      // Failures belong to the run that produced these layers, not to this one.
+      failures: input.stored.stats?.failures ?? [],
+      failure_count: input.stored.stats?.failure_count ?? 0,
+      audio,
+      report_engine: report.engine,
+      report_attempts: report.attempts,
+      report_only: true,
     },
-    spec,
-    html,
+    spec: report.spec,
+    html: report.html,
   };
 }
 

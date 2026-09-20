@@ -11,6 +11,7 @@ import {
   Loader2,
   MessagesSquare,
   Play,
+  RefreshCw,
   RotateCcw,
   Sparkles,
   Eye,
@@ -24,6 +25,7 @@ import {
   confirmTemplate,
   startPlanning,
   startPreview,
+  rerunPreviewReport,
   startPromptRefine,
   startReplanning,
   type PlanningParams,
@@ -82,6 +84,8 @@ interface PreviewRow extends JsonObject {
   created_at: string;
   finished_at: string | null;
   hasHtml: boolean;
+  /** Regenerated the report over an earlier preview's analysis. */
+  reportOnly: boolean | null;
   stats: JsonObject;
 }
 
@@ -671,6 +675,9 @@ export function Studio({
                     >
                       v{versionOf(state.templates, p.template_id)}
                     </span>
+                    {p.reportOnly ? (
+                      <span className="shrink-0 rounded bg-muted px-1 text-[10.5px]">仅报告</span>
+                    ) : null}
                   </div>
                 ))}
                 {!state.previews.length && <div className="text-[11.5px] text-muted-foreground">暂无</div>}
@@ -700,8 +707,28 @@ export function Studio({
               <div className="flex items-center gap-2">
                 <span className="num text-[11.5px] text-muted-foreground">
                   {formatDate(String(shownPreview.created_at))} · 模板 v{shownVersion}
+                  {shownPreview.reportOnly ? " · 仅重新生成报告" : ""}
                 </span>
-                <Button asChild size="sm" variant="ghost" className="ml-auto h-7 text-[11.5px]">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="ml-auto h-7 text-[11.5px]"
+                  disabled={Boolean(activePreview)}
+                  title="复用这份预览已有的三层分析结果，只重新设计并生成报告页面"
+                  onClick={async () => {
+                    try {
+                      await rerunPreviewReport(shownPreview.id);
+                      toast.success("已排队：只重新生成报告");
+                      await poll();
+                    } catch (e) {
+                      toast.error(e instanceof Error ? e.message : "重新生成报告失败");
+                    }
+                  }}
+                >
+                  <RefreshCw className="size-3" />
+                  只重新生成报告
+                </Button>
+                <Button asChild size="sm" variant="ghost" className="h-7 text-[11.5px]">
                   <a href={`/api/report/preview/${shownPreview.id}`} target="_blank" rel="noreferrer">
                     <ExternalLink className="size-3" />
                     新窗口打开

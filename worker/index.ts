@@ -17,6 +17,7 @@ import { closePool, execute, maybeOne, one, query, scalar } from "../src/lib/db"
 import {
   planTemplate,
   buildPreview,
+  buildPreviewReportOnly,
   fallbackTemplate,
   refinePlan,
   PROMPT_LABEL,
@@ -360,6 +361,30 @@ interface PreviewJob extends JsonObject {
   created_by: string | null;
 }
 
+/** The stored analysis of an earlier preview, for a report-only rerun. */
+async function loadPreviewResults(sourceId: string) {
+  const row = sourceId
+    ? await maybeOne<{
+        session_results: JsonObject[];
+        user_results: JsonObject[];
+        global_result: JsonObject | null;
+        stats: JsonObject;
+      }>(
+        `select session_results, user_results, global_result, stats
+         from template_previews where id = $1 and status = 'completed'`,
+        [sourceId],
+      )
+    : null;
+  if (!row?.global_result) throw new Error("找不到可复用的预览结果，请完整重跑一次预览");
+
+  return {
+    sessionResults: row.session_results as never,
+    userResults: row.user_results as never,
+    globalResult: row.global_result,
+    stats: row.stats ?? {},
+  };
+}
+
 async function handlePreview(job: PreviewJob) {
   const tpl = await maybeOne<{
     session_prompt: string;
@@ -375,21 +400,34 @@ async function handlePreview(job: PreviewJob) {
   if (!tpl || !source) throw new Error("模板或数据源不存在");
 
   const params = (job.params ?? {}) as Record<string, unknown>;
+  const runtime = await resolveRuntime(job.data_source_id);
+  const onProgress = async (p: JsonObject) => {
+    await execute(`update template_previews set progress = $2::jsonb where id = $1`, [
+      job.id,
+      JSON.stringify(p),
+    ]);
+  };
 
-  const out = await buildPreview({
-    dataSource: source,
-    runtime: await resolveRuntime(job.data_source_id),
-    template: tpl,
-    sessions: Number(params.sessions ?? 12),
-    useAudio: params.useAudio === true,
-    concurrency: Number(params.concurrency ?? 3),
-    onProgress: async (p) => {
-      await execute(`update template_previews set progress = $2::jsonb where id = $1`, [
-        job.id,
-        JSON.stringify(p),
-      ]);
-    },
-  });
+  // `reportOnly`: the three layers come from the preview being redone, and
+  // only the report is generated again. Iterating on how a report looks
+  // should not mean re-analysing the same twelve conversations.
+  const out = params.reportOnly
+    ? await buildPreviewReportOnly({
+        dataSource: source,
+        runtime,
+        template: tpl,
+        stored: await loadPreviewResults(String(params.sourcePreviewId ?? "")),
+        onProgress,
+      })
+    : await buildPreview({
+        dataSource: source,
+        runtime,
+        template: tpl,
+        sessions: Number(params.sessions ?? 12),
+        useAudio: params.useAudio === true,
+        concurrency: Number(params.concurrency ?? 3),
+        onProgress,
+      });
 
   await execute(
     `update template_previews
