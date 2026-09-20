@@ -4,73 +4,99 @@ import { truncate } from "./normalize";
 
 /* ------------------------------------------------------------------ schema */
 
+/**
+ * Every contract below is itself valid JSON, and deliberately so: a model shown
+ * `"value": 数字` or `{label,value,unit}` as an example copies that shape into
+ * its answer, and a bare key or a Chinese word where a value belongs is exactly
+ * the "Expected double-quoted property name" that used to kill a report after
+ * the model had already written four thousand tokens of it. The semantics that
+ * used to live inside the braces now live in a legend under them.
+ */
 export const SESSION_JSON_CONTRACT = `{
   "summary": "1-3 句话概括这次会话发生了什么、用户想要什么、结果如何",
   "intent": "用户核心意图，短语形式",
-  "outcome": "resolved | partial | unresolved | abandoned | unknown 之一",
-  "sentiment": "positive | neutral | mixed | negative 之一",
-  "quality_score": 0-100 的整数，衡量本次对话整体服务质量,
-  "risk_level": "none | low | medium | high 之一",
+  "outcome": "resolved",
+  "sentiment": "neutral",
+  "quality_score": 0,
+  "risk_level": "none",
   "tags": ["3-8 个业务标签，短词"],
-  "metrics": [{ "key": "英文 snake_case 唯一键", "label": "中文指标名", "value": 数字, "unit": "可选单位" }],
+  "metrics": [{ "key": "英文 snake_case 唯一键", "label": "中文指标名", "value": 0, "unit": "可选单位" }],
   "highlights": ["做得好或值得关注的具体片段，每条 <= 40 字"],
   "problems": ["存在的问题，每条 <= 40 字"],
-  "evidence": [{ "quote": "对话原文片段", "role": "user 或 assistant", "seq": 轮次序号 }]
-}`;
+  "evidence": [{ "quote": "对话原文片段", "role": "user", "seq": 0 }]
+}
+
+取值说明（上面是结构示例，值要按真实情况填）：
+- outcome：resolved | partial | unresolved | abandoned | unknown
+- sentiment：positive | neutral | mixed | negative
+- quality_score：0-100 的整数，衡量本次对话整体服务质量
+- risk_level：none | low | medium | high
+- metrics[].value：数字（不是字符串）
+- evidence[].role：user 或 assistant；evidence[].seq：轮次序号，数字`;
 
 export const USER_JSON_CONTRACT = `{
   "summary": "该用户的整体情况概述，2-4 句",
   "persona": "用户画像标签组合，例如「高频重度用户 · 价格敏感 · 易怒」",
   "needs": ["用户反复出现的核心诉求，3-6 条"],
   "behaviour": ["行为模式与交互习惯，3-6 条"],
-  "metrics": [{ "key": "英文 snake_case", "label": "中文名", "value": 数字, "unit": "可选" }],
-  "risk_level": "none | low | medium | high",
+  "metrics": [{ "key": "英文 snake_case", "label": "中文名", "value": 0, "unit": "可选" }],
+  "risk_level": "none",
   "tags": ["3-8 个标签"],
   "key_sessions": ["最能说明该用户的 session_key，最多 5 个"]
-}`;
+}
+
+取值说明：risk_level 取 none | low | medium | high；metrics[].value 是数字`;
 
 export const GLOBAL_JSON_CONTRACT = `{
   "summary": "面向决策者的整体结论，4-8 句，结论先行",
-  "findings": [{ "title": "发现标题", "detail": "支撑说明与量化依据", "severity": "info | warning | critical", "metric": "可选指标名" }],
-  "metrics": [{ "key": "英文 snake_case", "label": "中文名", "value": 数字, "unit": "可选" }],
-  "distributions": [{ "key": "英文键", "label": "分布名", "unit": "可选", "items": [{ "name": "分类名", "value": 数字 }] }],
-  "recommendations": [{ "title": "建议", "detail": "怎么做、预期效果", "priority": "high | medium | low", "impact": "可选影响面" }]
-}`;
+  "findings": [{ "title": "发现标题", "detail": "支撑说明与量化依据", "severity": "info", "metric": "可选指标名" }],
+  "metrics": [{ "key": "英文 snake_case", "label": "中文名", "value": 0, "unit": "可选" }],
+  "distributions": [{ "key": "英文键", "label": "分布名", "unit": "可选", "items": [{ "name": "分类名", "value": 0 }] }],
+  "recommendations": [{ "title": "建议", "detail": "怎么做、预期效果", "priority": "high", "impact": "可选影响面" }]
+}
+
+取值说明：severity 取 info | warning | critical；priority 取 high | medium | low；value 一律是数字`;
 
 export const REPORT_SPEC_CONTRACT = `{
   "title": "报告标题",
   "subtitle": "副标题：数据范围与样本量",
   "level": "global",
-  "meta": [{ "label": "口径说明", "value": "例如 2026-08-01 ~ 2026-08-31 · 1,204 会话" }],
+  "meta": [{ "label": "口径说明", "value": "2026-08-01 ~ 2026-08-31 · 1,204 会话" }],
   "hero": {
     "headline": "一句话最重要的结论",
     "summary": "3-5 句整体摘要",
-    "kpis": [{ "label": "指标名", "value": 数字或字符串, "unit": "可选", "delta": 环比数字或 null, "hint": "口径说明", "tone": "default|good|warn|bad" }]
+    "kpis": [{ "label": "指标名", "value": 0, "unit": "可选", "delta": null, "hint": "口径说明", "tone": "default" }]
   },
   "sections": [{
-    "id": "英文短 id",
+    "id": "overview",
     "title": "章节标题",
     "summary": "该章节 2-4 句导读",
-    "drill": { "users": ["可下探的 user_key，选填"], "sessions": ["可下探的 session_key，选填"] },
-    "blocks": [ <见下方 block 类型> ]
+    "drill": { "users": [], "sessions": [] },
+    "blocks": [{ "kind": "markdown", "text": "见下方 block 类型" }]
   }]
 }
 
-block 类型（kind 必填，其余字段按类型取用）：
-1. {"kind":"kpis","title":"可选","kpis":[{label,value,unit,delta,hint,tone,source_field}]}
+取值说明：
+- kpis[].value：数字或字符串；kpis[].delta：环比数字，没有就填 null；kpis[].tone：default | good | warn | bad
+- sections[].id：英文短 id；drill.users / drill.sessions：可下探的 user_key / session_key，没有就留空数组
+
+block 类型（kind 必填，其余字段按类型取用；每个示例都是可以直接解析的合法 JSON）：
+1. {"kind":"kpis","title":"可选","kpis":[{"label":"指标名","value":0,"unit":"","delta":null,"hint":"口径说明","tone":"default","source_field":""}]}
    source_field 必填规则：若该 KPI 由某个 extra 字段算出，source_field 必须填该字段的英文 key（与 C 部分给出的字段名完全一致）；
    若是模型自己的判断（如 quality_score），source_field 填 "" 或省略。
 2. {"kind":"markdown","title":"可选","text":"Markdown 正文，可用 **加粗**、列表、表格"}
-3. {"kind":"bar","title":"","caption":"可选注释","categories":["分类"],"series":[{"name":"系列名","data":[数字]}],"unit":"可选"}
-4. {"kind":"hbar","title":"","categories":["分类"],"series":[{"name":"","data":[数字]}],"unit":""}
-5. {"kind":"line","title":"","categories":["x 轴"],"series":[{"name":"","data":[数字]}]}
-6. {"kind":"pie","title":"","categories":["分类"],"series":[{"name":"占比","data":[数字]}]}
-7. {"kind":"radar","title":"","categories":["维度"],"series":[{"name":"","data":[数字]}]}
-8. {"kind":"scatter","title":"","caption":"x=.. y=..","categories":["点名"],"series":[{"name":"y 值","data":[数字]}]}
-9. {"kind":"table","title":"","table":{"columns":["列名"],"rows":[["单元格",数字]]}}
-10. {"kind":"callout","title":"","text":"重点提示","tone":"info|warning|critical|success"}
+3. {"kind":"bar","title":"","caption":"可选注释","categories":["分类"],"series":[{"name":"系列名","data":[0]}],"unit":"可选"}
+4. {"kind":"hbar","title":"","categories":["分类"],"series":[{"name":"","data":[0]}],"unit":""}
+5. {"kind":"line","title":"","categories":["x 轴"],"series":[{"name":"","data":[0]}]}
+6. {"kind":"pie","title":"","categories":["分类"],"series":[{"name":"占比","data":[0]}]}
+7. {"kind":"radar","title":"","categories":["维度"],"series":[{"name":"","data":[0]}]}
+8. {"kind":"scatter","title":"","caption":"x=.. y=..","categories":["点名"],"series":[{"name":"y 值","data":[0]}]}
+9. {"kind":"table","title":"","table":{"columns":["列名"],"rows":[["单元格",0]]}}
+10. {"kind":"callout","title":"","text":"重点提示","tone":"info"}
 11. {"kind":"list","title":"","items":["条目"]}
-12. {"kind":"divider"}`;
+12. {"kind":"divider"}
+
+图表类 block 里 data 的每一项都是数字；callout 的 tone 取 info | warning | critical | success。`;
 
 /* ------------------------------------------------------------- extra 描述 */
 
@@ -229,6 +255,8 @@ ${REPORT_SPEC_CONTRACT}
 硬性要求：
 1. 所有提示词都用中文书写（业务字段名保留英文键）。
 2. 提示词必须自包含：接收方看不到本对话，需要把你写的背景、口径、契约完整传达。
+   其中出现的 JSON 示例必须自身可以被 JSON.parse 解析：键名带双引号，不要 {a,b,c} 简写，
+   不要把「数字」「可选」这类说明写在值的位置——这些说明放在示例外面单独列。
 3. metrics 的 key 必须在三层之间保持一致的命名风格；user 与 global 层的 metrics 应能从 session 层聚合得到。
 4. 只输出 JSON 对象本身，不要 Markdown 代码块、不要额外解释。`;
 
@@ -260,6 +288,11 @@ export function buildReportMessages(input: {
   const system = `${input.reportPrompt}
 
 你是这个平台的报告生成器。严格输出一个 JSON 对象，符合 REPORT 输出契约；不要 Markdown 代码块，不要任何解释文字。
+
+JSON 语法纪律（写错一个字符整份报告就作废）：
+- 每个键名都必须用双引号包起来，禁止 {label,value,unit} 这种简写。
+- } 或 ] 前面不能有多余的逗号。
+- 说明文字不是值：该填数字的位置就填数字，没有值就填 null 或省略这个键，不要写「数字」「可选」「环比数字」。
 
 REPORT 输出契约：
 ${REPORT_SPEC_CONTRACT}

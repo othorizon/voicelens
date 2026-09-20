@@ -91,7 +91,7 @@ export interface AnalyzeSessionOptions {
   extraSchemaHint: string;
 }
 
-const JSON_RULE = `\n\n# 输出硬性约束\n只输出一个 JSON 对象，严格按上面的字段结构，不要 Markdown 代码块、不要注释、不要解释文字。metrics 必须是数组，key 使用英文 snake_case。所有结论必须能被提供的对话内容支撑，无法判断时使用保守值（outcome=unknown、risk_level=none、quality_score 取中间值）。`;
+const JSON_RULE = `\n\n# 输出硬性约束\n只输出一个 JSON 对象，严格按上面的字段结构，不要 Markdown 代码块、不要注释、不要解释文字。所有键名都必须带双引号，} 与 ] 前不能有多余逗号，该填数字的位置填数字而不是说明文字。metrics 必须是数组，key 使用英文 snake_case。所有结论必须能被提供的对话内容支撑，无法判断时使用保守值（outcome=unknown、risk_level=none、quality_score 取中间值）。`;
 
 /** What one session contributed to the run's audio tally. */
 export interface SessionAudioUsage {
