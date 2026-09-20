@@ -1,7 +1,15 @@
-import { execute, one, query } from "@/lib/db";
+import { execute, one, query, scalar } from "@/lib/db";
 import { deleteObject, uploadObject } from "@/lib/storage";
 import { openZipBuffer, openZipObject, type ZipArchive, type ZipEntry } from "./zip";
 import { bundleSessions, normalizeLine, type NormalizedMessage, type SessionBundle } from "./normalize";
+import {
+  isSchemaFilePath,
+  mergeSchemaFields,
+  parseSchemaFile,
+  pickSchemaFile,
+  type SchemaFileMode,
+} from "@/lib/schema-file";
+import type { ExtraFieldDef } from "@/lib/types";
 
 export interface ImportResult {
   batchId: string;
@@ -13,6 +21,18 @@ export interface ImportResult {
   failedAudios: number;
   skipped: number;
   errors: string[];
+  /** Set when the archive carried an extra-schema description file. */
+  schema: AppliedSchema | null;
+}
+
+export interface AppliedSchema {
+  /** Path of the file inside the archive. */
+  file: string;
+  /** Fields the file described. */
+  fields: number;
+  /** Fields the data source ended up with. */
+  total: number;
+  mode: SchemaFileMode;
 }
 
 export interface ImportLogger {
@@ -115,6 +135,7 @@ export async function importZip(
     failedAudios: 0,
     skipped: 0,
     errors,
+    schema: null,
   };
 
   // Held outside the try so the finally can close it, opened inside so a bad
@@ -131,6 +152,10 @@ export async function importZip(
     const audioEntries = new Map<string, ZipEntry>();
 
     for (const entry of opened.entries) {
+      // Checked before the .json test below: the schema file describes the
+      // data, it is not data, and parsing it as dialogue would count every
+      // one of its lines as skipped.
+      if (isSchemaFilePath(entry.path)) continue;
       if (/\.(jsonl|ndjson|json)$/i.test(entry.path)) jsonlEntries.push(entry);
       else if (AUDIO_EXT.test(entry.path)) {
         audioEntries.set(entry.path.split("/").pop()!.toLowerCase(), entry);
@@ -140,6 +165,8 @@ export async function importZip(
 
     if (jsonlEntries.length === 0) throw new Error("压缩包内没有找到 .jsonl 文件");
     result.jsonlFiles = jsonlEntries.length;
+
+    result.schema = await applySchemaFile(dataSourceId, opened.entries, log, errors);
 
     // ------------------------------------------------------------ 1. parse
     const all: NormalizedMessage[] = [];
@@ -354,7 +381,7 @@ export async function importZip(
         result.failedAudios,
         result.skipped,
         errors.length ? errors.slice(0, 10).join("; ").slice(0, 900) : null,
-        JSON.stringify({ step: "done" }),
+        JSON.stringify({ step: "done", schema: result.schema }),
       ],
     );
 
@@ -381,6 +408,64 @@ export async function importZip(
     throw err;
   } finally {
     await archive?.close().catch(() => {});
+  }
+}
+
+/**
+ * Read the optional schema description file and configure the data source from it.
+ *
+ * Never fatal: an archive whose schema file is malformed still imports its
+ * conversations, with the reason recorded on the batch — the data is the point,
+ * and a rejected import would be a disproportionate answer to a typo in a file
+ * that is optional in the first place.
+ *
+ * Defaults to `merge` because an import is not necessarily the whole dataset:
+ * a later batch that describes three new fields should not wipe the twenty a
+ * human configured. A file that means to start over says `"mode": "replace"`.
+ */
+async function applySchemaFile(
+  dataSourceId: string,
+  entries: ZipEntry[],
+  log: ImportLogger,
+  errors: string[],
+): Promise<AppliedSchema | null> {
+  const entry = pickSchemaFile(entries);
+  if (!entry) return null;
+
+  const found = entries.filter((e) => isSchemaFilePath(e.path));
+  if (found.length > 1) {
+    log("压缩包内有多个 schema 文件，只应用一个", { picked: entry.path, found: found.length });
+    errors.push(`压缩包内有 ${found.length} 个 schema 文件，只应用了 ${entry.path}`);
+  }
+
+  try {
+    const parsed = parseSchemaFile(await entry.text());
+    const mode = parsed.mode ?? "merge";
+    const current = (await scalar<ExtraFieldDef[]>(
+      `select extra_schema from data_sources where id = $1`,
+      [dataSourceId],
+    )) ?? [];
+    const next = mergeSchemaFields(current, parsed.fields, mode);
+
+    await execute(
+      `update data_sources set extra_schema = $2::jsonb, updated_at = now() where id = $1`,
+      [dataSourceId, JSON.stringify(next)],
+    );
+
+    for (const w of parsed.warnings.slice(0, 5)) errors.push(`schema 文件：${w}`);
+    log("已应用 schema 描述文件", {
+      file: entry.path,
+      mode,
+      fields: parsed.fields.length,
+      total: next.length,
+      warnings: parsed.warnings.length,
+    });
+    return { file: entry.path, fields: parsed.fields.length, total: next.length, mode };
+  } catch (err) {
+    const message = (err as Error).message;
+    log("schema 描述文件解析失败，已跳过", { file: entry.path, error: message });
+    errors.push(`schema 文件 ${entry.path} 未生效：${message}`);
+    return null;
   }
 }
 

@@ -5,6 +5,7 @@
  */
 import JSZip from "jszip";
 import type { ExtraFieldDef } from "@/lib/types";
+import { PRIMARY_SCHEMA_FILE, schemaFileJson } from "@/lib/schema-file";
 
 export const DEMO_EXTRA_SCHEMA: ExtraFieldDef[] = [
   {
@@ -453,6 +454,10 @@ export async function buildDemoZip(dataset: DemoDataset): Promise<Uint8Array> {
     dataset.records.map((r) => JSON.stringify(r)).join("\n"),
   );
 
+  // The sample archive carries its own field description, so downloading it
+  // also serves as a worked example of the schema file.
+  folder.file(PRIMARY_SCHEMA_FILE, schemaFileJson(DEMO_EXTRA_SCHEMA, "merge"));
+
   const audioFolder = folder.folder("audio")!;
   dataset.records.forEach((r, i) => {
     if (!r.audio) return;
@@ -473,7 +478,8 @@ export async function buildDemoZip(dataset: DemoDataset): Promise<Uint8Array> {
       "dialogues.jsonl 每行一条消息，字段：",
       "  sessionId / userId / timestamp / message{role,content} / extra{...} / audio",
       "",
-      "extra 字段建议的 schema 配置见平台的「字段 Schema」页，可一键从数据推断。",
+      `${PRIMARY_SCHEMA_FILE} 描述了 extra 里每个字段的含义与分析用途，导入时平台会自动读取它，`,
+      "不用再到「字段 Schema」页逐个配置。规范可在导入页点「schema 文件规范」查看并复制。",
     ].join("\n"),
   );
 

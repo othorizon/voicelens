@@ -1,10 +1,12 @@
 "use client";
 
-import { useEffect, useState, useTransition } from "react";
+import { useEffect, useRef, useState, useTransition } from "react";
 import { toast } from "sonner";
-import { Check, Loader2, Plus, Trash2, Wand2, X } from "lucide-react";
+import { Check, FileUp, Loader2, Plus, Trash2, Wand2, X } from "lucide-react";
 import { inferSchemaFromData, saveExtraSchema } from "@/lib/actions/sources";
 import type { ExtraFieldDef, ExtraFieldKind, ExtraFieldUsage } from "@/lib/types";
+import { mergeSchemaFields, parseSchemaFile } from "@/lib/schema-file";
+import { SchemaSpecDialog } from "@/components/schema-spec-dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -54,6 +56,7 @@ export function ExtraSchemaEditor({
   const [dirty, setDirty] = useState(false);
   const [pending, startTransition] = useTransition();
   const [inferring, setInferring] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => setFields(initial), [initial]);
 
@@ -97,6 +100,35 @@ export function ExtraSchemaEditor({
     }
   }
 
+  /**
+   * Apply a schema description file to the draft on screen.
+   *
+   * Nothing is persisted here: the fields land in the editor as unsaved
+   * changes, so a file that turns out to be wrong is undone by leaving the
+   * page. A file that does not declare a mode replaces the configuration,
+   * which is what「导入文件覆盖页面配置」means; `"mode": "merge"` in the file
+   * opts into the additive behaviour the zip import uses.
+   */
+  async function importFile(file: File) {
+    try {
+      const parsed = parseSchemaFile(await file.text());
+      const mode = parsed.mode ?? "replace";
+      const next = mergeSchemaFields(fields, parsed.fields, mode);
+      setFields(next);
+      setDirty(true);
+      toast.success(
+        `${file.name}：${mode === "replace" ? "已覆盖为" : "已合并"} ${parsed.fields.length} 个字段` +
+          `，当前共 ${next.length} 个，请核对后点「保存更改」`,
+      );
+      parsed.warnings.slice(0, 3).forEach((w) => toast.warning(w));
+      if (parsed.warnings.length > 3) {
+        toast.warning(`还有 ${parsed.warnings.length - 3} 条提示未显示，详见规范说明`);
+      }
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "schema 文件解析失败");
+    }
+  }
+
   const counts = fields.reduce(
     (acc, f) => ({ ...acc, [f.usage]: (acc[f.usage] ?? 0) + 1 }),
     {} as Record<string, number>,
@@ -105,24 +137,49 @@ export function ExtraSchemaEditor({
   return (
     <div className="mx-auto max-w-[1440px] space-y-5 p-4 md:p-8">
       <Card>
-        <CardHeader className="flex-row items-start justify-between space-y-0">
-          <div className="space-y-1">
-            <CardTitle className="text-sm font-semibold">extra 字段 Schema</CardTitle>
-            <CardDescription className="max-w-3xl text-[12.5px] leading-relaxed">
-              手工定义 extra 里每个字段的语义、类型与<strong className="font-medium text-foreground">分析用途</strong>。
-              这份 schema 会随数据一起交给模型：标记为「指标」的字段会被聚合成 KPI，「分群」字段会成为图表维度，
-              「上下文」只用于辅助理解，「过滤」用于判断样本取舍。规划阶段与任务执行都会读取最新配置。
-            </CardDescription>
-          </div>
-          <div className="flex shrink-0 gap-2">
-            <Button variant="outline" size="sm" onClick={infer} disabled={inferring}>
-              {inferring ? <Loader2 className="size-3.5 animate-spin" /> : <Wand2 className="size-3.5" />}
-              从数据推断
-            </Button>
-            <Button size="sm" onClick={save} disabled={pending || !dirty}>
-              {pending ? <Loader2 className="size-3.5 animate-spin" /> : <Check className="size-3.5" />}
-              {dirty ? "保存更改" : "已保存"}
-            </Button>
+        {/* CardHeader is a grid, so `flex-row justify-between` on it never
+            split the row — the actions ended up stacked under the text and
+            squeezed into the description's own column. An explicit flex row
+            is what actually puts them side by side. */}
+        <CardHeader className="grid-cols-1">
+          <div className="flex w-full flex-wrap items-start justify-between gap-x-6 gap-y-3">
+            <div className="min-w-[280px] flex-1 space-y-1">
+              <CardTitle className="text-sm font-semibold">extra 字段 Schema</CardTitle>
+              <CardDescription className="max-w-3xl text-[12.5px] leading-relaxed">
+                手工定义 extra 里每个字段的语义、类型与
+                <strong className="font-medium text-foreground">分析用途</strong>。这份 schema
+                会随数据一起交给模型：标记为「指标」的字段会被聚合成 KPI，「分群」字段会成为图表维度，
+                「上下文」只用于辅助理解，「过滤」用于判断样本取舍。规划阶段与任务执行都会读取最新配置。
+                也可以直接导入一份 schema 描述文件来覆盖这里的配置——规范见「schema 文件规范」。
+              </CardDescription>
+            </div>
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
+              <SchemaSpecDialog variant="ghost" />
+              <Button variant="outline" size="sm" onClick={() => fileRef.current?.click()}>
+                <FileUp className="size-3.5" />
+                导入 schema 文件
+              </Button>
+              <Button variant="outline" size="sm" onClick={infer} disabled={inferring}>
+                {inferring ? <Loader2 className="size-3.5 animate-spin" /> : <Wand2 className="size-3.5" />}
+                从数据推断
+              </Button>
+              <Button size="sm" onClick={save} disabled={pending || !dirty}>
+                {pending ? <Loader2 className="size-3.5 animate-spin" /> : <Check className="size-3.5" />}
+                {dirty ? "保存更改" : "已保存"}
+              </Button>
+              <input
+                ref={fileRef}
+                type="file"
+                accept=".json,application/json"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) void importFile(file);
+                  // Reset so picking the same file twice fires again.
+                  e.target.value = "";
+                }}
+              />
+            </div>
           </div>
         </CardHeader>
         <CardContent>
@@ -142,9 +199,13 @@ export function ExtraSchemaEditor({
         <Card>
           <CardContent className="py-12 text-center">
             <p className="text-[13px] text-muted-foreground">
-              还没有配置 extra 字段。如果数据已经导入，可以直接「从数据推断」，也可以手工添加。
+              还没有配置 extra 字段。可以导入一份 schema 描述文件，也可以在数据导入后「从数据推断」或手工添加。
             </p>
-            <div className="mt-4 flex justify-center gap-2">
+            <div className="mt-4 flex flex-wrap justify-center gap-2">
+              <Button variant="outline" size="sm" onClick={() => fileRef.current?.click()}>
+                <FileUp className="size-3.5" />
+                导入 schema 文件
+              </Button>
               <Button variant="outline" size="sm" onClick={() => { setFields([blank()]); setDirty(true); }}>
                 <Plus className="size-3.5" />
                 手工添加字段
@@ -161,7 +222,10 @@ export function ExtraSchemaEditor({
           {fields.map((f, i) => (
             <Card key={i} className={cn("overflow-hidden", !f.name.trim() && "border-[var(--warning)]/60")}>
               <CardContent className="space-y-3 p-4">
-                <div className="grid gap-2.5 sm:grid-cols-2 lg:grid-cols-[170px_150px_120px_120px_150px_1fr_auto]">
+                {/* minmax(0,…) on every column: a fixed track plus a control
+                    that sizes to its content is what let the 分析用途 select
+                    push into the 语义说明 column. */}
+                <div className="grid items-end gap-x-3 gap-y-2.5 sm:grid-cols-2 lg:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)_minmax(0,100px)_minmax(0,104px)_minmax(0,116px)_minmax(0,2fr)_auto]">
                   <Field label="字段名">
                     <Input
                       value={f.name}
@@ -180,12 +244,17 @@ export function ExtraSchemaEditor({
                   </Field>
                   <Field label="类型">
                     <Select value={f.kind} onValueChange={(v) => patch(i, { kind: v as ExtraFieldKind })}>
-                      <SelectTrigger className="h-8 text-[12px]">
+                      <SelectTrigger className="h-8 w-full min-w-0 text-[12px]">
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
                         {KINDS.map((k) => (
-                          <SelectItem key={k.value} value={k.value} className="text-[12px]">
+                          <SelectItem
+                            key={k.value}
+                            value={k.value}
+                            className="text-[12px]"
+                            hint={<span className="text-[10.5px]">{k.hint}</span>}
+                          >
                             {k.label}
                           </SelectItem>
                         ))}
@@ -194,7 +263,7 @@ export function ExtraSchemaEditor({
                   </Field>
                   <Field label="层级">
                     <Select value={f.scope} onValueChange={(v) => patch(i, { scope: v as "message" | "session" })}>
-                      <SelectTrigger className="h-8 text-[12px]">
+                      <SelectTrigger className="h-8 w-full min-w-0 text-[12px]">
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
@@ -205,16 +274,18 @@ export function ExtraSchemaEditor({
                   </Field>
                   <Field label="分析用途">
                     <Select value={f.usage} onValueChange={(v) => patch(i, { usage: v as ExtraFieldUsage })}>
-                      <SelectTrigger className="h-8 text-[12px]">
+                      <SelectTrigger className="h-8 w-full min-w-0 text-[12px]">
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
                         {USAGES.map((u) => (
-                          <SelectItem key={u.value} value={u.value} className="text-[12px]">
-                            <span className="flex items-center gap-2">
-                              {u.label}
-                              <span className="text-[10.5px] text-muted-foreground">{u.hint}</span>
-                            </span>
+                          <SelectItem
+                            key={u.value}
+                            value={u.value}
+                            className="text-[12px]"
+                            hint={<span className="text-[10.5px]">{u.hint}</span>}
+                          >
+                            {u.label}
                           </SelectItem>
                         ))}
                       </SelectContent>
@@ -279,8 +350,10 @@ export function ExtraSchemaEditor({
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <label className="block space-y-1">
-      <span className="block text-[10.5px] font-medium tracking-wide text-muted-foreground">{label}</span>
+    <label className="block min-w-0 space-y-1">
+      <span className="block truncate text-[10.5px] font-medium tracking-wide text-muted-foreground">
+        {label}
+      </span>
       {children}
     </label>
   );

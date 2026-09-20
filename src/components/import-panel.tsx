@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import {
@@ -15,6 +16,7 @@ import {
   Music4,
   Ban,
   RotateCcw,
+  Braces,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -29,6 +31,8 @@ import {
   uploadArchive,
 } from "@/lib/upload/multipart";
 import { retryBatch } from "@/lib/actions/sources";
+import { SchemaSpecDialog } from "@/components/schema-spec-dialog";
+import { PRIMARY_SCHEMA_FILE } from "@/lib/schema-file";
 import type { JsonObject } from "@/lib/types";
 
 interface Batch extends JsonObject {
@@ -46,6 +50,19 @@ interface Batch extends JsonObject {
   finished_at: string | null;
   progress_detail: JsonObject | null;
   source_object: string | null;
+}
+
+/** What `importZip` recorded about a schema description file it found. */
+interface AppliedSchema {
+  file?: string;
+  fields?: number;
+  total?: number;
+  mode?: string;
+}
+
+function appliedSchema(batch: Batch): AppliedSchema | null {
+  const detail = (batch.progress_detail as JsonObject | null)?.schema;
+  return detail && typeof detail === "object" ? (detail as AppliedSchema) : null;
 }
 
 const STAGE_NOTE: Record<string, string> = {
@@ -299,11 +316,18 @@ export function ImportPanel({
 
         <Card>
           <CardHeader>
-            <CardTitle className="flex items-center gap-1.5 text-sm font-semibold">
-              <Info className="size-3.5 text-muted-foreground" />
-              数据格式约定
-            </CardTitle>
-            <CardDescription className="text-[12.5px]">JSONL 每行一条消息，音频可选。</CardDescription>
+            <div className="flex items-start justify-between gap-2">
+              <div className="space-y-1.5">
+                <CardTitle className="flex items-center gap-1.5 text-sm font-semibold">
+                  <Info className="size-3.5 text-muted-foreground" />
+                  数据格式约定
+                </CardTitle>
+                <CardDescription className="text-[12.5px]">
+                  JSONL 每行一条消息，音频与 schema 说明文件均可选。
+                </CardDescription>
+              </div>
+              <SchemaSpecDialog variant="outline" label="schema 文件规范" />
+            </div>
           </CardHeader>
           <CardContent className="space-y-3 text-[12.5px] leading-relaxed">
             <div>
@@ -311,6 +335,7 @@ export function ImportPanel({
               <pre className="overflow-x-auto rounded-lg border border-border/70 bg-muted/40 p-3 font-mono text-[11.5px] leading-relaxed text-muted-foreground">
 {`my-data.zip
 ├─ dialogues.jsonl        # 对话数据（1 个，可任意层级）
+├─ ${PRIMARY_SCHEMA_FILE}  # extra 字段说明（可选，导入时自动生效）
 ├─ audio/                 # 音频目录（可选，层级不限）
 │  ├─ sess_001_t000.wav
 │  └─ sess_001_t004.wav
@@ -366,6 +391,16 @@ export function ImportPanel({
                 <span className="mt-1.5 size-1 shrink-0 rounded-full bg-primary" />
                 <span>
                   也支持「一行一个 session、内含 messages 数组」的导出格式，平台会自动展开。
+                </span>
+              </li>
+              <li className="flex gap-2">
+                <span className="mt-1.5 size-1 shrink-0 rounded-full bg-primary" />
+                <span>
+                  压缩包里可以放一个
+                  <code className="font-mono text-[11.5px]"> {PRIMARY_SCHEMA_FILE}</code>
+                  ，描述 extra 里每个字段的含义与分析用途，导入时会自动写入「字段 Schema」，
+                  省掉逐个字段手工配置。点右上角「schema 文件规范」可查看并一键复制规范，
+                  交给产数据的同学或 AI 照着生成。
                 </span>
               </li>
             </ul>
@@ -449,6 +484,27 @@ export function ImportPanel({
                     {b.skipped ? <span className="text-[var(--warning)]">跳过 {b.skipped} 行</span> : null}
                     {b.finished_at ? <span className="ml-auto">{relativeTime(b.finished_at)}完成</span> : null}
                   </div>
+
+                  {(() => {
+                    const schema = appliedSchema(b);
+                    if (!schema?.file) return null;
+                    return (
+                      <div className="mt-2 flex flex-wrap items-center gap-1.5 pl-[26px] text-[12px] text-muted-foreground">
+                        <Braces className="size-3 shrink-0" />
+                        <span>
+                          已读取 <code className="font-mono text-[11.5px]">{schema.file}</code>，
+                          {schema.mode === "replace" ? "覆盖" : "合并"}了 {schema.fields ?? 0} 个字段定义，
+                          当前共 <b className="num font-semibold text-foreground">{schema.total ?? 0}</b> 个 extra 字段
+                        </span>
+                        <Link
+                          href={`/sources/${sourceId}/schema`}
+                          className="text-primary underline-offset-2 hover:underline"
+                        >
+                          去查看
+                        </Link>
+                      </div>
+                    );
+                  })()}
 
                   {b.error && (
                     <div className="mt-2 rounded-lg bg-destructive/8 px-3 py-2 pl-[26px] text-[12px] leading-relaxed text-destructive">

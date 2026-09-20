@@ -76,3 +76,36 @@ export function uid(prefix = "id"): string {
 export async function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
+
+/**
+ * Copy text, including from a page served over plain http.
+ *
+ * `navigator.clipboard` only exists in a secure context, and this app is often
+ * run on a LAN over http, so the hidden-textarea path is the one that actually
+ * fires there — not a legacy fallback.
+ */
+export async function copyText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // fall through to the textarea path
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}

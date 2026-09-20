@@ -102,13 +102,23 @@ function SelectLabel({
 function SelectItem({
   className,
   children,
+  hint,
   ...props
-}: React.ComponentProps<typeof SelectPrimitive.Item>) {
+}: React.ComponentProps<typeof SelectPrimitive.Item> & {
+  /**
+   * Secondary text shown only in the open list.
+   *
+   * It lives outside `ItemText` on purpose: Radix mirrors `ItemText` into the
+   * trigger, so a hint written as part of `children` would be pulled into the
+   * closed control and stretch it past its column.
+   */
+  hint?: React.ReactNode
+}) {
   return (
     <SelectPrimitive.Item
       data-slot="select-item"
       className={cn(
-        "relative flex w-full cursor-default items-center gap-2 rounded-sm py-1.5 pr-8 pl-2 text-sm outline-hidden select-none focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4 [&_svg:not([class*='text-'])]:text-muted-foreground *:[span]:last:flex *:[span]:last:items-center *:[span]:last:gap-2",
+        "relative flex w-full cursor-default items-center gap-2 rounded-sm py-1.5 pr-8 pl-2 text-sm outline-hidden select-none focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4 [&_svg:not([class*='text-'])]:text-muted-foreground",
         className
       )}
       {...props}
@@ -122,6 +132,11 @@ function SelectItem({
         </SelectPrimitive.ItemIndicator>
       </span>
       <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
+      {hint ? (
+        <span data-slot="select-item-hint" className="ml-auto text-xs text-muted-foreground">
+          {hint}
+        </span>
+      ) : null}
     </SelectPrimitive.Item>
   )
 }

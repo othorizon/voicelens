@@ -13,7 +13,8 @@ PostgreSQL（pg 直连）· S3 兼容对象存储（阿里云 OSS）· qwen3.8-o
 ```
 数据源 ──导入──> 会话/消息 + 音频(对象存储)
    │
-   ├─ extra 字段 schema（手工定义类型/层级/用途：metric|segment|context|filter）
+   ├─ extra 字段 schema（zip 内 schema 文件自动导入，或手工定义类型/层级/用途：
+   │                     metric|segment|context|filter）
    │
    └─ 工作流（React Flow 可视化编排 10 个节点的参数）
           │
@@ -37,6 +38,7 @@ PostgreSQL（pg 直连）· S3 兼容对象存储（阿里云 OSS）· qwen3.8-o
 | `src/app/pending/` | 无权限账号的等待开通页 |
 | `src/app/api/` | 分片直传签名、导入入队、示例数据、报告 HTML、音频签名代理、轮询状态 |
 | `src/lib/engine/` | 分析引擎：归一化、抽样、提示词、三层分析、报告渲染 |
+| `src/lib/schema-file.ts` | extra 字段 schema 描述文件：命名、解析、合并与可复制的规范文本 |
 | `src/lib/workflow/` | 工作流节点定义与图 → 执行配置解析 |
 | `src/lib/actions/` | Server Actions（认证、数据源、工作流、工作台、任务） |
 | `src/lib/db/` | 连接池与查询封装（参数化 SQL） |
@@ -176,7 +178,8 @@ Web 只接受请求、写作业；Worker 跑的是几分钟到几十分钟、反
 
 ## 数据格式
 
-zip 压缩包 = 一个对话 JSONL（层级任意）＋ 音频文件（可选，层级任意）。
+zip 压缩包 = 一个对话 JSONL（层级任意）＋ 音频文件（可选，层级任意）
+＋ 一个 extra 字段说明文件（可选，见下）。
 
 ```jsonc
 {
@@ -194,6 +197,43 @@ zip 压缩包 = 一个对话 JSONL（层级任意）＋ 音频文件（可选，
 音频只把**字节**写进 S3 兼容的私有桶，数据库只存对象路径。
 
 同一个 `sessionId` 多次导入会自动追加到已有会话（`seq` 续号、转录拼接、计数累加）。
+
+### extra 字段 schema 描述文件（可选）
+
+`extra` 里的埋点字段平台并不认识，所以需要有人说明「这个字段是什么、分析时怎么用」。
+除了在「字段 Schema」页逐个配置，也可以把说明随数据一起放进 zip：
+
+```
+my-data.zip
+├─ dialogues.jsonl
+├─ voicelens.schema.json   # ← 这个文件，可选，任意层级
+└─ audio/…
+```
+
+```jsonc
+{
+  "version": 1,
+  "mode": "merge",                       // merge（默认）只更新文件里写到的字段；replace 整体覆盖
+  "fields": [
+    {
+      "name": "asr_confidence",          // extra 里的键名，必填
+      "label": "ASR 置信度",
+      "kind": "number",                  // enum | sentiment | boolean | number | text
+      "scope": "message",                // message（默认）| session
+      "usage": "metric",                 // metric | segment | context | filter
+      "description": "语音识别置信度 0-1，低于 0.6 通常是噪声或口音导致的误识别"
+    }
+  ]
+}
+```
+
+- 文件名取 `voicelens.schema.json`（推荐）、`schema.json`、`extra-schema.json`、`extra_schema.json` 之一，
+  不区分大小写；它不会被当成对话数据解析。
+- 导入时自动写入该数据源的 extra schema，导入批次上会显示读到了哪个文件、生效了几个字段。
+- 文件写错不会让导入失败：对话照常入库，原因记在批次的错误信息里。
+- 也可以在「字段 Schema」页点「导入 schema 文件」直接覆盖页面配置（改动仍需点保存才落库）。
+- 两个页面都有「schema 文件规范」按钮，可查看并**一键复制**完整规范——规范本身就是写给 AI 的提示词，
+  连同几行真实 JSONL 发给模型即可生成这个文件。示例 zip 里也自带一份可参考。
 
 ### 导入上传：浏览器直传 + 断点续传
 
@@ -291,7 +331,7 @@ chip，所以「开音频 / 不开音频各跑一次预览对比效果」这条�
 
 - 字段在 schema 里声明了 → 按声明的 `kind` 统计：`number` 出均值/中位数/P90/最大值/样本数，
   其余（`enum`/`sentiment`/`boolean`/`text`）出取值计数。
-- 未声明 → 按实际占多数的类型推断，这正是「从数据推断」的引导场景。
+- 未声明 → 按实际占多数的类型推断，这正是「从数据推断」与 schema 描述文件的引导场景。
 - 不符合所选口径的值（例如数值字段里混进的 `"N/A"`）不计入统计，但会记在 `mixed_count` 里，
   脏数据可见而不是被静默丢掉。
 
@@ -376,3 +416,4 @@ ACCESS_TEST_DATABASE_URL=postgresql://... npm run test:access
 `导入` 页有两个入口：**导入示例数据**（车机语音助手，服务端生成并直接入库，
 附带推荐 extra schema 与业务描述）与 **下载示例 zip**（同一数据集，可自行检查结构后上传）。
 示例含程序合成的可听 WAV 波形，用于验证多模态链路是否打通。
+示例 zip 里自带一份 `voicelens.schema.json`，既是 schema 描述文件的可运行样例，也能直接照着改。
