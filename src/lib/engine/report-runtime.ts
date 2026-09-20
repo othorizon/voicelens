@@ -179,7 +179,10 @@ export const VL_RUNTIME_JS = String.raw`
   }
 
   var VL = {
-    meta: P.meta || {},
+    /* An export states what it managed to carry, over the meta baked in at
+       generation time — a file with a tenth of the sessions must not present
+       itself as the whole run. */
+    meta: Object.assign({}, P.meta || {}, (SNAP && SNAP.meta) || {}),
     profile: P.profile || {},
     groundTruth: P.groundTruth || null,
     global: P.global || {},
@@ -261,7 +264,9 @@ export function composeReportDocument(
   const head = [
     `<meta http-equiv="Content-Security-Policy" content="${REPORT_CSP.replace(/"/g, "&quot;")}">`,
     `<script>window.__VL_PAYLOAD__=${serialize(payload)};</script>`,
-    ...(snapshot ? [`<script>window.__VL_SNAPSHOT__=${serialize(snapshot)};</script>`] : []),
+    // Either the data travels with the document from the start, or the slot
+    // stays open for `injectSnapshot` to fill on export.
+    snapshot ? `<script>window.__VL_SNAPSHOT__=${serialize(snapshot)};</script>` : SNAPSHOT_SLOT,
     `<script>${VL_RUNTIME_JS}</script>`,
   ].join("\n");
 
@@ -272,11 +277,35 @@ export function composeReportDocument(
 
 /**
  * Detail rows carried by the document itself, for a report small enough not
- * to need a host: `VL`'s async methods then resolve from here.
+ * to need a host — a preview, or a file someone downloaded: `VL`'s async
+ * methods then resolve from here instead of asking a host that is not there.
  */
 export interface ReportSnapshot {
   users: JsonObject[];
   sessions: JsonObject[];
+  /** Merged over `VL.meta`, so an export can declare what it left behind. */
+  meta?: JsonObject;
+}
+
+/** Where `injectSnapshot` puts the data on a document that shipped without it. */
+const SNAPSHOT_SLOT = "<!--vl-snapshot-->";
+
+/**
+ * Give an already-composed document its data.
+ *
+ * A report served from the platform fetches detail through its host. The same
+ * file downloaded has no host, so the rows it can carry are written into it on
+ * the way out. Documents from the block renderer have no slot and need none —
+ * they inline their drill-down already — so they come back untouched.
+ */
+export function injectSnapshot(document: string, snapshot: ReportSnapshot): string {
+  if (!document.includes(SNAPSHOT_SLOT)) return document;
+  return document.replace(SNAPSHOT_SLOT, `<script>window.__VL_SNAPSHOT__=${serialize(snapshot)};</script>`);
+}
+
+/** Whether a document is one that `injectSnapshot` can fill. */
+export function acceptsSnapshot(document: string): boolean {
+  return document.includes(SNAPSHOT_SLOT);
 }
 
 /** `</script>` inside the JSON would close the tag it lives in. */
@@ -309,9 +338,9 @@ export const VL_API_DOC = `页面通过全局对象 \`VL\` 取数据。平台会
 
 ## 异步方法（返回 Promise，用于下探）
 - \`await VL.listUsers({ page, size, sort, order, q })\` → { rows, total, page, size }；size 上限 200
-- \`await VL.getUser(userKey)\` → 用户完整记录，含其 session_keys
+- \`await VL.getUser(userKey)\` → 用户完整记录，含其 session_keys；记录不存在时返回 null
 - \`await VL.listSessions({ userKey, page, size, sort, order, q })\` → { rows, total, page, size }
-- \`await VL.getSession(sessionKey)\` → 会话完整记录，含 transcript 与 evidence
+- \`await VL.getSession(sessionKey)\` → 会话完整记录，含 transcript 与 evidence；记录不存在时返回 null
 - \`await VL.audioUrl(sessionKey, seq)\` → 可直接喂给 <audio> 的 blob URL，没有音频时返回 null
 
 ## 工具
@@ -325,4 +354,7 @@ export const VL_API_DOC = `页面通过全局对象 \`VL\` 取数据。平台会
 3. **不要使用 localStorage / sessionStorage / cookie / fetch / XMLHttpRequest**：页面运行在无源沙箱里，这些要么抛异常，要么被 CSP 拦截。
 4. 可以从 cdnjs / jsdelivr / unpkg 引入任意前端库（图表、动画、字体均可）。**不要引用远程图片**，CSP 只允许 data: 和 blob:。
 5. 引入外部库时必须处理加载失败：库没加载出来时页面要退化成可读的静态内容，而不是白屏。
-6. 渲染完成后调用 \`VL.done()\`。`;
+6. 渲染完成后调用 \`VL.done()\`。
+7. **要能离线打开**。报告可以被下载成单个文件，此时明细只有随文件带走的那一部分：\`getUser\` / \`getSession\` 可能返回 null，
+   \`listUsers\` / \`listSessions\` 的 total 只反映文件里有多少行。页面遇到 null 要给出「该记录未包含在离线文件中」这类提示，不要报错或空白。
+   \`VL.meta.offline\` 为 true 时说明正在离线模式下运行，\`VL.meta.offline_note\` 是一句可直接展示的说明文案。`;

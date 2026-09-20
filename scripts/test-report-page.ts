@@ -6,7 +6,9 @@
  */
 import { buildDataProfile } from "../src/lib/engine/report-profile";
 import {
+  acceptsSnapshot,
   composeReportDocument,
+  injectSnapshot,
   type ReportPayload,
   type ReportSnapshot,
 } from "../src/lib/engine/report-runtime";
@@ -138,6 +140,10 @@ VL.ready(async function () {
   var app = document.getElementById('app'), out = '<h1>' + VL.escape(VL.meta.title) + '</h1>';
   out += '<p>' + VL.escape(VL.global.summary) + '</p>';
 
+  var snap = window.__VL_SNAPSHOT__;
+  if (snap && snap.meta && !VL.meta.offline) throw new Error('snapshot.meta 未合并进 VL.meta');
+  if (VL.meta.offline) out += '<p class="offline">' + VL.escape(VL.meta.offline_note) + '</p>';
+
   var first = await VL.listUsers({ page: 1, size: 40, sort: 'session_count', order: 'desc' });
   out += '<h2>用户 ' + first.total + ' 位</h2>';
   first.rows.forEach(function (u) {
@@ -215,6 +221,26 @@ async function main() {
   const nohost = await validateReportDocument(composeReportDocument(SNAPSHOT_PAGE, p), { screenshot: false });
   console.log("ok:", nohost.ok);
   if (nohost.ok) { failures++; console.log("!! 没有 snapshot 也通过了，下探并未真正执行"); }
+
+  console.log("\n== 导出：给已发布的文档补上明细 ==");
+  const served = composeReportDocument(SNAPSHOT_PAGE, p);
+  if (!acceptsSnapshot(served)) { failures++; console.log("!! 文档没有留出 snapshot 注入点"); }
+
+  const exported = injectSnapshot(served, {
+    ...snapshot(),
+    meta: { offline: true, offline_note: "离线文件，包含 40 / 12043 位用户的明细。" },
+  });
+  const off = await validateReportDocument(exported, { screenshot: false });
+  console.log("ok:", off.ok, "| stats:", JSON.stringify(off.stats));
+  if (off.issues.length) console.log(renderIssues(off.issues));
+  if (!off.ok) { failures++; console.log("!! 导出后的文档未通过校验"); }
+
+  const noSlot = "<!doctype html><html><head></head><body><p>内置渲染器的产物</p></body></html>";
+  if (acceptsSnapshot(noSlot)) { failures++; console.log("!! 无注入点的文档被误判为可注入"); }
+  if (injectSnapshot(noSlot, snapshot()) !== noSlot) {
+    failures++;
+    console.log("!! 无注入点的文档被改动了");
+  }
 
   console.log("\n== 问题页面 ==");
   const bad = await validateReportDocument(composeReportDocument(BAD_PAGE, p), { screenshot: false });
