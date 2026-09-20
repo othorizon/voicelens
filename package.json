@@ -15,7 +15,8 @@
     "test:refine": "tsx scripts/test-refine.ts",
     "test:access": "tsx scripts/test-access.ts",
     "test:models": "tsx scripts/test-models.ts",
-    "db:migrate": "tsx --env-file=.env.local db/apply.ts"
+    "db:migrate": "tsx --env-file=.env.local db/apply.ts",
+    "test:report": "tsx scripts/test-report-page.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.699.0",
@@ -74,6 +75,7 @@
     "@types/yauzl": "^3.4.0",
     "eslint": "^9",
     "eslint-config-next": "15.5.25",
+    "playwright": "^1.63.0",
     "tailwindcss": "^4",
     "typescript": "^5"
   }
