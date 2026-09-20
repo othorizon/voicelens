@@ -16,10 +16,18 @@ import {
 } from "@/lib/models/registry";
 import {
   ANALYSIS_MODES,
+  ANALYSIS_STAGES,
+  EMPTY_PATCH,
+  MAX_TOKENS_CEILING,
   MODEL_KIND_LABEL,
+  STAGE_LABEL,
+  isEmptyStagePatch,
   type AnalysisMode,
   type AnalysisSelectionPatch,
+  type AnalysisStage,
   type ModelKind,
+  type StagePatchMap,
+  type ThinkingChoice,
 } from "@/lib/models/mode";
 
 /**
@@ -203,10 +211,50 @@ export async function testModel(id: string): Promise<{ ok: boolean; message: str
 
 /* ------------------------------------------------------------ selection */
 
+/**
+ * Stage params come from a form, so a bad budget is reported rather than
+ * silently clamped: a 160000 typed into 报告生成 should say so, not quietly
+ * become something else and then behave unlike what the page shows.
+ */
+function cleanStages(raw: unknown): StagePatchMap {
+  const input = (raw ?? {}) as Record<string, { thinking?: unknown; maxTokens?: unknown } | null>;
+  const out: StagePatchMap = {};
+  for (const stage of ANALYSIS_STAGES) {
+    const value = input[stage];
+    if (value == null) continue;
+
+    let thinking: ThinkingChoice | null = null;
+    if (value.thinking != null) {
+      if (value.thinking !== "auto" && value.thinking !== "on" && value.thinking !== "off") {
+        throw new ActionError(`「${STAGE_LABEL[stage as AnalysisStage]}」的思考设置不合法`);
+      }
+      thinking = value.thinking;
+    }
+
+    let maxTokens: number | null = null;
+    if (value.maxTokens != null && value.maxTokens !== "") {
+      const n = Number(value.maxTokens);
+      if (!Number.isFinite(n) || n < 0 || !Number.isInteger(n)) {
+        throw new ActionError(`「${STAGE_LABEL[stage as AnalysisStage]}」的 max_tokens 必须是不小于 0 的整数`);
+      }
+      if (n > MAX_TOKENS_CEILING) {
+        throw new ActionError(
+          `「${STAGE_LABEL[stage as AnalysisStage]}」的 max_tokens 最大 ${MAX_TOKENS_CEILING}，填 0 表示不限制`,
+        );
+      }
+      maxTokens = n;
+    }
+
+    if (thinking !== null || maxTokens !== null) out[stage] = { thinking, maxTokens };
+  }
+  return out;
+}
+
 function cleanPatch(raw: {
   mode?: string | null;
   omniModelId?: string | null;
   multimodalModelId?: string | null;
+  stages?: unknown;
 }): AnalysisSelectionPatch {
   const mode = raw.mode ?? null;
   if (mode !== null && !(ANALYSIS_MODES as readonly string[]).includes(mode)) {
@@ -216,6 +264,7 @@ function cleanPatch(raw: {
     mode: (mode as AnalysisMode | null) ?? null,
     omniModelId: raw.omniModelId || null,
     multimodalModelId: raw.multimodalModelId || null,
+    stages: cleanStages(raw.stages),
   };
 }
 
@@ -246,6 +295,7 @@ export async function saveAnalysisDefaults(raw: {
   mode?: string | null;
   omniModelId?: string | null;
   multimodalModelId?: string | null;
+  stages?: unknown;
 }): Promise<void> {
   const session = await requireOwnerSession();
   const patch = cleanPatch(raw);
@@ -268,7 +318,12 @@ export async function saveAnalysisDefaults(raw: {
  */
 export async function saveSourceModelConfig(
   dataSourceId: string,
-  raw: { mode?: string | null; omniModelId?: string | null; multimodalModelId?: string | null },
+  raw: {
+    mode?: string | null;
+    omniModelId?: string | null;
+    multimodalModelId?: string | null;
+    stages?: unknown;
+  },
 ): Promise<void> {
   await requireSourceAccess(dataSourceId);
   const patch = cleanPatch(raw);
@@ -287,9 +342,16 @@ export async function saveSourceModelConfig(
 export async function resetSourceModelConfig(dataSourceId: string): Promise<void> {
   await requireSourceAccess(dataSourceId);
   const current = await readSourcePatch(dataSourceId);
-  if (!current.mode && !current.omniModelId && !current.multimodalModelId) return;
+  if (
+    !current.mode &&
+    !current.omniModelId &&
+    !current.multimodalModelId &&
+    isEmptyStagePatch(current.stages)
+  ) {
+    return;
+  }
   try {
-    await writeSourcePatch(dataSourceId, { mode: null, omniModelId: null, multimodalModelId: null });
+    await writeSourcePatch(dataSourceId, EMPTY_PATCH);
   } catch (err) {
     wrap(err, "重置分析模型配置失败");
   }

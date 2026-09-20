@@ -5,7 +5,7 @@ import {
   type AnalysisRuntime,
   type ModelRuntime,
 } from "@/lib/models/registry";
-import { sessionStrategy, textModelKind, type SessionStrategy } from "@/lib/models/mode";
+import { sessionStrategy, stageOptions, textModelKind, type SessionStrategy } from "@/lib/models/mode";
 import type {
   GlobalAnalysis,
   JsonObject,
@@ -125,6 +125,7 @@ export async function analyzeSession(opts: AnalyzeSessionOptions): Promise<Sessi
   const strategy = sessionStrategy(runtime.mode, clips.length > 0);
   const system = `${template.session_prompt}${JSON_RULE}`;
   const label = `会话层分析（${session.session_key}）`;
+  const call = stageOptions(runtime.stages, "session");
 
   const done = (result: SessionAnalysis, tokens: number): SessionAnalysisRun => ({
     result: normalizeSessionResult(result, session),
@@ -142,14 +143,19 @@ export async function analyzeSession(opts: AnalyzeSessionOptions): Promise<Sessi
       // rejects an `input_audio` part, so this must stay true even if the
       // routing table in @/lib/models/mode is changed later.
       const content = kind === "omni" && clips.length ? withAudio(payload, clips) : payload;
-      const pass = await sessionJson([sys(system), user(content)], model, label);
+      const pass = await sessionJson([sys(system), user(content)], model, label, call);
       return done(pass.result, pass.tokens);
     }
 
     case "omni_then_refine": {
       const omni = requireModel(runtime, "omni", "会话层音频分析");
       const multimodal = requireModel(runtime, "multimodal", "会话层二次优化");
-      const first = await sessionJson([sys(system), user(withAudio(payload, clips))], omni, `${label} · 音频`);
+      const first = await sessionJson(
+        [sys(system), user(withAudio(payload, clips))],
+        omni,
+        `${label} · 音频`,
+        call,
+      );
       // The refine pass gets the transcript and v1 but no audio, so the prompt
       // tells it to keep v1's audio-derived claims rather than second-guess
       // what it cannot hear.
@@ -162,6 +168,7 @@ export async function analyzeSession(opts: AnalyzeSessionOptions): Promise<Sessi
         ],
         multimodal,
         `${label} · 二次优化`,
+        call,
       );
       return done(second.result, first.tokens + second.tokens);
     }
@@ -186,6 +193,7 @@ export async function analyzeSession(opts: AnalyzeSessionOptions): Promise<Sessi
         [sys(system), user(`${renderAudioObservation(heard.text)}\n\n${payload}`)],
         multimodal,
         label,
+        call,
       );
       return done(pass.result, heard.usage.total_tokens + pass.tokens);
     }
@@ -204,8 +212,9 @@ async function sessionJson(
   messages: ChatMessage[],
   model: ModelRuntime,
   label: string,
+  call: { thinking?: boolean; maxTokens?: number },
 ): Promise<{ result: SessionAnalysis; tokens: number }> {
-  const res = await chatJson<SessionAnalysis>(messages, { model, temperature: 0.3, label });
+  const res = await chatJson<SessionAnalysis>(messages, { model, temperature: 0.3, label, ...call });
   return { result: res.data, tokens: res.usage.total_tokens };
 }
 
@@ -352,6 +361,7 @@ export async function aggregateUser(
       model: requireModel(runtime, textModelKind(runtime.mode), "用户层汇总"),
       temperature: 0.3,
       label: `用户层汇总（${input.user_key}）`,
+      ...stageOptions(runtime.stages, "user"),
     },
   );
 
@@ -416,8 +426,8 @@ export async function aggregateGlobal(
     {
       model: requireModel(runtime, textModelKind(runtime.mode), "全局层汇总"),
       temperature: 0.35,
-      maxTokens: 12000,
       label: "全局层汇总",
+      ...stageOptions(runtime.stages, "global"),
     },
   );
 
@@ -490,14 +500,15 @@ export async function generateReport(input: {
     targetSections: input.targetSections,
     evidence: input.evidence,
   });
-  // thinking is left off here: the report contract is already precise, and a
-  // multi-thousand-token reasoning prefix makes the call take many minutes.
+  // Budget and thinking come from the stage settings — thinking is off by
+  // default here (the report contract is already precise, and a
+  // multi-thousand-token reasoning prefix makes the call take many minutes),
+  // but a workspace that wants it can say so.
   const res = await chatJson<ReportSpec>(messages, {
     model: requireModel(input.runtime, textModelKind(input.runtime.mode), "报告生成"),
     temperature: 0.45,
-    maxTokens: 8000,
-    thinking: false,
     label: "报告生成",
+    ...stageOptions(input.runtime.stages, "report"),
   });
   const base = normalizeReportSpec(res.data, input.title);
   const { spec, overrides } = reconcileWithGroundTruth(base, input.groundTruth);

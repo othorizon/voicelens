@@ -24,13 +24,17 @@ import {
 } from "@/lib/actions/models";
 import {
   ANALYSIS_MODES,
+  DEFAULT_STAGE_PARAMS,
   MODEL_KIND_LABEL,
   MODE_HINT,
   MODE_LABEL,
   describeModeCost,
   type AnalysisMode,
+  type AnalysisSelection,
   type ModelKind,
+  type StagePatchMap,
 } from "@/lib/models/mode";
+import { StageParamsEditor } from "@/components/stage-params";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -94,17 +98,24 @@ const KIND_ICON = { multimodal: ImageIcon, omni: AudioLines } as const;
 export function ModelSettings({
   models,
   defaults,
+  stagePatch,
   canManage,
 }: {
   models: ModelCard[];
-  defaults: { mode: AnalysisMode; omniModelId: string | null; multimodalModelId: string | null };
+  defaults: AnalysisSelection;
+  stagePatch: StagePatchMap;
   canManage: boolean;
 }) {
   const [editing, setEditing] = useState<ModelCard | "new" | null>(null);
 
   return (
     <div className="space-y-5">
-      <DefaultsPanel models={models} defaults={defaults} canManage={canManage} />
+      <DefaultsPanel
+        models={models}
+        defaults={defaults}
+        stagePatch={stagePatch}
+        canManage={canManage}
+      />
 
       <Separator />
 
@@ -476,15 +487,24 @@ function ModelDialog({ target, onClose }: { target: ModelCard | "new" | null; on
 function DefaultsPanel({
   models,
   defaults,
+  stagePatch,
   canManage,
 }: {
   models: ModelCard[];
-  defaults: { mode: AnalysisMode; omniModelId: string | null; multimodalModelId: string | null };
+  defaults: AnalysisSelection;
+  stagePatch: StagePatchMap;
   canManage: boolean;
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
-  const [draft, setDraft] = useState(defaults);
+  const [draft, setDraft] = useState({
+    mode: defaults.mode,
+    omniModelId: defaults.omniModelId,
+    multimodalModelId: defaults.multimodalModelId,
+    // Stages are edited as the stored patch, not as resolved values: a stage
+    // left alone keeps following the built-in default as it changes.
+    stages: stagePatch,
+  });
   const options: ModelOption[] = models.map((m) => ({
     id: m.id,
     name: m.name,
@@ -496,7 +516,8 @@ function DefaultsPanel({
   const dirty =
     draft.mode !== defaults.mode ||
     draft.omniModelId !== defaults.omniModelId ||
-    draft.multimodalModelId !== defaults.multimodalModelId;
+    draft.multimodalModelId !== defaults.multimodalModelId ||
+    JSON.stringify(draft.stages) !== JSON.stringify(stagePatch);
 
   function save() {
     startTransition(async () => {
@@ -515,7 +536,7 @@ function DefaultsPanel({
       <div>
         <div className="text-sm font-semibold">默认分析配置</div>
         <div className="mt-0.5 text-[12px] text-muted-foreground">
-          所有数据源默认继承这里的模式与模型；单个数据源可以在它自己的「分析模型」页签里覆盖。
+          所有数据源默认继承这里的模式、模型与各阶段调用参数；单个数据源可以在它自己的「分析模型」页签里覆盖。
         </div>
       </div>
 
@@ -542,6 +563,17 @@ function DefaultsPanel({
           options={options}
           disabled={!canManage || pending}
           onChange={(id) => setDraft((d) => ({ ...d, multimodalModelId: id }))}
+        />
+      </div>
+
+      <div className="space-y-1.5">
+        <div className="text-[12px] text-muted-foreground">各阶段调用参数</div>
+        <StageParamsEditor
+          value={draft.stages}
+          base={DEFAULT_STAGE_PARAMS}
+          baseLabel="内置默认"
+          disabled={!canManage || pending}
+          onChange={(stages) => setDraft((d) => ({ ...d, stages }))}
         />
       </div>
 

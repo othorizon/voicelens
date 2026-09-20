@@ -137,6 +137,142 @@ export function describeModeCost(mode: AnalysisMode): string {
   return "每个会话 1 次调用；汇总与报告走多模态";
 }
 
+/* ------------------------------------------------------- 各阶段调用参数 */
+
+/**
+ * The five JSON-returning model calls a run makes. Each one has its own budget
+ * and its own answer to "is reasoning worth the wait here", so each is
+ * configurable: a 会话层 call runs once per session and wants to be cheap, the
+ * 报告 call runs once and has to fit a whole report in one answer.
+ *
+ * The audio-only sub-calls (planning's 试听, the audio-first observation) are
+ * not here: they produce prose, not JSON, and their small fixed budgets are a
+ * property of the prompt rather than something worth tuning.
+ */
+export const ANALYSIS_STAGES = ["plan", "session", "user", "global", "report"] as const;
+
+export type AnalysisStage = (typeof ANALYSIS_STAGES)[number];
+
+export const STAGE_LABEL: Record<AnalysisStage, string> = {
+  plan: "规划 · 生成提示词",
+  session: "会话层分析",
+  user: "用户层汇总",
+  global: "全局层汇总",
+  report: "报告生成",
+};
+
+export const STAGE_HINT: Record<AnalysisStage, string> = {
+  plan: "每次规划 1 次调用，产出四段提示词，值得思考",
+  session: "每个会话 1-2 次调用，调用量最大，成本对这里最敏感",
+  user: "每个用户 1 次调用，输入是该用户所有会话的结论",
+  global: "整个任务 1 次调用，输入是全部用户层结论与真实统计",
+  report: "整个任务 1 次调用，要在一次回答里写完整份报告",
+};
+
+/** 跟随模型自身的 enable_thinking 设置，或在这一步强制开关。 */
+export type ThinkingChoice = "auto" | "on" | "off";
+
+export const THINKING_LABEL: Record<ThinkingChoice, string> = {
+  auto: "跟随模型配置",
+  on: "开启思考",
+  off: "关闭思考",
+};
+
+export interface StageParams {
+  thinking: ThinkingChoice;
+  /** 0 means "send no max_tokens at all" and let the model stop where it stops. */
+  maxTokens: number;
+}
+
+/** Above this the value is almost certainly a typo, not a budget. */
+export const MAX_TOKENS_CEILING = 100000;
+
+/**
+ * The built-in floor of the chain. The budgets are measured, not guessed:
+ * against a Model Studio endpoint, an "write as much as you can" report prompt
+ * stops on its own at ~12k (omni-flash) and ~15k (max) completion tokens, so
+ * 16000 is a runaway guard that a real report never reaches — where the old
+ * 8000 truncated a long one mid-sentence. Report writing keeps thinking off:
+ * the same prompt took 431s with it and 105s without, and the contract it
+ * follows is already precise.
+ */
+export const DEFAULT_STAGE_PARAMS: Record<AnalysisStage, StageParams> = {
+  plan: { thinking: "on", maxTokens: 14000 },
+  session: { thinking: "auto", maxTokens: 0 },
+  user: { thinking: "auto", maxTokens: 0 },
+  global: { thinking: "auto", maxTokens: 16000 },
+  report: { thinking: "off", maxTokens: 16000 },
+};
+
+/** As stored: every field may be null, meaning "inherit the layer below". */
+export interface StageParamsPatch {
+  thinking: ThinkingChoice | null;
+  maxTokens: number | null;
+}
+
+export type StagePatchMap = Partial<Record<AnalysisStage, StageParamsPatch>>;
+
+const THINKING_CHOICES: readonly string[] = ["auto", "on", "off"];
+
+function asStagePatch(value: unknown): StageParamsPatch {
+  const raw = (value ?? {}) as Record<string, unknown>;
+  const thinking = typeof raw.thinking === "string" && THINKING_CHOICES.includes(raw.thinking)
+    ? (raw.thinking as ThinkingChoice)
+    : null;
+  const maxTokens =
+    typeof raw.maxTokens === "number" && Number.isFinite(raw.maxTokens) && raw.maxTokens >= 0
+      ? Math.min(Math.floor(raw.maxTokens), MAX_TOKENS_CEILING)
+      : null;
+  return { thinking, maxTokens };
+}
+
+export function asStagePatchMap(value: unknown): StagePatchMap {
+  const raw = (value ?? {}) as Record<string, unknown>;
+  const out: StagePatchMap = {};
+  for (const stage of ANALYSIS_STAGES) {
+    if (raw[stage] == null) continue;
+    const patch = asStagePatch(raw[stage]);
+    if (patch.thinking !== null || patch.maxTokens !== null) out[stage] = patch;
+  }
+  return out;
+}
+
+/** Field-by-field, stage-by-stage inheritance, same rule as the model slots. */
+export function applyStagePatch(
+  base: Record<AnalysisStage, StageParams>,
+  patch: StagePatchMap,
+): Record<AnalysisStage, StageParams> {
+  const out = {} as Record<AnalysisStage, StageParams>;
+  for (const stage of ANALYSIS_STAGES) {
+    const over = patch[stage];
+    out[stage] = {
+      thinking: over?.thinking ?? base[stage].thinking,
+      maxTokens: over?.maxTokens ?? base[stage].maxTokens,
+    };
+  }
+  return out;
+}
+
+export function isEmptyStagePatch(patch: StagePatchMap): boolean {
+  return !ANALYSIS_STAGES.some((s) => patch[s]?.thinking != null || patch[s]?.maxTokens != null);
+}
+
+/**
+ * A stage's settings as `chat`/`chatJson` options. "auto" and 0 are expressed by
+ * leaving the key out, which is what makes them mean "whatever the model says"
+ * and "no max_tokens on the wire" rather than `false` and `0`.
+ */
+export function stageOptions(
+  stages: Record<AnalysisStage, StageParams>,
+  stage: AnalysisStage,
+): { thinking?: boolean; maxTokens?: number } {
+  const params = stages[stage] ?? DEFAULT_STAGE_PARAMS[stage];
+  return {
+    ...(params.thinking === "auto" ? {} : { thinking: params.thinking === "on" }),
+    ...(params.maxTokens > 0 ? { maxTokens: params.maxTokens } : {}),
+  };
+}
+
 /* ---------------------------------------------------------- the selection */
 
 /**
@@ -148,6 +284,7 @@ export interface AnalysisSelection {
   mode: AnalysisMode;
   omniModelId: string | null;
   multimodalModelId: string | null;
+  stages: Record<AnalysisStage, StageParams>;
 }
 
 /** As stored — on `app_settings.analysis_defaults` or `data_sources.model_config`. */
@@ -155,12 +292,14 @@ export interface AnalysisSelectionPatch {
   mode: AnalysisMode | null;
   omniModelId: string | null;
   multimodalModelId: string | null;
+  stages: StagePatchMap;
 }
 
 export const EMPTY_PATCH: AnalysisSelectionPatch = {
   mode: null,
   omniModelId: null,
   multimodalModelId: null,
+  stages: {},
 };
 
 /** Read a stored jsonb blob into a patch, tolerating absent and junk keys. */
@@ -172,6 +311,7 @@ export function asPatch(value: unknown): AnalysisSelectionPatch {
     omniModelId: typeof raw.omniModelId === "string" && raw.omniModelId ? raw.omniModelId : null,
     multimodalModelId:
       typeof raw.multimodalModelId === "string" && raw.multimodalModelId ? raw.multimodalModelId : null,
+    stages: asStagePatchMap(raw.stages),
   };
 }
 
@@ -181,5 +321,6 @@ export function applyPatch(base: AnalysisSelection, patch: AnalysisSelectionPatc
     mode: patch.mode ?? base.mode,
     omniModelId: patch.omniModelId ?? base.omniModelId,
     multimodalModelId: patch.multimodalModelId ?? base.multimodalModelId,
+    stages: applyStagePatch(base.stages, patch.stages),
   };
 }

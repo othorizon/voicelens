@@ -16,13 +16,17 @@ process.env.MODEL_SECRET = "models-test-secret-models-test-secret-0123456789";
 
 import { closePool, execute, one, query } from "../src/lib/db";
 import {
+  DEFAULT_STAGE_PARAMS,
   PLAN_AUDIO_KIND,
   audioKinds,
   asMode,
   asPatch,
   applyPatch,
+  applyStagePatch,
+  isEmptyStagePatch,
   requiredKinds,
   sessionStrategy,
+  stageOptions,
   textModelKind,
   type AnalysisMode,
 } from "../src/lib/models/mode";
@@ -99,22 +103,73 @@ function routingChecks() {
 
 function inheritanceChecks() {
   console.log("\n-- 配置继承 --");
-  const base = { mode: "omni_all" as AnalysisMode, omniModelId: "o-1", multimodalModelId: "m-1" };
+  const base = {
+    mode: "omni_all" as AnalysisMode,
+    omniModelId: "o-1",
+    multimodalModelId: "m-1",
+    stages: DEFAULT_STAGE_PARAMS,
+  };
 
   check("空覆盖完全继承", applyPatch(base, asPatch({})), base);
   check("只覆盖模式时模型仍继承", applyPatch(base, asPatch({ mode: "audio_first" })), {
     mode: "audio_first",
     omniModelId: "o-1",
     multimodalModelId: "m-1",
+    stages: DEFAULT_STAGE_PARAMS,
   });
   check("只覆盖单个模型时模式仍继承", applyPatch(base, asPatch({ multimodalModelId: "m-2" })), {
     mode: "omni_all",
     omniModelId: "o-1",
     multimodalModelId: "m-2",
+    stages: DEFAULT_STAGE_PARAMS,
   });
   // Junk in the column must not resolve into a mode the engine cannot run.
   check("非法模式当作未覆盖", applyPatch(base, asPatch({ mode: "made-up" })), base);
   check("空字符串 id 当作未覆盖", applyPatch(base, asPatch({ omniModelId: "" })), base);
+}
+
+/* -------------------------------------------------------- 阶段参数继承 */
+
+function stageChecks() {
+  console.log("\n-- 各阶段调用参数 --");
+
+  check("未配置时用内置默认", applyStagePatch(DEFAULT_STAGE_PARAMS, {}), DEFAULT_STAGE_PARAMS);
+  check(
+    "只覆盖一个字段，另一个仍继承",
+    applyStagePatch(DEFAULT_STAGE_PARAMS, { report: { thinking: "on", maxTokens: null } }).report,
+    { thinking: "on", maxTokens: DEFAULT_STAGE_PARAMS.report.maxTokens },
+  );
+  check(
+    "覆盖一个阶段不影响其他阶段",
+    applyStagePatch(DEFAULT_STAGE_PARAMS, { report: { thinking: "on", maxTokens: null } }).global,
+    DEFAULT_STAGE_PARAMS.global,
+  );
+  // 数据源层再覆盖一次：全局 → 数据源，逐字段生效。
+  const workspace = applyStagePatch(DEFAULT_STAGE_PARAMS, {
+    report: { thinking: "on", maxTokens: 20000 },
+  });
+  check(
+    "数据源层只改预算，思考沿用全局",
+    applyStagePatch(workspace, { report: { thinking: null, maxTokens: 6000 } }).report,
+    { thinking: "on", maxTokens: 6000 },
+  );
+
+  check("junk 阶段被忽略", asPatch({ stages: { nope: { thinking: "on" } } }).stages, {});
+  check("junk 思考值被忽略", asPatch({ stages: { report: { thinking: "yes" } } }).stages, {});
+  check("负数预算被忽略", asPatch({ stages: { report: { maxTokens: -5 } } }).stages, {});
+  check("合法值被保留", asPatch({ stages: { report: { maxTokens: 9000 } } }).stages, {
+    report: { thinking: null, maxTokens: 9000 },
+  });
+  check("空覆盖判定为空", isEmptyStagePatch(asPatch({ stages: {} }).stages), true);
+
+  // On the wire: "auto" and 0 are the absence of a parameter, not false and 0.
+  check("auto 不发送 enable_thinking 覆盖", stageOptions(DEFAULT_STAGE_PARAMS, "session"), {});
+  check("0 不发送 max_tokens", stageOptions(applyStagePatch(DEFAULT_STAGE_PARAMS, {
+    report: { thinking: "off", maxTokens: 0 },
+  }), "report"), { thinking: false });
+  check("显式值原样发送", stageOptions(applyStagePatch(DEFAULT_STAGE_PARAMS, {
+    report: { thinking: "on", maxTokens: 5000 },
+  }), "report"), { thinking: true, maxTokens: 5000 });
 }
 
 /* ------------------------------------------------------------ secrets */
@@ -167,14 +222,39 @@ async function dbChecks() {
   );
 
   await writeDefaults(
-    { mode: "omni_for_audio", omniModelId: omni.id, multimodalModelId: multimodal.id },
+    { mode: "omni_for_audio", omniModelId: omni.id, multimodalModelId: multimodal.id, stages: {} },
     owner.id,
   );
   check("默认配置写入后可读回", await readDefaults(), {
     mode: "omni_for_audio",
     omniModelId: omni.id,
     multimodalModelId: multimodal.id,
+    stages: DEFAULT_STAGE_PARAMS,
   });
+
+  // A stage stored at the workspace level reaches the engine through the runtime.
+  await writeDefaults(
+    {
+      mode: "omni_for_audio",
+      omniModelId: omni.id,
+      multimodalModelId: multimodal.id,
+      stages: { report: { thinking: "on", maxTokens: 9000 } },
+    },
+    owner.id,
+  );
+  check("阶段参数写入后进入运行时", (await resolveRuntime(source.id)).stages.report, {
+    thinking: "on",
+    maxTokens: 9000,
+  });
+  check(
+    "未配置的阶段仍是内置默认",
+    (await resolveRuntime(source.id)).stages.global,
+    DEFAULT_STAGE_PARAMS.global,
+  );
+  await writeDefaults(
+    { mode: "omni_for_audio", omniModelId: omni.id, multimodalModelId: multimodal.id, stages: {} },
+    owner.id,
+  );
 
   const inherited = await resolveRuntime(source.id);
   check("数据源默认继承全局模式", inherited.mode, "omni_for_audio");
@@ -185,10 +265,19 @@ async function dbChecks() {
   check("运行时带出解密后的 Key", inherited.omni?.apiKey, "sk-omni");
 
   // Per-field override: the mode moves, the models keep following the default.
-  await writeSourcePatch(source.id, { mode: "audio_first", omniModelId: null, multimodalModelId: null });
+  await writeSourcePatch(source.id, {
+    mode: "audio_first",
+    omniModelId: null,
+    multimodalModelId: null,
+    stages: { session: { thinking: "off", maxTokens: null } },
+  });
   const overridden = await resolveRuntime(source.id);
   check("数据源覆盖模式生效", overridden.mode, "audio_first");
   check("未覆盖的模型仍继承", overridden.multimodal?.id, multimodal.id);
+  check("数据源覆盖阶段参数生效", overridden.stages.session, {
+    thinking: "off",
+    maxTokens: DEFAULT_STAGE_PARAMS.session.maxTokens,
+  });
 
   // A disabled model is a reported problem, not a silent empty slot…
   await execute(`update ai_models set enabled = false where id = $1`, [omni.id]);
@@ -215,7 +304,12 @@ async function dbChecks() {
   check("删除后解析为未配置", (await resolveRuntime(source.id)).omni, null);
   checkThrows(
     "未配置时给出可执行的提示",
-    () => requireModel({ mode: "audio_first", omni: null, multimodal: null, problems: {} }, "omni", "会话层分析"),
+    () =>
+      requireModel(
+        { mode: "audio_first", omni: null, multimodal: null, stages: DEFAULT_STAGE_PARAMS, problems: {} },
+        "omni",
+        "会话层分析",
+      ),
     "设置 → 分析模型",
   );
 
@@ -225,6 +319,7 @@ async function dbChecks() {
     mode: null,
     omniModelId: omni2.id,
     multimodalModelId: multimodal.id,
+    stages: {},
   });
   const cleared2 = await clearModelReferences(omni2.id);
   check("清理改写了显式引用它的数据源", cleared2, 1);
@@ -251,6 +346,7 @@ async function cleanup() {
 async function main() {
   routingChecks();
   inheritanceChecks();
+  stageChecks();
   secretChecks();
 
   if (!process.env.DATABASE_URL) {

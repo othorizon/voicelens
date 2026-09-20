@@ -2,14 +2,19 @@ import { execute, maybeOne, query, type Executor } from "@/lib/db";
 import { decryptSecret, describeSecret, type SecretState } from "./secret";
 import {
   applyPatch,
+  applyStagePatch,
   asMode,
   asPatch,
   DEFAULT_MODE,
+  DEFAULT_STAGE_PARAMS,
+  EMPTY_PATCH,
   MODEL_KIND_LABEL,
   type AnalysisMode,
   type AnalysisSelection,
   type AnalysisSelectionPatch,
+  type AnalysisStage,
   type ModelKind,
+  type StageParams,
 } from "./mode";
 
 /**
@@ -135,16 +140,29 @@ export async function runtimeFor(id: string): Promise<ModelRuntime | null> {
 
 /* ------------------------------------------------------------- selection */
 
-/** The workspace default. Missing or junk rows read as the built-in default. */
-export async function readDefaults(): Promise<AnalysisSelection> {
+/**
+ * The workspace patch as stored, before the built-in defaults are applied —
+ * what the settings page edits, so a stage nobody has touched keeps saying
+ * "内置默认" rather than freezing today's number into the row.
+ */
+export async function readDefaultsPatch(): Promise<AnalysisSelectionPatch> {
   const value = await maybeOne<{ value: unknown }>(`select value from app_settings where key = $1`, [
     SETTINGS_KEY,
   ]);
-  const patch = asPatch(value?.value);
+  return asPatch(value?.value);
+}
+
+/** The workspace default. Missing or junk rows read as the built-in default. */
+export async function readDefaults(): Promise<AnalysisSelection> {
+  const patch = await readDefaultsPatch();
   return {
     mode: patch.mode ?? DEFAULT_MODE,
     omniModelId: patch.omniModelId,
     multimodalModelId: patch.multimodalModelId,
+    // The workspace row is a patch over the built-in params, so a stage the
+    // owner never touched keeps following the code rather than freezing at
+    // whatever the defaults happened to be the day it was saved.
+    stages: applyStagePatch(DEFAULT_STAGE_PARAMS, patch.stages),
   };
 }
 
@@ -226,7 +244,7 @@ export interface ResolvedSelection {
 
 export async function resolveSelection(dataSourceId: string | null): Promise<ResolvedSelection> {
   const defaults = await readDefaults();
-  const override = dataSourceId ? await readSourcePatch(dataSourceId) : { mode: null, omniModelId: null, multimodalModelId: null };
+  const override = dataSourceId ? await readSourcePatch(dataSourceId) : EMPTY_PATCH;
   return { effective: applyPatch(defaults, override), defaults, override };
 }
 
@@ -241,6 +259,8 @@ export interface AnalysisRuntime {
   mode: AnalysisMode;
   omni: ModelRuntime | null;
   multimodal: ModelRuntime | null;
+  /** Per-stage thinking and max_tokens, already resolved through both layers. */
+  stages: Record<AnalysisStage, StageParams>;
   /**
    * Why a slot is empty although a model was selected for it — a disabled row,
    * an undecryptable key, a kind that no longer matches. Held rather than
@@ -280,7 +300,13 @@ export async function resolveRuntime(dataSourceId: string | null): Promise<Analy
   const problems: Partial<Record<ModelKind, string>> = {};
   if (omni.problem) problems.omni = omni.problem;
   if (multimodal.problem) problems.multimodal = multimodal.problem;
-  return { mode: asMode(effective.mode), omni: omni.model, multimodal: multimodal.model, problems };
+  return {
+    mode: asMode(effective.mode),
+    omni: omni.model,
+    multimodal: multimodal.model,
+    stages: effective.stages,
+    problems,
+  };
 }
 
 export function pickModel(runtime: AnalysisRuntime, kind: ModelKind): ModelRuntime | null {

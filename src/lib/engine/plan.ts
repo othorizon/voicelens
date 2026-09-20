@@ -1,7 +1,7 @@
 import { callJson, query } from "@/lib/db";
 import { chat, chatJson } from "./ai";
 import { requireModel, type AnalysisRuntime } from "@/lib/models/registry";
-import { PLAN_AUDIO_KIND, textModelKind } from "@/lib/models/mode";
+import { PLAN_AUDIO_KIND, stageOptions, textModelKind } from "@/lib/models/mode";
 import {
   describeExtraSchema,
   buildPlanningMessages,
@@ -206,9 +206,8 @@ export async function planTemplate(input: PlanInput): Promise<PlanOutput> {
   const { data, usage } = await chatJson<PlannerResult>(messages, {
     model: requireModel(input.runtime, textModelKind(input.runtime.mode), "规划提示词"),
     temperature: 0.5,
-    maxTokens: 14000,
-    thinking: true,
     label: "AI 规划",
+    ...stageOptions(input.runtime.stages, "plan"),
   });
 
   if (!data.session_prompt || !data.user_prompt || !data.global_prompt || !data.report_prompt) {

@@ -7,18 +7,24 @@ import { Loader2, RotateCcw } from "lucide-react";
 import { resetSourceModelConfig, saveSourceModelConfig } from "@/lib/actions/models";
 import {
   ANALYSIS_MODES,
+  EMPTY_PATCH,
   MODEL_KIND_LABEL,
   MODE_HINT,
   MODE_LABEL,
   PLAN_AUDIO_KIND,
   STRATEGY_LABEL,
   describeModeCost,
+  applyStagePatch,
+  isEmptyStagePatch,
   sessionStrategy,
   textModelKind,
   type AnalysisMode,
+  type AnalysisSelection,
   type AnalysisSelectionPatch,
 } from "@/lib/models/mode";
 import { ModePicker, ModelPicker, type ModelOption } from "@/components/model-pickers";
+import { StageParamsEditor, StageParamsSummary } from "@/components/stage-params";
+import { Label } from "@/components/ui/label";
 import { PageHeader } from "@/components/ui-kit";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -41,7 +47,7 @@ export function SourceModelConfig({
 }: {
   sourceId: string;
   models: ModelOption[];
-  defaults: { mode: AnalysisMode; omniModelId: string | null; multimodalModelId: string | null };
+  defaults: AnalysisSelection;
   override: AnalysisSelectionPatch;
 }) {
   const router = useRouter();
@@ -52,13 +58,16 @@ export function SourceModelConfig({
     mode: draft.mode ?? defaults.mode,
     omniModelId: draft.omniModelId ?? defaults.omniModelId,
     multimodalModelId: draft.multimodalModelId ?? defaults.multimodalModelId,
+    stages: applyStagePatch(defaults.stages, draft.stages),
   };
 
   const dirty =
     draft.mode !== override.mode ||
     draft.omniModelId !== override.omniModelId ||
-    draft.multimodalModelId !== override.multimodalModelId;
-  const inherits = !draft.mode && !draft.omniModelId && !draft.multimodalModelId;
+    draft.multimodalModelId !== override.multimodalModelId ||
+    JSON.stringify(draft.stages) !== JSON.stringify(override.stages);
+  const inherits =
+    !draft.mode && !draft.omniModelId && !draft.multimodalModelId && isEmptyStagePatch(draft.stages);
 
   const nameOf = (id: string | null) => models.find((m) => m.id === id)?.name ?? "未选择";
 
@@ -78,7 +87,7 @@ export function SourceModelConfig({
     startTransition(async () => {
       try {
         await resetSourceModelConfig(sourceId);
-        setDraft({ mode: null, omniModelId: null, multimodalModelId: null });
+        setDraft(EMPTY_PATCH);
         toast.success("已改回完全继承全局默认");
         router.refresh();
       } catch (e) {
@@ -139,6 +148,17 @@ export function SourceModelConfig({
               />
             </div>
 
+            <div className="space-y-1.5">
+              <Label className="text-[12px] text-muted-foreground">各阶段调用参数</Label>
+              <StageParamsEditor
+                value={draft.stages}
+                base={defaults.stages}
+                baseLabel="继承全局"
+                disabled={pending}
+                onChange={(stages) => setDraft((d) => ({ ...d, stages }))}
+              />
+            </div>
+
             <div className="rounded-lg border border-border/60 bg-muted/30 p-3 text-[12px] leading-relaxed text-muted-foreground">
               <span className="font-medium text-foreground">{MODE_LABEL[effective.mode]}</span>
               <span className="mx-1.5">·</span>
@@ -190,6 +210,10 @@ export function SourceModelConfig({
               <Fact k={MODEL_KIND_LABEL.omni} v={nameOf(effective.omniModelId)} />
               <Fact k={MODEL_KIND_LABEL.multimodal} v={nameOf(effective.multimodalModelId)} />
             </dl>
+            <div className="mt-3 space-y-1.5">
+              <Label className="text-[12px] text-muted-foreground">各阶段实际生效的参数</Label>
+              <StageParamsSummary stages={effective.stages} />
+            </div>
           </CardContent>
         </Card>
       </div>

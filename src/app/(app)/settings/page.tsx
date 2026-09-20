@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { Bot, Database, ShieldCheck, Users, Cpu, Cloud } from "lucide-react";
 import { count as countRows, maybeOne, query } from "@/lib/db";
 import { ownerScope, requireSession } from "@/lib/actions/common";
-import { listModels, readDefaults } from "@/lib/models/registry";
+import { listModels, readDefaults, readDefaultsPatch } from "@/lib/models/registry";
 import { MODE_LABEL } from "@/lib/models/mode";
 import { ModelSettings, type ModelCard } from "@/components/model-settings";
 import { canAssignRoles, ROLE_HINT, ROLE_LABEL, asRole, type Role } from "@/lib/auth/roles";
@@ -56,7 +56,11 @@ export default async function SettingsPage() {
   // Models live in the database now. Only the owner may change them, but the
   // whole workspace sees what is configured — a member picking a model for
   // their own data source needs the names.
-  const [registry, defaults] = await Promise.all([listModels(), readDefaults()]);
+  const [registry, defaults, defaultsPatch] = await Promise.all([
+    listModels(),
+    readDefaults(),
+    readDefaultsPatch(),
+  ]);
   const cards: ModelCard[] = registry.map((m) => ({
     id: m.id,
     name: m.name,
@@ -209,7 +213,12 @@ export default async function SettingsPage() {
             </CardDescription>
           </CardHeader>
           <CardContent>
-            <ModelSettings models={cards} defaults={defaults} canManage={myRole === "owner"} />
+            <ModelSettings
+              models={cards}
+              defaults={defaults}
+              stagePatch={defaultsPatch.stages}
+              canManage={myRole === "owner"}
+            />
           </CardContent>
         </Card>
 
