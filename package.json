@@ -46,6 +46,7 @@
     "date-fns": "^4.4.0",
     "dotenv": "^17.4.2",
     "jose": "^5.9.6",
+    "jsonrepair": "^3.15.0",
     "jszip": "^3.10.2",
     "lucide-react": "^1.47.0",
     "next": "15.5.25",

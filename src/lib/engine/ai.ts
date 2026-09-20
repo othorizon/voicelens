@@ -1,3 +1,4 @@
+import { jsonrepair } from "jsonrepair";
 import OpenAI from "openai";
 import type { ChatCompletionCreateParamsStreaming } from "openai/resources/chat/completions";
 import type { ModelRuntime } from "@/lib/models/registry";
@@ -348,28 +349,58 @@ export function tryParseJson<T>(input: string): JsonParseResult<T> {
   const cleaned = unwrapped === raw ? direct : parseJson<T>(unwrapped);
   if (cleaned.ok) return { ok: true, value: cleaned.value, fix: "clean" };
 
-  const fragment = firstJsonValue(unwrapped) ?? unwrapped;
+  const fail = (): JsonParseResult<T> => ({
+    ok: false,
+    reason: cleaned.reason,
+    fault: faultWindow(unwrapped, cleaned.reason),
+  });
+
+  const found = firstJsonValue(unwrapped);
+  // No brackets anywhere: prose, a refusal, an apology. Nothing to repair, and
+  // pretending otherwise is how a refusal becomes an empty report.
+  if (!found) return fail();
+
+  const fragment = found.text;
   if (fragment !== unwrapped) {
     const embedded = parseJson<T>(fragment);
     if (embedded.ok) return { ok: true, value: embedded.value, fix: "clean" };
   }
 
-  // Cheap syntax defects first: they cost nothing to undo, so a report with a
-  // stray comma in its middle should never be thrown away over it.
-  const relaxed = relaxJson(fragment);
-  if (relaxed) {
-    const loosened = parseJson<T>(relaxed);
-    if (loosened.ok) return { ok: true, value: loosened.value, fix: "relaxed" };
+  if (found.complete) {
+    // Written to the end, just written wrong. Correcting it loses nothing, so
+    // there is no reason to spend another call on it: our own pass first
+    // (it knows this schema — a placeholder where a number belongs is null,
+    // not the string "数字"), then the library for everything else.
+    const relaxed = relaxJson(fragment);
+    if (relaxed) {
+      const loosened = parseJson<T>(relaxed);
+      if (loosened.ok) return { ok: true, value: loosened.value, fix: "relaxed" };
+    }
+    const byLibrary = libraryRepair(relaxed ?? fragment);
+    if (byLibrary) {
+      const parsed = parseJson<T>(byLibrary);
+      if (parsed.ok) return { ok: true, value: parsed.value, fix: "relaxed" };
+    }
+    return fail();
   }
 
-  // Only then the lossy one.
-  const repaired = repairTruncated(relaxed ?? fragment);
+  // Cut off mid-value: content is genuinely missing, so whatever comes back is
+  // flagged lossy and the caller gets to decide whether to ask again. The
+  // library keeps a half-written sentence as a complete string, which saves
+  // more of the answer than cutting back to the last finished value; that cut
+  // is the fallback when it cannot make sense of the fragment at all.
+  const byLibrary = libraryRepair(relaxJson(fragment) ?? fragment);
+  if (byLibrary) {
+    const parsed = parseJson<T>(byLibrary);
+    if (parsed.ok) return { ok: true, value: parsed.value, fix: "truncated" };
+  }
+  const repaired = repairTruncated(fragment);
   if (repaired) {
     const salvaged = parseJson<T>(repaired);
     if (salvaged.ok) return { ok: true, value: salvaged.value, fix: "truncated" };
   }
 
-  return { ok: false, reason: cleaned.reason, fault: faultWindow(unwrapped, cleaned.reason) };
+  return fail();
 }
 
 const IDENT_START = /[A-Za-z_$]/;
@@ -506,10 +537,15 @@ function unwrap(raw: string): string {
 
 /**
  * The first balanced `{…}` / `[…]` in the text, string-aware so a brace inside a
- * quoted sentence does not close it. Returns the fragment from the opening
- * bracket to the end when it never closes — that is what the repair works on.
+ * quoted sentence does not close it.
+ *
+ * `complete` is what separates the two kinds of damage: a value whose brackets
+ * never close was cut off and has content missing, while one that closes but
+ * still will not parse is merely mis-written. They call for different answers —
+ * another call versus a correction in place — so the scan reports which it is
+ * rather than leaving the repair to guess.
  */
-function firstJsonValue(text: string): string | null {
+function firstJsonValue(text: string): { text: string; complete: boolean } | null {
   const start = firstIndexOfEither(text, "{", "[");
   if (start < 0) return null;
 
@@ -527,11 +563,38 @@ function firstJsonValue(text: string): string | null {
     if (c === '"') inString = true;
     else if (c === "{" || c === "[") stack.push(c === "{" ? "}" : "]");
     else if (c === "}" || c === "]") {
-      if (stack.pop() !== c) return text.slice(start);
-      if (!stack.length) return text.slice(start, i + 1);
+      // A bracket that closes the wrong container is a structural error, not a
+      // cut: there is nothing missing from the end to restore.
+      if (stack.pop() !== c) return { text: text.slice(start), complete: true };
+      if (!stack.length) return { text: text.slice(start, i + 1), complete: true };
     }
   }
-  return text.slice(start);
+  return { text: text.slice(start), complete: false };
+}
+
+/**
+ * `jsonrepair` as a second opinion, fenced in on both sides.
+ *
+ * It is far better than anything hand-written at the syntax a model invents —
+ * single and smart quotes, missing commas, comments, a string cut in half — but
+ * left to itself it also does two things that would be worse than failing:
+ * a refusal ("抱歉，我不能生成该报告。") comes back as a valid JSON *string*, and
+ * prose with an object inside it comes back as an *array* of the prose and the
+ * object. Either one would sail through as a successful parse and reach the
+ * caller as an empty report.
+ *
+ * So it only ever sees an already-extracted `{…}` / `[…]` fragment, and its
+ * result is accepted only when it is still an object or an array.
+ */
+function libraryRepair(fragment: string): string | null {
+  try {
+    const repaired = jsonrepair(fragment);
+    const value: unknown = JSON.parse(repaired);
+    if (typeof value !== "object" || value === null) return null;
+    return repaired;
+  } catch {
+    return null;
+  }
 }
 
 function firstIndexOfEither(text: string, a: string, b: string): number {

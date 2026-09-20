@@ -63,7 +63,8 @@ const TRUNCATED = `{
   check("能救回已经说完的部分", r.ok && (r.value.sections?.length ?? 0) >= 2, JSON.stringify(r));
   check("标记为 truncated，让调用方知道内容有损", r.ok && r.fix === "truncated");
   check("救回的内容本身合法", r.ok && r.value.sections?.[1]?.title === "问题诊断");
-  check("半截的字段被丢掉，不会留下残缺文本", r.ok && !JSON.stringify(r.value).includes("风险提"));
+  // 半截的句子会被补成一个完整字符串留下来 —— 报告里看得见，但比整章丢掉好
+  check("半截的文字被保留成完整字符串", r.ok && JSON.stringify(r.value).includes("风险提"));
 }
 
 console.log("\n[4] 模型写出的 JSON 语法瑕疵");
@@ -92,6 +93,16 @@ console.log("\n[4] 模型写出的 JSON 语法瑕疵");
   );
   check("占位说明被当成 null", placeholder.ok && placeholder.value.value === null, JSON.stringify(placeholder));
 
+  // 下面四种由 jsonrepair 兜底：手写规则不去追这些，但它见得多
+  const quotes = tryParseJson<{ a: number }>("{'a':1}");
+  check("单引号", quotes.ok && quotes.value.a === 1 && quotes.fix === "relaxed", JSON.stringify(quotes));
+  const smart = tryParseJson<{ a: number }>('{“a”:1}');
+  check("中文全角引号", smart.ok && smart.value.a === 1, JSON.stringify(smart));
+  const missing = tryParseJson<{ a: number; b: number }>('{"a":1 "b":2}');
+  check("漏掉逗号", missing.ok && missing.value.b === 2, JSON.stringify(missing));
+  const comment = tryParseJson<{ a: number }>('{"a":1 // 说明\n}');
+  check("JSON 里写了注释", comment.ok && comment.value.a === 1, JSON.stringify(comment));
+
   const nan = tryParseJson<{ value: number | null }>('{"value":NaN}');
   check("NaN 当作 null", nan.ok && nan.value.value === null, JSON.stringify(nan));
 
@@ -102,7 +113,27 @@ console.log("\n[4] 模型写出的 JSON 语法瑕疵");
   check("数组里的 true/false/null 不被当成键", literals.ok && literals.value.flags?.length === 3);
 }
 
-console.log("\n[5] 失败时报告的原因");
+console.log("\n[5] 兜底修复不能越界");
+{
+  // jsonrepair 单独用时，这两种输入会被"修"成合法 JSON：
+  //   '我无法完成这个请求。'  -> "我无法完成这个请求。"（一个合法的 JSON 字符串）
+  //   '好的：{"a":1}以上。'   -> ["好的：", {"a":1}, "以上。"]（数组）
+  // 两种都会作为"解析成功"流到调用方，变成一份空报告，所以都必须挡住。
+  const refusal = tryParseJson<Spec>("抱歉，我不能生成该报告。");
+  check("模型的拒绝回复不会变成合法 JSON 字符串", !refusal.ok, JSON.stringify(refusal));
+
+  const withProse = tryParseJson<Spec>('好的：\n{"title":"报告"}\n以上。');
+  check(
+    "前后有解释时拿到的是对象而不是数组",
+    withProse.ok && !Array.isArray(withProse.value) && withProse.value.title === "报告",
+    JSON.stringify(withProse),
+  );
+
+  const scalar = tryParseJson<Spec>("42 分");
+  check("标量/散文不会被当成修复结果", !scalar.ok);
+}
+
+console.log("\n[6] 失败时报告的原因");
 {
   const r = tryParseJson<Spec>("我无法完成这个请求。");
   check("完全不是 JSON 时失败", !r.ok);
@@ -127,7 +158,7 @@ console.log("\n[5] 失败时报告的原因");
   check("空输出有专门的说法", !empty.ok && empty.reason.includes("没有返回任何内容"));
 }
 
-console.log("\n[6] excerpt / faultWindow — 存进 error 字段的原文摘录");
+console.log("\n[7] excerpt / faultWindow — 存进 error 字段的原文摘录");
 {
   const long = "甲".repeat(5000);
   const e = excerpt(long);
@@ -137,8 +168,8 @@ console.log("\n[6] excerpt / faultWindow — 存进 error 字段的原文摘录"
 
   // 头尾摘录对「错在中间」毫无帮助：线上那次的缺陷在第 4409 个字符，
   // 头 260 字 + 尾 160 字恰好把它漏掉了。失败时必须带上出错位置的上下文。
-  const failed = tryParseJson<Spec>('{"a":1]}');
-  check("结构对不上时仍然失败", !failed.ok, JSON.stringify(failed));
+  const failed = tryParseJson<Spec>('{"a":1],"b":2}');
+  check("结构彻底对不上时仍然失败", !failed.ok, JSON.stringify(failed));
   check(
     "失败时带出错位置的上下文",
     !failed.ok && failed.fault.includes("⟪出错在这里⟫]"),
