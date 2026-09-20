@@ -1,29 +1,13 @@
 import { callJson, execute, scalar } from "@/lib/db";
 import { describeExtraSchema } from "./prompts";
 import { resolveScope, loadSessions } from "./sampler";
-import {
-  aggregateGlobal,
-  aggregateUser,
-  analyzeSession,
-  generateReport,
-  mapLimit,
-} from "./analyze";
-import {
-  buildDrillData,
-  collectEvidence,
-  computeStats,
-  computeUserStats,
-  type DataSourceLike,
-} from "./plan";
-import { renderReportHtml } from "./report-html";
-import { deriveGroundTruth } from "./ground-truth";
-import { extraHistogramForSessions } from "./plan";
+import { aggregateGlobal, aggregateUser, analyzeSession, mapLimit } from "./analyze";
+import { computeStats, extraHistogramForSessions, type DataSourceLike } from "./plan";
+import { runReportStage } from "./report-stage";
 import type {
   AudioUsage,
   ExtraFieldDef,
-  GlobalAnalysis,
   JsonObject,
-  ReportSpec,
   SessionAnalysis,
   UserAnalysis,
 } from "@/lib/types";
@@ -398,52 +382,6 @@ export async function runTask(
     await execute(`update analysis_tasks set stage = 'report_generation' where id = $1`, [taskId]);
     await log(taskId, "info", "report", "开始生成报告");
 
-    const topUsers = [...userAgg]
-      .sort((a, b) => b.result.session_count - a.result.session_count)
-      .slice(0, Math.max(1, config.report.topUsers));
-
-    const evidence = collectEvidence(results);
-    const groundTruth = deriveGroundTruth(
-      distributions,
-      (task.dataSource.extra_schema as ExtraFieldDef[]) ?? [],
-      {
-        sessions: results.length,
-        messages: results.reduce((n, r) => n + (r.session.turn_count ?? 0), 0),
-      },
-    );
-    const { spec, overrides } = await generateReport({
-      template: task.template,
-      runtime,
-      title: task.name || `${task.dataSource.name} 分析报告`,
-      scopeNote: describeScope(task, scope.sessionIds.length, userKeys.length),
-      globalResult: globalResult as unknown as JsonObject,
-      userResults: topUsers.map((u) => ({ user_key: u.user_key, result: u.result as unknown as JsonObject })),
-      sessionStats: stats,
-      distributions,
-      groundTruth,
-      language: config.report.language,
-      includeEvidence: config.report.includeEvidence,
-      tone: config.report.tone,
-      targetSections: config.report.sections,
-      evidence,
-    });
-
-    if (overrides.length) {
-      await log(taskId, "warn", "report", `指标口径校正：覆盖 ${overrides.length} 个 KPI`, {
-        overrides: overrides.map((o) => ({ label: o.label, field: o.field, was: o.was, now: o.now })),
-      });
-    }
-
-    const sessionsForDrill = results.slice(0, 400).map((r) => r.session as SessionRecordForDrill);
-    const drill = buildDrillData(
-      sessionsForDrill,
-      results.map((r) => ({ session_key: r.session_key, user_key: r.user_key, result: r.result })),
-      topUsers,
-    );
-    drill.users = topUsers.length
-      ? drill.users.filter((u) => topUsers.some((t) => t.user_key === u.user_key))
-      : drill.users;
-
     const audio: AudioUsage = {
       enabled: config.session.useAudio,
       maxPerSession: config.session.maxAudiosPerSession,
@@ -451,31 +389,35 @@ export async function runTask(
       ...audioUse,
     };
 
-    const html = renderReportHtml({
-      spec,
-      drill,
-      generatedAt: new Date().toISOString(),
-      scopeNote: describeScope(task, results.length, userKeys.length),
-      templateVersion: task.template.version,
-      taskName: task.name,
+    // Everything the report needs is already in task_session_results,
+    // task_user_results and task_global_result, so the stage reloads from
+    // there rather than closing over locals. That is what lets it be rerun on
+    // its own when a page fails to render, instead of repeating hours of
+    // analysis.
+    const report = await runReportStage({
+      taskId,
+      runtime,
+      config,
       audio,
+      models: describeRuntime(runtime),
+      onStep: (message: string) => void log(taskId, "info", "report", message),
     });
+    tokens += report.tokens;
 
-    await execute(
-      `insert into task_reports (task_id, kind, title, report, html, created_by)
-       values ($1, 'final', $2, $3::jsonb, $4, $5)`,
-      [taskId, spec.title ?? task.name, JSON.stringify(spec), html, task.createdBy],
-    );
+    if (report.overrides) {
+      await log(taskId, "warn", "report", `指标口径校正：覆盖 ${report.overrides} 个 KPI`);
+    }
+    if (report.engine === "spec") {
+      await log(taskId, "warn", "report", "生成的页面未通过渲染校验，已回退到内置渲染器");
+    }
 
     await execute(
       `update analysis_tasks
-       set status = 'completed', stage = 'done', report = $2::jsonb, report_html = $3,
-           stats = $4::jsonb, progress = $5::jsonb, heartbeat_at = now(), finished_at = now()
+       set status = 'completed', stage = 'done',
+           stats = $2::jsonb, progress = $3::jsonb, heartbeat_at = now(), finished_at = now()
        where id = $1`,
       [
         taskId,
-        JSON.stringify(spec),
-        html,
         JSON.stringify({
           sessions_total: scope.sessionIds.length,
           sessions_ok: succeeded,
@@ -485,7 +427,9 @@ export async function runTask(
           duration_ms: Date.now() - Date.parse(startedAt),
           models: describeRuntime(runtime),
           session_strategies: strategyUse,
-          metric_overrides: overrides.length,
+          metric_overrides: report.overrides,
+          report_engine: report.engine,
+          report_attempts: report.attempts,
           audio,
         }),
         JSON.stringify({
@@ -501,7 +445,7 @@ export async function runTask(
       ],
     );
 
-    await log(taskId, "info", "report", `报告生成完成，共 ${spec.sections.length} 个章节`);
+    await log(taskId, "info", "report", `报告生成完成（${report.engine === "page" ? "AI 生成页面" : "内置渲染器"}）`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await execute(
@@ -529,21 +473,6 @@ interface SessionRecord {
   extra: JsonObject;
 }
 
-type SessionRecordForDrill = SessionRecord;
-
-function describeScope(task: TaskRow, sessions: number, users: number): string {
-  const mode = task.scope_type === "range" ? "时间范围" : "增量未分析";
-  const range =
-    task.scope_type === "range" && (task.range_start || task.range_end)
-      ? ` ${formatDate(task.range_start)} ~ ${formatDate(task.range_end)}`
-      : "";
-  return `${mode}${range} · ${sessions} 会话 · ${users} 用户`;
-}
-
-function formatDate(iso: string | null): string {
-  if (!iso) return "—";
-  return iso.slice(0, 10);
-}
 
 function fallbackUser(key: string, sessions: { session_key: string; result: SessionAnalysis }[]) {
   const quality = sessions.map((s) => s.result.quality_score).filter((v) => Number.isFinite(v));

@@ -56,7 +56,7 @@ export interface ReportPayload {
     tone: string;
     includeEvidence: boolean;
     audio?: JsonObject;
-    models?: string;
+    models?: JsonObject;
   };
   profile: DataProfile;
   groundTruth: GroundTruth | null;

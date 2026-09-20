@@ -180,6 +180,8 @@ export interface TemplateSnapshot {
 
 export type TaskStatus =
   | "pending"
+  /** Analysis is done and kept; only the report stage is queued to run again. */
+  | "report_pending"
   | "running"
   | "aggregating"
   | "reporting"

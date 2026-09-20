@@ -251,6 +251,32 @@ export async function cancelTask(taskId: string): Promise<void> {
   revalidatePath("/tasks");
 }
 
+/**
+ * Regenerate the report without redoing the analysis.
+ *
+ * `rerunTask` copies the task and runs the whole chain again, which on a large
+ * data source is hours of model calls to change nothing but the last step.
+ * This parks the existing task for the worker to pick up at the report stage,
+ * against the three layers it already produced.
+ */
+export async function rerunReport(taskId: string): Promise<void> {
+  await requireTaskAccess(taskId);
+  let parked = 0;
+  try {
+    parked = await execute(
+      `update analysis_tasks
+       set status = 'report_pending', stage = 'report_generation', error = null, finished_at = null
+       where id = $1 and status in ('completed', 'failed')`,
+      [taskId],
+    );
+  } catch (err) {
+    throw new ActionError(`重新生成报告失败：${(err as Error).message}`);
+  }
+  if (!parked) throw new ActionError("只有已完成或已失败的任务可以单独重新生成报告");
+  revalidatePath(`/tasks/${taskId}`);
+  revalidatePath("/tasks");
+}
+
 export async function rerunTask(taskId: string): Promise<{ taskId: string }> {
   const { session } = await requireTaskAccess(taskId);
   const userId = session.userId;

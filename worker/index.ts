@@ -24,6 +24,7 @@ import {
   type TemplateConfig,
 } from "../src/lib/engine/plan";
 import { runTask, log } from "../src/lib/engine/executor";
+import { runReportStage } from "../src/lib/engine/report-stage";
 import { importZip } from "../src/lib/engine/import";
 import { configFromGraph, normalizeGraph } from "../src/lib/workflow/graph";
 import type { WorkflowConfig } from "../src/lib/workflow/definition";
@@ -461,6 +462,51 @@ async function handleTask(job: TaskRow) {
   );
 }
 
+/**
+ * Redo only the last stage.
+ *
+ * The three analysis layers are already in the database, and on a large run
+ * they cost hours; a page that failed to render, or a design worth asking for
+ * again, must not send anyone back through them. A task parked at
+ * `report_pending` is claimed here and picks up from the report stage alone.
+ */
+async function handleReportRerun(job: TaskRow) {
+  const runtime = await resolveRuntime(job.data_source_id);
+  const config = await loadConfig(job.workflow_id);
+  const overrides = (job.config ?? {}) as Partial<{ scope: unknown; session: unknown; report: unknown }>;
+  const merged = { ...config, ...(overrides as object) } as WorkflowConfig;
+
+  await execute(`update analysis_tasks set stage = 'report_generation', error = null where id = $1`, [job.id]);
+  await log(job.id, "info", "report", "重新生成报告（复用已有的三层分析结果）");
+
+  const result = await runReportStage({
+    taskId: job.id,
+    runtime,
+    config: merged,
+    onStep: (message: string) => void log(job.id, "info", "report", message),
+  });
+
+  if (result.engine === "spec") {
+    await log(job.id, "warn", "report", "生成的页面未通过渲染校验，已回退到内置渲染器");
+  }
+
+  await execute(
+    `update analysis_tasks
+     set status = 'completed', stage = 'done', heartbeat_at = now(), finished_at = now(),
+         stats = coalesce(stats, '{}'::jsonb) || $2::jsonb
+     where id = $1`,
+    [
+      job.id,
+      JSON.stringify({
+        report_engine: result.engine,
+        report_attempts: result.attempts,
+        report_rerun_at: new Date().toISOString(),
+      }),
+    ],
+  );
+  await log(job.id, "info", "report", `报告已重新生成（${result.engine === "page" ? "AI 生成页面" : "内置渲染器"}）`);
+}
+
 /* ---------------------------------------------------------------- loop */
 
 async function tick() {
@@ -502,6 +548,18 @@ async function tick() {
         `update template_previews set status = 'failed', error = $2, finished_at = now() where id = $1`,
         [preview.id, err.slice(0, 4000)],
       );
+    });
+  }
+
+  const rerun = await claim<TaskRow>("analysis_tasks", "heartbeat_at = now()", [], "report_pending");
+  if (rerun) {
+    active.add(rerun.id);
+    void run("report-rerun", rerun.id, () => handleReportRerun(rerun), async (err) => {
+      await execute(
+        `update analysis_tasks set status = 'failed', error = $2, finished_at = now() where id = $1`,
+        [rerun.id, err.slice(0, 4000)],
+      );
+      await log(rerun.id, "error", "report", `报告重新生成失败: ${err.slice(0, 600)}`);
     });
   }
 
@@ -581,6 +639,18 @@ async function main() {
  * running at boot could not have a live owner, so put it back in the queue.
  */
 async function recoverStaleJobs() {
+  // A task interrupted while writing its report keeps its three analysis
+  // layers — they were committed before that stage began — so it resumes at
+  // the report alone. Requeuing it from the top would redo hours of model
+  // calls to change nothing but the last step, and would undo the whole point
+  // of the rerun path for a crash that lands in the same place.
+  const resumed = await execute(
+    `update analysis_tasks
+     set status = 'report_pending', started_at = null, heartbeat_at = now()
+     where status = 'running' and stage = 'report_generation'
+       and exists (select 1 from task_global_result g where g.task_id = analysis_tasks.id and g.result is not null)`,
+  );
+
   const [tasks, plans, previews] = await Promise.all([
     execute(
       `update analysis_tasks
@@ -594,7 +664,7 @@ async function recoverStaleJobs() {
     ),
   ]);
   console.log(
-    `[worker] recovered orphaned jobs: tasks=${tasks} planning=${plans} previews=${previews}`,
+    `[worker] recovered orphaned jobs: tasks=${tasks} report-only=${resumed} planning=${plans} previews=${previews}`,
   );
 }
 
