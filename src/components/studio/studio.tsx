@@ -38,8 +38,9 @@ import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { StatusBadge, EmptyState } from "@/components/ui-kit";
+import { ScopeEstimatePanel } from "@/components/scope-estimate";
 import { PromptViewer } from "./prompt-viewer";
-import { cn, compactNumber, formatDate, relativeTime } from "@/lib/utils";
+import { cn, formatDate, relativeTime } from "@/lib/utils";
 import type { ExtraFieldDef, JsonObject } from "@/lib/types";
 
 interface TemplateRow extends JsonObject {
@@ -258,12 +259,16 @@ export function Studio({
     };
   }
 
-  /** The scope the launch would submit. The estimate measures this same one. */
+  /**
+   * The scope the launch would submit. The estimate measures this same one.
+   * The days go over as days: the server reads them in its own timezone, where
+   * an end date covers all of that day.
+   */
   function scopeArgs() {
     return {
       scopeType: scope.type,
-      rangeStart: scope.type === "range" && scope.start ? new Date(scope.start).toISOString() : null,
-      rangeEnd: scope.type === "range" && scope.end ? new Date(scope.end).toISOString() : null,
+      rangeStart: scope.type === "range" ? scope.start || null : null,
+      rangeEnd: scope.type === "range" ? scope.end || null : null,
     };
   }
 
@@ -787,59 +792,7 @@ export function Studio({
             </div>
           </div>
 
-          {estimate ? (
-            <div className="rounded-xl border border-border/70 bg-muted/20 p-3.5">
-              <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-[12.5px]">
-                <span className="font-medium">
-                  按当前配置，本次将分析{" "}
-                  <b className="num text-primary">{estimate.sessions.toLocaleString("zh-CN")}</b> 个会话
-                </span>
-                <span className="text-[11.5px] text-muted-foreground">
-                  （{estimate.mode === "range" ? "时间范围" : "增量未分析"}命中{" "}
-                  {estimate.matched.toLocaleString("zh-CN")} 个
-                  {estimate.matched > estimate.sessions
-                    ? `，受工作流「session 上限 ${estimate.limit}」限制，其余 ${(
-                        estimate.matched - estimate.sessions
-                      ).toLocaleString("zh-CN")} 个留给下次任务`
-                    : "，已全部覆盖"}
-                  ）
-                </span>
-              </div>
-
-              <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
-                {[
-                  { label: "会话", value: compactNumber(estimate.sessions), hint: "每个会话一次模型调用" },
-                  { label: "终端用户", value: compactNumber(estimate.users), hint: "用户层汇总的条数" },
-                  { label: "对话轮次", value: compactNumber(estimate.turns), hint: `约 ${compactNumber(estimate.chars)} 字` },
-                  {
-                    label: "音频片段",
-                    value: estimate.useAudio ? compactNumber(estimate.audioClipsSent) : "不送入",
-                    hint: estimate.useAudio
-                      ? `范围内共 ${compactNumber(estimate.audioClips)} 段，按每会话上限截断`
-                      : `范围内有 ${compactNumber(estimate.audioClips)} 段，会话节点未开启音频`,
-                  },
-                ].map((m) => (
-                  <div key={m.label} className="rounded-lg border border-border/70 bg-card p-2.5">
-                    <div className="text-[11px] text-muted-foreground">{m.label}</div>
-                    <div className="num mt-0.5 text-[15px] font-semibold">{m.value}</div>
-                    <div className="mt-0.5 truncate text-[10.5px] text-muted-foreground">{m.hint}</div>
-                  </div>
-                ))}
-              </div>
-
-              <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11.5px] text-muted-foreground">
-                <span>
-                  预计模型调用 <b className="num text-foreground">{estimate.modelCalls.toLocaleString("zh-CN")}</b> 次
-                  （会话 {compactNumber(estimate.sessions)} + 用户 {compactNumber(estimate.users)} + 全局 1 + 报告 1，不含失败重试）
-                </span>
-                {estimate.firstAt && estimate.lastAt ? (
-                  <span className="num">
-                    数据时间 {formatDate(estimate.firstAt)} ~ {formatDate(estimate.lastAt)}
-                  </span>
-                ) : null}
-              </div>
-            </div>
-          ) : null}
+          {estimate ? <ScopeEstimatePanel estimate={estimate} /> : null}
 
           {confirmed && selected && selected.id !== confirmed.id ? (
             <Button size="sm" variant="outline" className="h-8" onClick={() => void guard(confirm_(), "confirm")}>

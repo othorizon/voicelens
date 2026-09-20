@@ -22,6 +22,7 @@ import "@xyflow/react/dist/style.css";
 import {
   BarChart3,
   Braces,
+  Calculator,
   Check,
   Database,
   Eye,
@@ -39,7 +40,8 @@ import {
 import { NODE_DEFS, type NodeKind, type ParamDef } from "@/lib/workflow/definition";
 import { configFromGraph, defaultGraph, validateGraph, type WfGraph, type WfNodeData } from "@/lib/workflow/graph";
 import { saveWorkflow, resetWorkflow } from "@/lib/actions/workflow";
-import { createAnalysisTask } from "@/lib/actions/tasks";
+import { createAnalysisTask, estimateTaskScope, type ScopeEstimate } from "@/lib/actions/tasks";
+import { ScopeEstimatePanel } from "@/components/scope-estimate";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -142,6 +144,8 @@ export function WorkflowCanvas({
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [launching, setLaunching] = useState(false);
+  const [measuring, setMeasuring] = useState(false);
+  const [estimate, setEstimate] = useState<ScopeEstimate | null>(null);
   const { fitView } = useReactFlow();
 
   const selected = nodes.find((n) => n.id === selectedId);
@@ -168,6 +172,8 @@ export function WorkflowCanvas({
         ),
       );
       setDirty(true);
+      // The figure was measured for the saved graph; an edit retires it.
+      setEstimate(null);
     },
     [setNodes],
   );
@@ -199,6 +205,31 @@ export function WorkflowCanvas({
     setDirty(false);
     toast.success("已恢复默认流水线");
     router.refresh();
+  }
+
+  /**
+   * Measure what this pipeline would take. It saves first, exactly as the
+   * launch does, so the figures describe the graph on screen rather than the
+   * last saved one, and it reads the scope out of the same config the launch
+   * submits.
+   */
+  async function measure() {
+    if (!(await save(true))) return;
+    setMeasuring(true);
+    try {
+      const res = await estimateTaskScope({
+        dataSourceId: sourceId,
+        workflowId,
+        scopeType: config.scope.mode,
+      });
+      setEstimate(res);
+      setSelectedId(null); // the panel lives in the sidebar's config view
+      if (!res.sessions) toast.info("当前范围内没有可分析的会话");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "计算失败");
+    } finally {
+      setMeasuring(false);
+    }
   }
 
   async function launch() {
@@ -246,6 +277,16 @@ export function WorkflowCanvas({
         <Button size="sm" variant="outline" className="h-8" onClick={() => void save()} disabled={saving}>
           {saving ? <Loader2 className="size-3.5 animate-spin" /> : <Save className="size-3.5" />}
           保存
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-8"
+          onClick={() => void measure()}
+          disabled={measuring || saving}
+        >
+          {measuring ? <Loader2 className="size-3.5 animate-spin" /> : <Calculator className="size-3.5" />}
+          计算数据量
         </Button>
         <Button size="sm" className="h-8" onClick={launch} disabled={launching || !templateReady}>
           {launching ? <Loader2 className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5" />}
@@ -341,6 +382,7 @@ export function WorkflowCanvas({
             </div>
           ) : (
             <div className="p-4">
+              {estimate ? <ScopeEstimatePanel estimate={estimate} compact className="mb-4" /> : null}
               <h3 className="text-[13px] font-semibold">解析后的执行配置</h3>
               <p className="mt-1 mb-3 text-[11.5px] leading-relaxed text-muted-foreground">
                 点击画布上的节点可编辑参数。下面是引擎实际读取到的配置。

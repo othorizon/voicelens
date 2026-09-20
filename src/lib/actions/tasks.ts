@@ -4,6 +4,7 @@ import { revalidatePath } from "next/cache";
 import { requireSourceAccess, requireTaskAccess, ActionError } from "./common";
 import { execute, maybeOne, one } from "@/lib/db";
 import { countScope, resolveScope } from "@/lib/engine/sampler";
+import { rangeBound } from "@/lib/server-time";
 import { configFromGraph, normalizeGraph } from "@/lib/workflow/graph";
 import type { JsonObject } from "@/lib/types";
 
@@ -13,7 +14,9 @@ export interface CreateTaskInput {
   templateId?: string | null;
   name?: string;
   scopeType?: "incremental" | "range";
+  /** A day (`2026-03-08`), read in the server's timezone, or a full instant. */
   rangeStart?: string | null;
+  /** A day covers all of it: the bound lands on 23:59:59.999 of that day. */
   rangeEnd?: string | null;
   config?: JsonObject;
 }
@@ -68,7 +71,9 @@ export async function createAnalysisTask(input: CreateTaskInput): Promise<{ task
   if (!template) throw new ActionError("还没有可用的执行模板，请先在「分析工作台」完成规划与预览");
 
   const scopeType = input.scopeType === "range" ? "range" : "incremental";
-  if (scopeType === "range" && !input.rangeStart && !input.rangeEnd) {
+  const rangeStart = rangeBound(input.rangeStart, "start");
+  const rangeEnd = rangeBound(input.rangeEnd, "end");
+  if (scopeType === "range" && !rangeStart && !rangeEnd) {
     throw new ActionError("按时间范围分析时请至少设置一个时间边界");
   }
 
@@ -90,8 +95,8 @@ export async function createAnalysisTask(input: CreateTaskInput): Promise<{ task
         input.workflowId,
         name,
         scopeType,
-        input.rangeStart ?? null,
-        input.rangeEnd ?? null,
+        rangeStart,
+        rangeEnd,
         JSON.stringify(input.config ?? {}),
         JSON.stringify({ stage: "queued", total: 0, done: 0 }),
         userId,
@@ -149,6 +154,7 @@ export async function estimateTaskScope(input: {
   dataSourceId: string;
   workflowId: string | null;
   scopeType?: "incremental" | "range";
+  /** Same shape as a task's bounds, resolved the same way. */
   rangeStart?: string | null;
   rangeEnd?: string | null;
 }): Promise<ScopeEstimate> {
@@ -174,8 +180,8 @@ export async function estimateTaskScope(input: {
         : config.scope.mode === "range"
           ? "range"
           : "incremental";
-  const rangeStart = input.rangeStart ?? null;
-  const rangeEnd = input.rangeEnd ?? null;
+  const rangeStart = rangeBound(input.rangeStart, "start");
+  const rangeEnd = rangeBound(input.rangeEnd, "end");
   if (mode === "range" && !rangeStart && !rangeEnd) {
     throw new ActionError("按时间范围分析时请至少设置一个时间边界");
   }
