@@ -24,7 +24,14 @@ const TABS = [
   { key: "report", label: "报告生成提示词", hint: "接收三层结果，规划报告章节、图表选型与下探入口，输出报告结构 JSON。" },
 ] as const;
 
-export function PromptViewer({ template }: { template: TemplatePrompt }) {
+export function PromptViewer({
+  template,
+  onSaved,
+}: {
+  template: TemplatePrompt;
+  /** Saving forks a new version; the page has to pull it in and select it. */
+  onSaved?: (created: { id: string; version: number }) => void | Promise<void>;
+}) {
   const [tab, setTab] = useState<string>("session");
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState<Record<string, string>>({});
@@ -42,6 +49,7 @@ export function PromptViewer({ template }: { template: TemplatePrompt }) {
         toast.success(`已保存为新版本 v${res.version}`);
         setDraft({});
         setEditing(false);
+        await onSaved?.(res);
       } catch (e) {
         toast.error(e instanceof Error ? e.message : "保存失败");
       }

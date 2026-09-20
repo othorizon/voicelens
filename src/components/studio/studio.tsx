@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
@@ -117,6 +117,9 @@ export function Studio({
   const [selectedId, setSelectedId] = useState<string | null>(
     initial.templates.find((t) => t.status === "confirmed")?.id ?? initial.templates[0]?.id ?? null,
   );
+  // Versions already on screen, so a poll can tell an arriving one apart from
+  // the ones the user is looking at.
+  const knownTemplateIds = useRef<Set<string>>(new Set(initial.templates.map((t) => t.id)));
   const [plan, setPlan] = useState<PlanningParams>(runParams.plan);
   const [previewParams, setPreviewParams] = useState(runParams.preview);
   const [feedback, setFeedback] = useState("");
@@ -142,11 +145,20 @@ export function Studio({
       const res = await fetch(`/api/sources/${sourceId}/studio-state`);
       if (!res.ok) return;
       const json = (await res.json()) as StudioState;
+      const templates = (json.templates ?? []) as TemplateRow[];
+      // A version that was not there on the previous poll came from the
+      // planning job (or manual edit) the user just ran, so move the selection
+      // onto it: previewing and replanning both follow the selection, and
+      // leaving it on the old version would silently run the wrong prompts.
+      const known = knownTemplateIds.current;
+      const arrived = templates.some((t) => !known.has(t.id));
+      knownTemplateIds.current = new Set(templates.map((t) => t.id));
       setState({
-        templates: (json.templates ?? []) as TemplateRow[],
+        templates,
         jobs: (json.jobs ?? []) as JobRow[],
         previews: (json.previews ?? []).map((p) => ({ ...p, hasHtml: Boolean(p.hasHtml) })) as PreviewRow[],
       });
+      if (arrived && templates.length) setSelectedId(templates[0].id);
     } catch {
       /* ignore transient polling errors */
     }
@@ -158,7 +170,9 @@ export function Studio({
     return () => clearInterval(t);
   }, [polling]);
 
-  // Auto-select the newest template once planning finishes.
+  // Nothing selected yet (the source had no template when the page rendered):
+  // fall back to the newest one. New versions arriving later are selected by
+  // `poll` instead.
   useEffect(() => {
     if (!selectedId && state.templates.length) setSelectedId(state.templates[0].id);
   }, [selectedId, state.templates]);
@@ -488,7 +502,18 @@ export function Studio({
                 </CardContent>
               </Card>
 
-              <PromptViewer template={selected} />
+              {/* Keyed by template: a half-typed draft belongs to the version
+                  it was started on, not to whichever one is selected next. */}
+              <PromptViewer
+                key={selected.id}
+                template={selected}
+                onSaved={async (created) => {
+                  // Pull the new version into the list first, then select it,
+                  // so the selection never lands on a row that is not there yet.
+                  await poll();
+                  setSelectedId(created.id);
+                }}
+              />
             </div>
           ) : null}
         </div>
