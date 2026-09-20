@@ -40,6 +40,8 @@ import {
 } from "./analyze";
 import type { DrillData, DrillSession, DrillUser } from "./report-html";
 import { renderReportHtml } from "./report-html";
+import { buildReportPayload } from "./report-payload";
+import { generateReportPage } from "./report-generate";
 import { deriveGroundTruth, type HistogramEntry } from "./ground-truth";
 
 export interface DataSourceLike {
@@ -474,7 +476,8 @@ export interface PreviewOutput {
   userResults: { user_key: string; result: UserAnalysis }[];
   globalResult: JsonObject;
   stats: JsonObject;
-  spec: ReportSpec;
+  /** Only set when the page could not be generated and the renderer ran. */
+  spec: ReportSpec | null;
   html: string;
 }
 
@@ -611,27 +614,11 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
 
   progress({ stage: "report", done: 0, total: 1, message: "生成预览报告" });
   const evidence = collectEvidence(sessionResults);
+  const messageCount = sessions.reduce((n, s) => n + (s.turn_count ?? 0), 0);
   const groundTruth = deriveGroundTruth(histograms, dataSource.extra_schema ?? [], {
     sessions: sessionResults.length,
-    messages: sessions.reduce((n, s) => n + (s.turn_count ?? 0), 0),
+    messages: messageCount,
   });
-  const { spec } = await generateReport({
-    template,
-    runtime: input.runtime,
-    title: `${dataSource.name} · 预览报告`,
-    scopeNote: `预览样本 ${sessionResults.length} 个会话 / ${userAgg.length} 位用户（非全量）`,
-    globalResult: globalResult as JsonObject,
-    userResults: userAgg as unknown as { user_key: string; result: JsonObject }[],
-    sessionStats: stats,
-    distributions: histograms,
-    groundTruth,
-    language: "zh",
-    includeEvidence: true,
-    tone: "客观、数据驱动、结论先行；这是预览报告，样本量较小，措辞需要保守，不要使用超出证据强度的判断",
-    targetSections: 6,
-    evidence,
-  });
-  progress({ stage: "report", done: 1, total: 1 });
 
   const drill = buildDrillData(sessions as never, sessionResults, userAgg);
   const audio: AudioUsage = {
@@ -641,13 +628,87 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
     ...audioUse,
   };
 
-  const html = renderReportHtml({
-    spec,
-    drill,
-    generatedAt: new Date().toISOString(),
-    scopeNote: `预览样本 ${sessionResults.length} 个会话 / ${userAgg.length} 位用户`,
+  const scopeNote = `预览样本 ${sessionResults.length} 个会话 / ${userAgg.length} 位用户（非全量）`;
+  const tone =
+    "客观、数据驱动、结论先行；这是预览报告，样本量较小，措辞需要保守，不要使用超出证据强度的判断";
+
+  // Assembled by the same builder the full run uses, so the page sees
+  // identical field names and shapes in both. A preview that differed in
+  // shape from the run would be a rehearsal of the wrong thing.
+  const payload = buildReportPayload({
+    title: `${dataSource.name} · 预览报告`,
+    taskName: `${dataSource.name} · 预览`,
+    templateVersion: null,
+    scopeNote,
+    language: "zh",
+    tone,
+    includeEvidence: true,
+    sessionResults: results.map((r) => ({
+      session_key: r.session.session_key,
+      user_key: r.session.user_key,
+      started_at: r.session.started_at ?? null,
+      turn_count: r.session.turn_count ?? 0,
+      result: r.result,
+    })),
+    userResults: userAgg,
+    globalResult: globalResult as JsonObject,
+    stats,
+    distributions: histograms.map((h) => ({ key: h.key, label: h.key, items: h.values })),
+    groundTruth,
+    evidence,
+    messages: messageCount,
     audio,
   });
+
+  // A preview is a dozen sessions, so its detail rows travel inside the
+  // document. Drill-down then works with no host and no endpoint — and it is
+  // exercised during validation rather than failing for want of a parent.
+  const snapshot = {
+    users: drill.users.map((u) => ({ ...u, session_keys: u.sessions ?? [] })),
+    sessions: drill.sessions as unknown as JsonObject[],
+  };
+
+  const generated = await generateReportPage({
+    runtime: input.runtime,
+    brief: template.report_prompt,
+    payload,
+    snapshot,
+    onStep: (message: string) => progress({ stage: "report", done: 0, total: 1, message }),
+  });
+
+  let spec: ReportSpec | null = null;
+  let html = generated.document;
+
+  if (!generated.validation.ok) {
+    // The preview is what the operator judges the template by, so it must
+    // exist even when the page could not be made to render.
+    progress({ stage: "report", done: 0, total: 1, message: "页面未通过校验，回退到内置渲染器" });
+    const fallback = await generateReport({
+      template,
+      runtime: input.runtime,
+      title: `${dataSource.name} · 预览报告`,
+      scopeNote,
+      globalResult: globalResult as JsonObject,
+      userResults: userAgg as unknown as { user_key: string; result: JsonObject }[],
+      sessionStats: stats,
+      distributions: histograms,
+      groundTruth,
+      language: "zh",
+      includeEvidence: true,
+      tone,
+      targetSections: 6,
+      evidence,
+    });
+    spec = fallback.spec;
+    html = renderReportHtml({
+      spec,
+      drill,
+      generatedAt: new Date().toISOString(),
+      scopeNote: `预览样本 ${sessionResults.length} 个会话 / ${userAgg.length} 位用户`,
+      audio,
+    });
+  }
+  progress({ stage: "report", done: 1, total: 1 });
 
   return {
     sessionResults,
@@ -655,7 +716,13 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
     globalResult: globalResult as JsonObject,
     // `failures` rides along with the stats rather than the model-facing copy:
     // the workbench needs to show it, the report prompt must not see it.
-    stats: { ...stats, failures: failures.slice(0, 20), failure_count: failures.length },
+    stats: {
+      ...stats,
+      failures: failures.slice(0, 20),
+      failure_count: failures.length,
+      report_engine: generated.validation.ok ? "page" : "spec",
+      report_attempts: generated.attempts,
+    },
     spec,
     html,
   };

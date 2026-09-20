@@ -3,9 +3,9 @@ import { generateReport } from "./analyze";
 import { buildDrillData, collectEvidence, computeStats, extraHistogramForSessions } from "./plan";
 import { deriveGroundTruth, type GroundTruth } from "./ground-truth";
 import { renderReportHtml } from "./report-html";
-import { buildDataProfile } from "./report-profile";
 import { generateReportPage } from "./report-generate";
-import { composeReportDocument, type ReportPayload, type ReportSessionRow, type ReportUserRow } from "./report-runtime";
+import { buildReportPayload } from "./report-payload";
+import { composeReportDocument } from "./report-runtime";
 import type { ValidationResult } from "./report-validate";
 import type { AnalysisRuntime } from "@/lib/models/registry";
 import type { WorkflowConfig } from "@/lib/workflow/definition";
@@ -123,91 +123,6 @@ export async function loadReportStageInputs(taskId: string): Promise<ReportStage
   };
 }
 
-/* ---------------------------------------------------------------- payload */
-
-function userRow(u: { user_key: string; result: UserAnalysis }): ReportUserRow {
-  return {
-    user_key: u.user_key,
-    persona: u.result.persona ?? "",
-    summary: u.result.summary ?? "",
-    session_count: u.result.session_count ?? 0,
-    risk_level: u.result.risk_level ?? "none",
-    tags: u.result.tags ?? [],
-    metrics: u.result.metrics ?? [],
-  };
-}
-
-function sessionRow(s: { session_key: string; user_key: string; result: SessionAnalysis }): ReportSessionRow {
-  return {
-    session_key: s.session_key,
-    user_key: s.user_key,
-    started_at: null,
-    turn_count: s.result.metrics?.find((m) => m.key === "turns")?.value ?? 0,
-    summary: s.result.summary ?? "",
-    intent: s.result.intent ?? "",
-    outcome: s.result.outcome ?? "",
-    sentiment: s.result.sentiment ?? "",
-    quality_score: typeof s.result.quality_score === "number" ? s.result.quality_score : null,
-    risk_level: s.result.risk_level ?? "none",
-    tags: s.result.tags ?? [],
-  };
-}
-
-/** How many detail rows ride along in the page itself. */
-const INLINE_USERS = 100;
-const INLINE_SESSIONS = 100;
-
-export async function buildReportPayload(input: {
-  inputs: ReportStageInputs;
-  config: WorkflowConfig;
-  scopeNote: string;
-  stats: JsonObject;
-  distributions: { key: string; label: string; unit?: string; items: { name: string; value: number }[] }[];
-  groundTruth: GroundTruth | null;
-  audio?: AudioUsage;
-  models?: JsonObject;
-}): Promise<ReportPayload> {
-  const { inputs, config } = input;
-  const messages = inputs.sessionResults.reduce(
-    (n, r) => n + (r.result.metrics?.find((m) => m.key === "turns")?.value ?? 0),
-    0,
-  );
-
-  return {
-    meta: {
-      title: inputs.task.name || "分析报告",
-      scopeNote: input.scopeNote,
-      generatedAt: new Date().toISOString(),
-      taskName: inputs.task.name,
-      templateVersion: inputs.templateVersion,
-      language: config.report.language,
-      tone: config.report.tone,
-      includeEvidence: config.report.includeEvidence,
-      audio: input.audio as JsonObject | undefined,
-      models: input.models,
-    },
-    profile: buildDataProfile({
-      sessionResults: inputs.sessionResults,
-      userResults: inputs.userResults,
-      messages,
-      available: { users: inputs.userResults.length, sessions: inputs.sessionResults.length },
-    }),
-    groundTruth: input.groundTruth,
-    global: inputs.globalResult,
-    stats: input.stats,
-    distributions: input.distributions,
-    evidence: config.report.includeEvidence ? collectEvidence(inputs.sessionResults) : [],
-    users: {
-      rows: inputs.userResults.slice(0, INLINE_USERS).map(userRow),
-      total: inputs.userResults.length,
-    },
-    sessions: {
-      rows: inputs.sessionResults.slice(0, INLINE_SESSIONS).map(sessionRow),
-      total: inputs.sessionResults.length,
-    },
-  };
-}
-
 /* -------------------------------------------------------------------- run */
 
 export async function runReportStage(input: {
@@ -238,17 +153,22 @@ export async function runReportStage(input: {
   });
 
   const scopeNote = describeScope(inputs, inputs.sessionResults.length, inputs.userResults.length);
-  const payload = await buildReportPayload({
-    inputs,
-    config: input.config,
+  const payload = buildReportPayload({
+    title: inputs.task.name || "分析报告",
+    taskName: inputs.task.name,
+    templateVersion: inputs.templateVersion,
     scopeNote,
+    language: input.config.report.language,
+    tone: input.config.report.tone,
+    includeEvidence: input.config.report.includeEvidence,
+    sessionResults: inputs.sessionResults,
+    userResults: inputs.userResults,
+    globalResult: inputs.globalResult,
     stats,
-    distributions: distributions.map((d) => ({
-      key: d.key,
-      label: d.key,
-      items: d.values,
-    })),
+    distributions: distributions.map((d) => ({ key: d.key, label: d.key, items: d.values })),
     groundTruth,
+    evidence: collectEvidence(inputs.sessionResults),
+    messages,
     audio: input.audio,
     models: input.models,
   });

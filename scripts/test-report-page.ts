@@ -5,7 +5,11 @@
  * expect. Run: npm run test:report
  */
 import { buildDataProfile } from "../src/lib/engine/report-profile";
-import { composeReportDocument, type ReportPayload } from "../src/lib/engine/report-runtime";
+import {
+  composeReportDocument,
+  type ReportPayload,
+  type ReportSnapshot,
+} from "../src/lib/engine/report-runtime";
 import { renderIssues, validateReportDocument } from "../src/lib/engine/report-validate";
 import type { SessionAnalysis, UserAnalysis } from "../src/lib/types";
 
@@ -122,6 +126,62 @@ VL.ready(function () {
 });
 </script></body></html>`;
 
+/**
+ * Drill-down with no host, which is how a preview runs: the detail rows ride
+ * inside the document and VL's async methods resolve from them. Validation
+ * has no parent window either, so this is also the only way async calls can
+ * be exercised at all.
+ */
+const SNAPSHOT_PAGE = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>t</title></head>
+<body><main id="app">载入中</main><script>
+VL.ready(async function () {
+  var app = document.getElementById('app'), out = '<h1>' + VL.escape(VL.meta.title) + '</h1>';
+  out += '<p>' + VL.escape(VL.global.summary) + '</p>';
+
+  var first = await VL.listUsers({ page: 1, size: 40, sort: 'session_count', order: 'desc' });
+  out += '<h2>用户 ' + first.total + ' 位</h2>';
+  first.rows.forEach(function (u) {
+    out += '<div>' + VL.escape(u.user_key) + ' · ' + VL.escape(u.persona) + ' · '
+         + u.session_count + ' 会话 · ' + VL.escape(u.summary) + '</div>';
+  });
+
+  var hit = await VL.listUsers({ q: 'u-1', size: 200 });
+  out += '<p>搜索 u-1 命中 ' + hit.total + ' 位</p>';
+
+  var one = await VL.getUser(first.rows[0].user_key);
+  out += '<p>该用户会话数 ' + (one.session_keys || []).length + '</p>';
+
+  var sess = await VL.getSession('s-0');
+  out += '<h3>' + VL.escape(sess.session_key) + '</h3>';
+  out += '<p>转录 ' + (sess.transcript || []).length + ' 条</p>';
+  (sess.transcript || []).slice(0, 3).forEach(function (t) {
+    out += '<blockquote>' + VL.escape(t.role) + '：' + VL.escape(t.text) + '</blockquote>';
+  });
+
+  app.innerHTML = out;
+  VL.done();
+});
+</script></body></html>`;
+
+function snapshot(): ReportSnapshot {
+  return {
+    users: fakeUsers(40).map((u) => ({
+      user_key: u.user_key,
+      ...u.result,
+      session_keys: [`s-${u.user_key.slice(2)}`],
+    })),
+    sessions: fakeSessions(40).map((s) => ({
+      session_key: s.session_key,
+      user_key: s.user_key,
+      ...s.result,
+      transcript: [
+        { role: "user", text: "我要改套餐" },
+        { role: "assistant", text: "好的，正在为您查询" },
+      ],
+    })),
+  };
+}
+
 /** Three separate contract violations in one page. */
 const BAD_PAGE = `<!doctype html><html><head><title>x</title></head><body><div id="a"></div><script>
 localStorage.setItem('k', '1');
@@ -142,6 +202,19 @@ async function main() {
   console.log("ok:", good.ok, "| stats:", JSON.stringify(good.stats));
   if (good.issues.length) console.log(renderIssues(good.issues));
   if (!good.ok) { failures++; console.log("!! 合格页面被误判为失败"); }
+
+  console.log("\n== 自带数据的页面（预览形态：无宿主下探） ==");
+  const snap = await validateReportDocument(composeReportDocument(SNAPSHOT_PAGE, p, snapshot()), {
+    screenshot: false,
+  });
+  console.log("ok:", snap.ok, "| stats:", JSON.stringify(snap.stats));
+  if (snap.issues.length) console.log(renderIssues(snap.issues));
+  if (!snap.ok) { failures++; console.log("!! 自带数据的页面未通过校验"); }
+
+  console.log("\n== 无数据时同一页面应当失败（证明上面确实走了 snapshot） ==");
+  const nohost = await validateReportDocument(composeReportDocument(SNAPSHOT_PAGE, p), { screenshot: false });
+  console.log("ok:", nohost.ok);
+  if (nohost.ok) { failures++; console.log("!! 没有 snapshot 也通过了，下探并未真正执行"); }
 
   console.log("\n== 问题页面 ==");
   const bad = await validateReportDocument(composeReportDocument(BAD_PAGE, p), { screenshot: false });

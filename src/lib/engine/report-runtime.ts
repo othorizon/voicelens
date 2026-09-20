@@ -114,24 +114,51 @@ export const VL_RUNTIME_JS = String.raw`
     if (d.error) p.reject(new Error(d.error)); else p.resolve(d.data);
   });
 
-  /* Offline snapshot: an exported report keeps working with no host. */
+  /* A report whose data travels with it — a preview, or an exported file —
+     answers the same calls locally. Filtering and sorting are reimplemented
+     rather than ignored: a search box that works in the preview and quietly
+     does nothing in the real report is worse than no preview at all. */
   function fromSnapshot(method, a) {
-    var page = function (rows, args) {
-      args = args || {};
-      var size = Math.min(200, Math.max(1, args.size || 50));
-      var start = Math.max(0, ((args.page || 1) - 1) * size);
-      return { rows: rows.slice(start, start + size), total: rows.length, page: args.page || 1, size: size };
-    };
-    if (method === 'listUsers') return page(SNAP.users || [], a);
+    a = a || {};
+    var asc = String(a.order).toLowerCase() === 'asc';
+
+    function match(row, fields) {
+      if (!a.q) return true;
+      var q = String(a.q).toLowerCase();
+      for (var i = 0; i < fields.length; i++) {
+        if (String(row[fields[i]] == null ? '' : row[fields[i]]).toLowerCase().indexOf(q) !== -1) return true;
+      }
+      return false;
+    }
+    function sort(rows, key, fallback) {
+      var k = key || fallback;
+      return rows.slice().sort(function (x, y) {
+        var a1 = x[k], b1 = y[k];
+        if (typeof a1 === 'number' && typeof b1 === 'number') return asc ? a1 - b1 : b1 - a1;
+        a1 = String(a1 == null ? '' : a1); b1 = String(b1 == null ? '' : b1);
+        return asc ? (a1 < b1 ? -1 : a1 > b1 ? 1 : 0) : (a1 > b1 ? -1 : a1 < b1 ? 1 : 0);
+      });
+    }
+    function page(rows) {
+      var size = Math.min(200, Math.max(1, a.size || 50));
+      var p = Math.max(1, a.page || 1);
+      return { rows: rows.slice((p - 1) * size, (p - 1) * size + size), total: rows.length, page: p, size: size };
+    }
+
+    if (method === 'listUsers') {
+      var users = (SNAP.users || []).filter(function (u) { return match(u, ['user_key', 'persona', 'summary']); });
+      return page(sort(users, a.sort, 'session_count'));
+    }
     if (method === 'listSessions') {
-      var rows = SNAP.sessions || [];
-      if (a && a.userKey) rows = rows.filter(function (s) { return s.user_key === a.userKey; });
-      return page(rows, a);
+      var rows = (SNAP.sessions || []).filter(function (s) {
+        return (!a.userKey || s.user_key === a.userKey) && match(s, ['session_key', 'summary']);
+      });
+      return page(sort(rows, a.sort, 'session_key'));
     }
     if (method === 'getUser') return (SNAP.users || []).filter(function (u) { return u.user_key === a.userKey; })[0] || null;
     if (method === 'getSession') return (SNAP.sessions || []).filter(function (s) { return s.session_key === a.sessionKey; })[0] || null;
     if (method === 'audioClip') return null;
-    throw new Error('VL: 离线报告不支持 ' + method);
+    throw new Error('VL: 这份报告不支持 ' + method);
   }
 
   function call(method, args) {
@@ -226,10 +253,15 @@ const HEAD_INJECT = /<head[^>]*>/i;
  * handed to the browser through `srcdoc`, which carries no response headers,
  * so the policy has to travel inside the document.
  */
-export function composeReportDocument(html: string, payload: ReportPayload): string {
+export function composeReportDocument(
+  html: string,
+  payload: ReportPayload,
+  snapshot?: ReportSnapshot | null,
+): string {
   const head = [
     `<meta http-equiv="Content-Security-Policy" content="${REPORT_CSP.replace(/"/g, "&quot;")}">`,
     `<script>window.__VL_PAYLOAD__=${serialize(payload)};</script>`,
+    ...(snapshot ? [`<script>window.__VL_SNAPSHOT__=${serialize(snapshot)};</script>`] : []),
     `<script>${VL_RUNTIME_JS}</script>`,
   ].join("\n");
 
@@ -238,8 +270,17 @@ export function composeReportDocument(html: string, payload: ReportPayload): str
   return `<!doctype html><html lang="zh-CN"><head>\n${head}\n</head><body>\n${html}\n</body></html>`;
 }
 
+/**
+ * Detail rows carried by the document itself, for a report small enough not
+ * to need a host: `VL`'s async methods then resolve from here.
+ */
+export interface ReportSnapshot {
+  users: JsonObject[];
+  sessions: JsonObject[];
+}
+
 /** `</script>` inside the JSON would close the tag it lives in. */
-function serialize(payload: ReportPayload): string {
+function serialize(payload: ReportPayload | ReportSnapshot): string {
   return JSON.stringify(payload)
     .replace(/</g, "\\u003c")
     .replace(/\u2028/g, "\\u2028")

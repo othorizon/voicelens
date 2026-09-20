@@ -2,7 +2,12 @@ import { chat, type ChatMessage } from "./ai";
 import { requireModel, type AnalysisRuntime } from "@/lib/models/registry";
 import { stageOptions, textModelKind } from "@/lib/models/mode";
 import { renderDataProfile } from "./report-profile";
-import { composeReportDocument, VL_API_DOC, type ReportPayload } from "./report-runtime";
+import {
+  composeReportDocument,
+  VL_API_DOC,
+  type ReportPayload,
+  type ReportSnapshot,
+} from "./report-runtime";
 import {
   renderIssues,
   validateReportDocument,
@@ -32,6 +37,12 @@ export interface GeneratePageInput {
   /** The planner's report prompt, used here as the design brief. */
   brief: string;
   payload: ReportPayload;
+  /**
+   * Detail rows to carry inside the document, for a report small enough to
+   * need no host. Validation then exercises drill-down for real instead of
+   * watching every call fail for want of a parent window.
+   */
+  snapshot?: ReportSnapshot | null;
   /** Total tries including the first; each retry sees the previous failures. */
   maxAttempts?: number;
   onStep?: (message: string) => void;
@@ -189,10 +200,10 @@ export async function generateReportPage(input: GeneratePageInput): Promise<Gene
       };
     } else {
       step(`校验页面（第 ${attempt} 次）`);
-      validation = await validateReportDocument(composeReportDocument(page, input.payload));
+      validation = await validateReportDocument(composeReportDocument(page, input.payload, input.snapshot));
     }
 
-    const document = composeReportDocument(page, input.payload);
+    const document = composeReportDocument(page, input.payload, input.snapshot);
     const errors = validation.issues.filter((i) => i.level === "error").length;
 
     if (validation.ok) {
