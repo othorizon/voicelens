@@ -100,6 +100,7 @@ export default async function SourceLayout({
               { href: `/sources/${id}/data`, label: "会话数据", icon: "messages-square" },
               { href: `/sources/${id}/import`, label: "导入", icon: "upload" },
               { href: `/sources/${id}/schema`, label: "字段 Schema", icon: "braces" },
+              { href: `/sources/${id}/models`, label: "分析模型", icon: "cpu" },
               { href: `/sources/${id}/workflow`, label: "工作流", icon: "workflow" },
               { href: `/sources/${id}/studio`, label: "分析工作台", icon: "sparkles" },
             ]}

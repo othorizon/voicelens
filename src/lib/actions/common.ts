@@ -46,6 +46,20 @@ export async function requireAdminSession(): Promise<Session> {
   return session;
 }
 
+/**
+ * Model registry — owner only, one step above `requireAdminSession`.
+ *
+ * These actions handle the model API keys, which are infrastructure
+ * credentials for the whole workspace rather than anyone's data. Choosing
+ * *which* configured model a data source uses is a different, lower bar and
+ * goes through `requireSourceAccess`.
+ */
+export async function requireOwnerSession(): Promise<Session> {
+  const session = await requireSession();
+  if (session.role !== "owner") fail("只有所有者可以配置模型");
+  return session;
+}
+
 /** The creator filter for a list query that spans data sources. */
 export function ownerScope(session: Session): string | null {
   return scopeOf(session);

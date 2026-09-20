@@ -1,15 +1,12 @@
 import { callJson, execute, scalar } from "@/lib/db";
-import { chatJson } from "./ai";
 import { describeExtraSchema } from "./prompts";
-import { resolveScope, loadSessions, loadSessionAudio } from "./sampler";
+import { resolveScope, loadSessions } from "./sampler";
 import {
   aggregateGlobal,
   aggregateUser,
   analyzeSession,
   generateReport,
   mapLimit,
-  normalizeSessionResult,
-  signedAudioUrls,
 } from "./analyze";
 import {
   buildDrillData,
@@ -31,6 +28,8 @@ import type {
   UserAnalysis,
 } from "@/lib/types";
 import type { WorkflowConfig } from "@/lib/workflow/definition";
+import { describeRuntime, type AnalysisRuntime } from "@/lib/models/registry";
+import { MODE_LABEL } from "@/lib/models/mode";
 
 export interface TaskRow {
   id: string;
@@ -80,7 +79,11 @@ export async function heartbeat(taskId: string, progress?: JsonObject) {
 }
 
 /** Full pipeline: collect → session → user → global → report. */
-export async function runTask(task: TaskRow, config: WorkflowConfig): Promise<void> {
+export async function runTask(
+  task: TaskRow,
+  config: WorkflowConfig,
+  runtime: AnalysisRuntime,
+): Promise<void> {
   const taskId = task.id;
   const startedAt = new Date().toISOString();
   await execute(
@@ -90,6 +93,13 @@ export async function runTask(task: TaskRow, config: WorkflowConfig): Promise<vo
     [taskId, startedAt],
   );
   await log(taskId, "info", "collect", "任务开始执行");
+  await log(
+    taskId,
+    "info",
+    "collect",
+    `分析模式：${MODE_LABEL[runtime.mode]}`,
+    describeRuntime(runtime) as unknown as JsonObject,
+  );
 
   try {
     /* ------------------------------------------------------- 1. scope */
@@ -132,6 +142,9 @@ export async function runTask(task: TaskRow, config: WorkflowConfig): Promise<vo
     // Audio degrades silently, so count what actually reached the model rather
     // than trusting the switch. See AudioUsage.
     const audioUse = { sessionsWithAudio: 0, clipsAttached: 0, clipsUnavailable: 0 };
+    // Which routing each session actually took. The mode alone does not say:
+    // under a two-pass mode, a session with no audio still runs single-pass.
+    const strategyUse: Record<string, number> = {};
     const results: { session_key: string; user_key: string; result: SessionAnalysis; session: SessionRecord }[] = [];
 
     const CHUNK = 40;
@@ -145,14 +158,16 @@ export async function runTask(task: TaskRow, config: WorkflowConfig): Promise<vo
         let lastError = "";
         for (let attempt = 0; attempt <= config.session.retries; attempt++) {
           try {
-            const { result, tokens: used, audio } = await analyzeSession({
+            const { result, tokens: used, audio, strategy } = await analyzeSession({
               session,
               template: task.template,
+              runtime,
               useAudio: config.session.useAudio,
               maxAudiosPerSession: config.session.maxAudiosPerSession,
               extraSchemaHint: extraHint,
             });
             tokens += used;
+            strategyUse[strategy] = (strategyUse[strategy] ?? 0) + 1;
             if (audio.attached > 0) audioUse.sessionsWithAudio++;
             audioUse.clipsAttached += audio.attached;
             audioUse.clipsUnavailable += audio.requested - audio.attached;
@@ -270,7 +285,11 @@ export async function runTask(task: TaskRow, config: WorkflowConfig): Promise<vo
         const all = byUser.get(key)!;
         const used = all.slice(0, config.user.maxSessionsPerUser);
         try {
-          const { result } = await aggregateUser({ user_key: key, sessions: used }, task.template);
+          const { result } = await aggregateUser(
+            { user_key: key, sessions: used },
+            task.template,
+            runtime,
+          );
           return { key, result, error: null as string | null, n: all.length };
         } catch (e) {
           return {
@@ -348,6 +367,7 @@ export async function runTask(task: TaskRow, config: WorkflowConfig): Promise<vo
         userCount: userAgg.length,
       },
       task.template,
+      runtime,
       config.global.maxUsersInPrompt,
     );
 
@@ -393,6 +413,7 @@ export async function runTask(task: TaskRow, config: WorkflowConfig): Promise<vo
     );
     const { spec, overrides } = await generateReport({
       template: task.template,
+      runtime,
       title: task.name || `${task.dataSource.name} 分析报告`,
       scopeNote: describeScope(task, scope.sessionIds.length, userKeys.length),
       globalResult: globalResult as unknown as JsonObject,
@@ -462,7 +483,8 @@ export async function runTask(task: TaskRow, config: WorkflowConfig): Promise<vo
           users: userKeys.length,
           tokens,
           duration_ms: Date.now() - Date.parse(startedAt),
-          model: process.env.AI_MODEL ?? "qwen3.8-omni-flash",
+          models: describeRuntime(runtime),
+          session_strategies: strategyUse,
           metric_overrides: overrides.length,
           audio,
         }),

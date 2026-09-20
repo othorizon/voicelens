@@ -4,7 +4,7 @@
 按「会话 → 用户 → 全局」三层视角由 AI 自主规划分析口径，最终产出**可下探的单页 HTML 报告**。
 
 技术栈：Next.js 15 (App Router) · React 19 · shadcn/ui · Tailwind v4 · React Flow ·
-PostgreSQL（pg 直连）· S3 兼容对象存储（阿里云 OSS）· qwen3.8-omni-flash（文本/图像/音频输入）
+PostgreSQL（pg 直连）· S3 兼容对象存储（阿里云 OSS）· 任意 OpenAI 兼容模型（多模态 / omni，后台可配多套）
 
 ---
 
@@ -38,6 +38,7 @@ PostgreSQL（pg 直连）· S3 兼容对象存储（阿里云 OSS）· qwen3.8-o
 | `src/app/pending/` | 无权限账号的等待开通页 |
 | `src/app/api/` | 分片直传签名、导入入队、示例数据、报告 HTML、音频签名代理、轮询状态 |
 | `src/lib/engine/` | 分析引擎：归一化、抽样、提示词、三层分析、报告渲染 |
+| `src/lib/models/` | 模型注册表：四种分析模式的路由规则、API Key 加解密、配置解析 |
 | `src/lib/schema-file.ts` | extra 字段 schema 描述文件：命名、解析、合并与可复制的规范文本 |
 | `src/lib/workflow/` | 工作流节点定义与图 → 执行配置解析 |
 | `src/lib/actions/` | Server Actions（认证、数据源、工作流、工作台、任务） |
@@ -52,7 +53,7 @@ PostgreSQL（pg 直连）· S3 兼容对象存储（阿里云 OSS）· qwen3.8-o
 
 ```bash
 npm install
-cp .env.local.example .env.local   # 填入数据库、对象存储与模型凭据
+cp .env.local.example .env.local   # 填入数据库与对象存储凭据（模型在页面上配）
 npm run db:migrate                 # 建表 + 建函数（幂等，可重复执行）
 npm run build && npm start         # Web，端口 3000
 npm run worker                     # 后台 Worker（另开一个进程，必须常驻）
@@ -88,7 +89,7 @@ npm run worker                     # 后台 Worker（另开一个进程，必须
 ### 方式一：compose，一条命令两个容器（推荐）
 
 ```bash
-cp .env.local.example .env.local         # 填数据库、对象存储与模型凭据
+cp .env.local.example .env.local         # 填数据库与对象存储凭据（模型在页面上配）
 docker compose run --rm web migrate      # 首次部署：建表建函数（幂等）
 docker compose up -d --build             # Web + Worker，访问 http://<host>:3000
 ```
@@ -123,7 +124,8 @@ docker run -d --name voicelens --restart unless-stopped \
 2. **Build Type** 选 `Dockerfile`:Dockerfile Path 填 `Dockerfile_cn`（官方源填 `Dockerfile`）,
    Docker Context Path 填 `.`,Docker Build Stage 留空。
 3. **Build Time Arguments**（可选，构建时）：`NPM_REGISTRY`、`APT_MIRROR`、`TZ`,不填就用文件里的默认值。
-4. **Environment**（运行时）：照 `.env.local.example` 填 `DATABASE_URL`、`AUTH_SECRET`、`S3_*`、`AI_*`,再加两条：
+4. **Environment**（运行时）：照 `.env.local.example` 填 `DATABASE_URL`、`AUTH_SECRET`、`S3_*`,再加两条：
+   （模型不在这里配，部署完由所有者在「设置 → 分析模型」里填）
    - `VOICELENS_ROLE=all` —— 一个实例里同时跑 Web 与 Worker
    - `VOICELENS_MIGRATE_ON_START=true` —— 启动时自动建表
 5. **Domains**:Host 填域名，Container Port 填 `3000`,打开 HTTPS（Let's Encrypt）。
@@ -296,6 +298,49 @@ Worker 入库时也不把压缩包读进内存：用 **HTTP Range 就地读**桶
 `{"AllowedOrigins":["https://…"],"AllowedMethods":["PUT"],"AllowedHeaders":["*"]}`；MinIO 默认
 放开 CORS，通常不用配。
 
+### 分析模型
+
+模型不再由启动配置决定，而是**由所有者在「设置 → 分析模型」里配置任意多套**，每套就是一个
+OpenAI 兼容的 Chat Completions 端点（接口地址 + 模型 id + API Key），按能力分成两类：
+
+| 类型 | 输入模态 | 承担的调用 |
+|---|---|---|
+| 多模态模型 | 文本 + 图像 | 全部纯文本调用：用户层、全局层、报告生成，以及规划里写提示词那一步 |
+| omni 模型 | 文本 + 图像 + 音频 | 唯一可以接收音频的一类：规划试听、会话层带音频的分析 |
+
+两类怎么配合，由**分析模式**决定，一共四种：
+
+| 模式 | 含音频的会话 | 无音频的会话 | 汇总与报告 |
+|---|---|---|---|
+| 全部用 omni 统一分析 | omni 一次 | omni 一次 | omni |
+| 涉及音频用 omni，其余用多模态 | omni 一次 | 多模态一次 | 多模态 |
+| omni 分析后多模态二次优化 | omni（音频+转录）→ 多模态（结果+转录，不含音频） | 多模态一次 | 多模态 |
+| 音频独立分析后交多模态 | omni（仅音频，出「音频观察」）→ 多模态（观察+完整对话） | 多模态一次 | 多模态 |
+
+「含音频」指该会话确实有音频片段、且工作流里的音频开关是开的；签不出预签名 URL 的会话按
+**无音频**处理——所以后两种模式不会因为音频链路退化而白白多花一次调用。规划阶段在后三种模式
+下一致：试听音频永远走 omni，写提示词走多模态。
+
+模式与模型的选择分两层，**逐字段继承**：
+
+- **全局默认**：设置页里配一次，所有数据源默认跟随。
+- **数据源覆盖**：数据源的「分析模型」页签，可以只改模式、或只换其中一个模型，没改的字段继续
+  跟随全局。该页签底部有一张路由表，列出保存后每一类调用实际会用到哪个模型。
+
+配置对**任务规划和实际分析任务同时生效**，作业在被 Worker 领取时解析一次，所以改完设置不必
+重启 Worker，下一个任务就是新配置。跑完的任务会把当次用到的模式与两个模型写进
+`analysis_tasks.stats.models`,并按实际路由统计每种调用各跑了多少个会话
+（`stats.session_strategies`），任务页上直接能看到。
+
+**关于 API Key**:填进来的 Key 用 AES-256-GCM 加密后存库，密钥取 `MODEL_SECRET`,未设置时回退
+`AUTH_SECRET`。前端任何时候都只拿得到掩码（`sk-…a1b2`），编辑时留空即保持原值。若在没有设
+`MODEL_SECRET` 的情况下轮换了 `AUTH_SECRET`,已存的 Key 会解不开——设置页会直接把这些行标红提示
+重填，而不是等到任务跑起来才报错。
+
+**升级提示**:本版本不迁移旧的 `AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL`。新版本起来后模型列表是
+空的，规划与分析任务会以明确的中文错误失败，由所有者在设置页重新配置即可。这样做是为了让 Key
+以加密形式重新入库，而不是让环境变量里的明文继续当真相。
+
 ### 音频用没用，报告里看得见
 
 音频是否送进模型由**开关**决定，不是「数据里有就用」。三个阶段各有一个，默认值不同：
@@ -350,8 +395,7 @@ chip，所以「开音频 / 不开音频各跑一次预览对比效果」这条�
 | `S3_FORCE_PATH_STYLE` | 路径风格寻址；OSS/S3 用默认 false，MinIO 需 true |
 | `IMPORT_MAX_ZIP_MB` | 单个压缩包上限，MB（默认 5120 = 5GB） |
 | `IMPORT_KEEP_SOURCE_ZIP` | 导入成功后保留暂存的压缩包（默认 false，解包后即删） |
-| `AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` | 模型服务（OpenAI 兼容 Chat Completions） |
-| `AI_ENABLE_THINKING` | 深度思考默认开关（默认 false，规划与报告单独开启） |
+| `MODEL_SECRET` | 加密库里模型 API Key 的密钥；不填则回退 `AUTH_SECRET`（见〈分析模型〉） |
 | `WORKER_POLL_MS` | Worker 轮询间隔 |
 | `VOICELENS_ROLE` | 仅容器：不带命令参数时跑哪个角色（`web` 默认 / `worker` / `all` / `migrate`） |
 | `VOICELENS_MIGRATE_ON_START` | 仅容器：`web`/`all` 启动前自动应用迁移（默认关） |
@@ -377,8 +421,9 @@ chip，所以「开音频 / 不开音频各跑一次预览对比效果」这条�
 | 文件 | 职责 |
 |---|---|
 | `src/lib/auth/roles.ts` | 角色表与分配规则（无服务端依赖，前端选择器与后端校验共用同一份） |
+| `src/lib/models/mode.ts` | 分析模式与调用路由表（同样无服务端依赖，配置页与引擎共用同一份） |
 | `src/lib/auth/access.ts` | 归属判定：`canAccessSource` / `resolveOwnedRow` / `resolveAudioSource` |
-| `src/lib/actions/common.ts` | 守卫：`requireSession` / `require*Access` / `require*Page` / `ownerScope` |
+| `src/lib/actions/common.ts` | 守卫：`requireSession` / `requireOwnerSession` / `require*Access` / `require*Page` / `ownerScope` |
 
 跨数据源的列表查询（`listDataSources` / `listTasks` / `listWorkflows`）接收 `ownerScope()`
 产出的过滤值：owner/admin 传 null 不过滤，成员传自己的 id。「不存在」与「不是你的」返回
@@ -393,6 +438,13 @@ chip，所以「开音频 / 不开音频各跑一次预览对比效果」这条�
 ACCESS_TEST_DATABASE_URL=postgresql://... npm run test:access
 ```
 
+分析模式与模型注册表也有一份同样形态的回归测试，其中路由与加解密部分不依赖数据库、可以直接跑：
+
+```bash
+npm run test:models                                       # 只跑路由/继承/加解密
+MODELS_TEST_DATABASE_URL=postgresql://... npm run test:models   # 再加上注册表解析
+```
+
 ## 安全边界
 
 - 授权在应用层：未登录请求在 middleware 被重定向，Server Actions 与 Route Handlers 各自再按
@@ -405,6 +457,9 @@ ACCESS_TEST_DATABASE_URL=postgresql://... npm run test:access
   分片 PUT URL**，前端拿不到任何长期凭据；对象路径由服务端按 `imports/<数据源 id>/…` 生成，
   签名与合并前都会校验它属于当前数据源。
 - 音频桶保持私有，播放与送模型都走**短时效预签名 URL**（播放 10 分钟，送模型 1 小时）。
+- 模型 API Key 只有**所有者**能新增和修改（`requireOwnerSession`），AES-256-GCM 加密后入库，
+  明文只在真正要发起调用的那一刻在服务端解出；前端拿到的永远是掩码。成员为自己的数据源挑模型
+  走的是普通数据源守卫，挑得到名字，拿不到凭据。
 - 数据库里不存文件字节；音频仅存对象路径。
 
 > 音频送模型时传的是预签名 URL，由模型服务**主动回源**拉取。若对象存储不可公网访问，

@@ -1,21 +1,32 @@
 import OpenAI from "openai";
 import type { ChatCompletionCreateParamsStreaming } from "openai/resources/chat/completions";
+import type { ModelRuntime } from "@/lib/models/registry";
 
-let client: OpenAI | null = null;
+/**
+ * One client per endpoint. Models are configured in the database now and a
+ * single run can talk to two of them (an omni model for audio, a multimodal one
+ * for everything else), so the old module-level singleton would have pinned the
+ * whole process to whichever endpoint happened to be used first.
+ *
+ * The key includes the API key so rotating a model's credential in the settings
+ * page takes effect on the next call rather than on the next restart.
+ */
+const clients = new Map<string, OpenAI>();
 
-function getClient(): OpenAI {
-  if (client) return client;
-  const baseURL = process.env.AI_BASE_URL;
-  const apiKey = process.env.AI_API_KEY;
-  if (!baseURL || !apiKey) {
-    throw new Error("AI_BASE_URL / AI_API_KEY are not configured on the server");
+function getClient(model: ModelRuntime): OpenAI {
+  if (!model.baseUrl || !model.apiKey) {
+    throw new Error(`模型「${model.name}」缺少接口地址或 API Key`);
   }
-  client = new OpenAI({
-    baseURL,
-    apiKey,
+  const cacheKey = `${model.baseUrl}\u0000${model.apiKey}`;
+  const existing = clients.get(cacheKey);
+  if (existing) return existing;
+  const client = new OpenAI({
+    baseURL: model.baseUrl,
+    apiKey: model.apiKey,
     timeout: 1000 * 60 * 4,
     maxRetries: 1,
   });
+  clients.set(cacheKey, client);
   return client;
 }
 
@@ -36,16 +47,17 @@ export interface CompletionUsage {
 }
 
 export interface ChatOptions {
-  model?: string;
+  /** Which configured model runs this call. Required — there is no ambient default. */
+  model: ModelRuntime;
   temperature?: number;
   maxTokens?: number;
   /**
-   * qwen3.8-omni-flash supports a reasoning mode. It measurably improves prompt
-   * design and report writing, but is ~3x slower, so it is off by default and
-   * only enabled for the two low-volume, high-value calls (planning, report).
+   * Reasoning mode. It measurably improves prompt design and report writing but
+   * is ~3x slower, so it is enabled per call for the two low-volume, high-value
+   * ones (planning, report) and otherwise follows the model's own setting.
    */
   thinking?: boolean;
-  /** qwen-omni only streams; the SDK accumulates chunks for us. */
+  /** The Omni family only streams; the SDK accumulates chunks for us. */
   onDelta?: (text: string) => void;
   signal?: AbortSignal;
 }
@@ -58,16 +70,16 @@ export interface ChatResult {
 }
 
 /**
- * Text-only chat completion against qwen3.8-omni-flash.
- * The Omni family requires `stream: true`, so every call streams and is
- * accumulated server-side; callers only ever see the final text.
+ * Chat completion against one configured OpenAI-compatible endpoint. Every call
+ * streams and is accumulated server-side — the Omni models require
+ * `stream: true` — so callers only ever see the final text.
  */
 export async function chat(
   messages: ChatMessage[],
-  options: ChatOptions = {},
+  options: ChatOptions,
 ): Promise<ChatResult> {
-  const openai = getClient();
-  const model = options.model ?? process.env.AI_MODEL ?? "qwen3.8-omni-flash";
+  const openai = getClient(options.model);
+  const model = options.model.model;
 
   const params: ChatCompletionCreateParamsStreaming = {
     model,
@@ -79,7 +91,7 @@ export async function chat(
   };
   // `enable_thinking` is a Model Studio extension of the OpenAI-compatible API.
   (params as unknown as Record<string, unknown>).enable_thinking =
-    options.thinking ?? process.env.AI_ENABLE_THINKING === "true";
+    options.thinking ?? options.model.thinking;
 
   const stream = await openai.chat.completions.create(
     params,
@@ -118,7 +130,7 @@ export async function chat(
  */
 export async function chatJson<T>(
   messages: ChatMessage[],
-  options: ChatOptions = {},
+  options: ChatOptions,
 ): Promise<{ data: T; usage: CompletionUsage; raw: string }> {
   let lastError = "";
   let attemptMessages = messages;

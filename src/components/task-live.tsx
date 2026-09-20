@@ -11,6 +11,7 @@ import { Badge } from "@/components/ui/badge";
 import { StatusBadge } from "@/components/ui-kit";
 import { cn, formatDuration, formatDate } from "@/lib/utils";
 import type { JsonObject } from "@/lib/types";
+import { MODE_LABEL, asMode, type AnalysisMode } from "@/lib/models/mode";
 
 const STAGES = [
   { key: "collect", label: "圈定范围" },
@@ -102,6 +103,13 @@ export function TaskLive({
   const pct = total ? Math.round((done / total) * 100) : state.stage === "done" ? 100 : 0;
   const stageIndex = STAGES.findIndex((s) => s.key === state.stage);
   const stats = state.stats ?? {};
+  // Written by the executor as `stats.models`; a task that ran before models
+  // moved into the database has none, and simply shows dashes.
+  const models = (stats.models ?? {}) as {
+    mode?: AnalysisMode;
+    omni?: string | null;
+    multimodal?: string | null;
+  };
   const duration =
     state.started_at && state.finished_at
       ? Date.parse(state.finished_at) - Date.parse(state.started_at)
@@ -227,8 +235,15 @@ export function TaskLive({
           <Fact label="会话失败" value={String(stats.sessions_failed ?? counts.failed ?? 0)} tone={Number(stats.sessions_failed ?? 0) > 0 ? "bad" : undefined} />
           <Fact label="用户数" value={String(stats.users ?? 0)} />
           <Fact label="Token 消耗" value={String(stats.tokens ?? 0)} />
-          <Fact label="模型" value={String(stats.model ?? "qwen3.8-omni-flash")} mono />
+          <Fact label="分析模式" value={models.mode ? MODE_LABEL[asMode(models.mode)] : "—"} />
         </div>
+
+        {(models.omni || models.multimodal) && (
+          <div className="mt-2 grid gap-2 sm:grid-cols-2">
+            {models.omni ? <Fact label="omni 模型" value={models.omni} mono /> : null}
+            {models.multimodal ? <Fact label="多模态模型" value={models.multimodal} mono /> : null}
+          </div>
+        )}
 
         {state.error && (
           <div className="mt-3 flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/8 p-3 text-[12px] leading-relaxed text-destructive">

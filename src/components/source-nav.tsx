@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   Braces,
+  Cpu,
   LayoutDashboard,
   MessagesSquare,
   Sparkles,
@@ -20,6 +21,7 @@ const ICONS: Record<string, LucideIcon> = {
   braces: Braces,
   workflow: Workflow,
   sparkles: Sparkles,
+  cpu: Cpu,
 };
 
 export function SourceNav({

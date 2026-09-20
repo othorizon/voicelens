@@ -18,6 +18,8 @@ import { runTask, log } from "../src/lib/engine/executor";
 import { importZip } from "../src/lib/engine/import";
 import { configFromGraph, normalizeGraph } from "../src/lib/workflow/graph";
 import type { WorkflowConfig } from "../src/lib/workflow/definition";
+import { resolveRuntime } from "../src/lib/models/registry";
+import { MODE_LABEL } from "../src/lib/models/mode";
 import type { ExtraFieldDef, JsonObject } from "../src/lib/types";
 
 const POLL_MS = Number(process.env.WORKER_POLL_MS ?? 2500);
@@ -158,6 +160,10 @@ async function handlePlanning(job: PlanningJob) {
   const source = await loadSource(job.data_source_id);
   if (!source) throw new Error("数据源不存在");
 
+  // The models and mode this source is configured with. Resolved per job, so a
+  // change in the settings page takes effect on the next job rather than on the
+  // next Worker restart.
+  const runtime = await resolveRuntime(job.data_source_id);
   const params = (job.params ?? {}) as Record<string, unknown>;
   const includeAudio = params.includeAudio !== false;
   const focus = String(params.focus ?? "");
@@ -181,6 +187,7 @@ async function handlePlanning(job: PlanningJob) {
   try {
     plan = await planTemplate({
       dataSource: source,
+      runtime,
       sessionSamples: Number(params.sessionSamples ?? 5),
       userSamples: Number(params.userSamples ?? 4),
       includeAudio,
@@ -270,6 +277,7 @@ async function handlePreview(job: PreviewJob) {
 
   const out = await buildPreview({
     dataSource: source,
+    runtime: await resolveRuntime(job.data_source_id),
     template: tpl,
     sessions: Number(params.sessions ?? 12),
     useAudio: params.useAudio === true,
@@ -319,6 +327,8 @@ async function handleTask(job: TaskRow) {
   const source = await loadSource(job.data_source_id);
   if (!source) throw new Error("数据源不存在");
 
+  const runtime = await resolveRuntime(job.data_source_id);
+
   const config = await loadConfig(job.workflow_id);
   const overrides = (job.config ?? {}) as Partial<{ scope: unknown; session: unknown; report: unknown }>;
   const merged = { ...config, ...(overrides as object) } as WorkflowConfig;
@@ -347,6 +357,7 @@ async function handleTask(job: TaskRow) {
       createdBy: (job.created_by as string | null) ?? null,
     },
     merged,
+    runtime,
   );
 }
 
@@ -428,8 +439,16 @@ async function run(kind: string, id: string, fn: () => Promise<void>, onError: (
 async function main() {
   // Fail fast, with a clear message, if the database is unreachable.
   const probe = await scalar<number>(`select 1 as ok`);
+  // Models live in the database and resolve per data source, so the banner
+  // reports the workspace default rather than a process-wide model.
+  const defaults = await resolveRuntime(null).catch(() => null);
+  const models = defaults
+    ? [defaults.omni && `omni=${defaults.omni.model}`, defaults.multimodal && `多模态=${defaults.multimodal.model}`]
+        .filter(Boolean)
+        .join(" · ") || "未选择模型"
+    : "模型配置不可读";
   console.log(
-    `[worker] connected · model=${process.env.AI_MODEL ?? "qwen3.8-omni-flash"} · poll=${POLL_MS}ms · probe=${probe === 1 ? "ok" : "n/a"}`,
+    `[worker] connected · 默认模式=${defaults ? MODE_LABEL[defaults.mode] : "?"} · ${models} · poll=${POLL_MS}ms · probe=${probe === 1 ? "ok" : "n/a"}`,
   );
 
   await recoverStaleJobs();

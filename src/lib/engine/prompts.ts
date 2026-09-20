@@ -314,3 +314,47 @@ ${JSON.stringify(input.evidence.slice(0, 60), null, 1).slice(0, 30000)}
   ];
   return messages;
 }
+
+/* ------------------------------------------------- 分模式的会话层提示词 */
+
+/**
+ * `audio_first`: the omni model hears the clips with no transcript in front of
+ * it, so what it reports is what the audio alone carries. Keeping the
+ * transcript out is the whole point of the mode — the multimodal model gets the
+ * transcript in the second pass, and mixing the two here would just reproduce
+ * `omni_for_audio` at twice the price.
+ */
+export const AUDIO_OBSERVATION_PROMPT = `你是一名语音对话质量分析专家。现在只给你一段或多段音频，没有文字转录。
+请仅根据你听到的内容作答，禁止猜测对话的具体业务内容或转录文本。
+
+请分点输出（中文，250 字以内，不要寒暄、不要 Markdown 代码块）：
+1. 说话人情绪与语气：双方各自的情绪走向、是否有不耐烦/焦虑/愤怒/满意的迹象。
+2. 交互节奏：语速、停顿、静音、抢话与打断，TTS 播报是否被中途打断。
+3. 音质与可懂度：背景噪音、断音、音量异常，以及可能导致 ASR 误识别的片段。
+4. 仅凭音频可得的风险信号：如长时间静音、重复兜底话术的语调、情绪骤变。
+如果某一项在音频中听不出来，直接写「未听出」，不要编造。`;
+
+/** The `audio_first` hand-off: audio findings above, transcript below. */
+export function renderAudioObservation(observation: string): string {
+  return `# 音频独立分析结论（由 omni 模型仅听音频得出，不含转录信息）
+以下结论来自对本会话原始音频的独立试听。你看不到音频本身，请把它当作可信的听觉证据来源，
+与下面的转录文本结合判断；当两者冲突时以转录的事实内容为准，以音频结论的情绪/节奏判断为准。
+
+${observation.trim() || "（未获得音频结论）"}`;
+}
+
+/**
+ * `omni_then_refine`: the second pass. The omni model has already produced a
+ * full result with the audio in hand; the multimodal model re-reads it against
+ * the transcript and tightens it. It is told not to invent audio detail,
+ * because it cannot hear anything — the first pass's claims are all it has.
+ */
+export const REFINE_PROMPT = `# 二次优化说明
+上面的 JSON 是 omni 模型结合原始音频与转录做出的第一版分析。你现在拿到的是同一个会话的完整转录（没有音频）。
+请在第一版的基础上产出一份更准确的最终结果：
+
+1. 核对第一版的每条结论是否被转录文本支撑；无法支撑且明显属于臆测的，改写或删除。
+2. 第一版中依赖音频得出的判断（语气、情绪、打断、停顿、噪音），你听不到音频，必须原样保留，不得推翻，也不得自行新增同类判断。
+3. 补齐第一版遗漏的事实性内容：意图、关键节点、可量化指标、可引用的原文证据。
+4. evidence 中的引用必须逐字来自转录，不得改写。
+5. 输出结构与第一版完全一致的 JSON，不要输出 diff、不要解释你改了什么。`;

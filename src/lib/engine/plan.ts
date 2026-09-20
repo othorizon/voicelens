@@ -1,5 +1,7 @@
 import { callJson, query } from "@/lib/db";
-import { chat, chatJson, type ContentPart } from "./ai";
+import { chat, chatJson } from "./ai";
+import { requireModel, type AnalysisRuntime } from "@/lib/models/registry";
+import { PLAN_AUDIO_KIND, textModelKind } from "@/lib/models/mode";
 import {
   describeExtraSchema,
   buildPlanningMessages,
@@ -27,7 +29,14 @@ import type {
   SessionAnalysis,
   UserAnalysis,
 } from "@/lib/types";
-import { normalizeSessionResult, mapLimit, aggregateUser, aggregateGlobal, generateReport } from "./analyze";
+import {
+  analyzeSession,
+  normalizeSessionResult,
+  mapLimit,
+  aggregateUser,
+  aggregateGlobal,
+  generateReport,
+} from "./analyze";
 import type { DrillData, DrillSession, DrillUser } from "./report-html";
 import { renderReportHtml } from "./report-html";
 import { deriveGroundTruth, type HistogramEntry } from "./ground-truth";
@@ -43,6 +52,8 @@ export interface DataSourceLike {
 
 export interface PlanInput {
   dataSource: DataSourceLike;
+  /** Which models run planning, and under which analysis mode. */
+  runtime: AnalysisRuntime;
   sessionSamples: number;
   userSamples: number;
   includeAudio: boolean;
@@ -88,10 +99,16 @@ interface PlannerResult {
   report_outline: unknown[];
 }
 
-/** Ask the multimodal model what the audio adds, so planning can rely on it. */
+/**
+ * Ask the omni model what the audio adds, so planning can rely on it.
+ *
+ * Listening is omni's job in every mode — it is the only kind that accepts an
+ * audio part at all — while the prompt-writing call below follows the mode.
+ */
 async function audioImpression(
   dataSource: DataSourceLike,
   sessionIds: string[],
+  runtime: AnalysisRuntime,
   maxClips = 6,
 ): Promise<string> {
   const clips: { path: string; format: string | null; role: string }[] = [];
@@ -101,6 +118,11 @@ async function audioImpression(
     clips.push(...audios.map((a) => ({ path: a.audio_path, format: a.audio_format, role: a.role })));
   }
   if (!clips.length) return "";
+
+  // Resolved before the try below: that catch is there to let a model *failure*
+  // fall back to text-only planning, but "no omni model configured" is a setup
+  // mistake the planning job should report rather than quietly plan around.
+  const model = requireModel(runtime, PLAN_AUDIO_KIND, "规划时试听音频");
 
   const urls = await signedAudioUrls(clips.slice(0, maxClips).map((c) => c.path));
   const parts = [
@@ -126,7 +148,7 @@ async function audioImpression(
         { role: "system", content: `你是一名语音对话数据分析专家。数据源业务背景：${dataSource.description || dataSource.name}` },
         { role: "user", content: parts as never },
       ],
-      { temperature: 0.4, maxTokens: 2000 },
+      { model, temperature: 0.4, maxTokens: 2000 },
     );
     return res.text.trim();
   } catch {
@@ -147,6 +169,7 @@ export async function planTemplate(input: PlanInput): Promise<PlanOutput> {
     impression = await audioImpression(
       input.dataSource,
       samples.rawSessions.slice(0, 4).map((s) => s.id),
+      input.runtime,
     );
   }
 
@@ -181,6 +204,7 @@ export async function planTemplate(input: PlanInput): Promise<PlanOutput> {
   }
 
   const { data, usage } = await chatJson<PlannerResult>(messages, {
+    model: requireModel(input.runtime, textModelKind(input.runtime.mode), "规划提示词"),
     temperature: 0.5,
     maxTokens: 14000,
     thinking: true,
@@ -304,6 +328,8 @@ quality_score 评分锚点：
 
 export interface PreviewInput {
   dataSource: DataSourceLike;
+  /** Which models run the preview, and under which analysis mode. */
+  runtime: AnalysisRuntime;
   template: {
     session_prompt: string;
     user_prompt: string;
@@ -354,19 +380,20 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
   const audioUse = { sessionsWithAudio: 0, clipsAttached: 0, clipsUnavailable: 0 };
   const results = await mapLimit(sessions, input.concurrency ?? 3, async (s) => {
     try {
-      const payload = await sessionPayloadContent(s, extraHint, input.useAudio);
-      if (payload.attached > 0) audioUse.sessionsWithAudio++;
-      audioUse.clipsAttached += payload.attached;
-      audioUse.clipsUnavailable += payload.requested - payload.attached;
-
-      const parsed = await chatJson<SessionAnalysis>(
-        [
-          { role: "system", content: template.session_prompt },
-          { role: "user", content: payload.content },
-        ],
-        { temperature: 0.3 },
-      );
-      return { session: s, result: normalizeSessionResult(parsed.data, s as never) };
+      // Same runner as the full task, so the preview can never disagree with
+      // the run it is previewing about which model saw what.
+      const { result, audio } = await analyzeSession({
+        session: s as never,
+        template,
+        runtime: input.runtime,
+        useAudio: input.useAudio,
+        maxAudiosPerSession: PREVIEW_MAX_AUDIOS,
+        extraSchemaHint: extraHint,
+      });
+      if (audio.attached > 0) audioUse.sessionsWithAudio++;
+      audioUse.clipsAttached += audio.attached;
+      audioUse.clipsUnavailable += audio.requested - audio.attached;
+      return { session: s, result };
     } catch (err) {
       return {
         session: s,
@@ -398,7 +425,11 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
   let uDone = 0;
   const userAgg = await mapLimit(userKeys, input.concurrency ?? 3, async (key) => {
     try {
-      const { result } = await aggregateUser({ user_key: key, sessions: byUser.get(key)! }, template);
+      const { result } = await aggregateUser(
+        { user_key: key, sessions: byUser.get(key)! },
+        template,
+        input.runtime,
+      );
       return { user_key: key, result };
     } catch {
       const list = byUser.get(key)!;
@@ -435,6 +466,7 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
       userCount: userAgg.length,
     },
     template,
+    input.runtime,
     200,
   );
   progress({ stage: "global_aggregation", done: 1, total: 1 });
@@ -447,6 +479,7 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
   });
   const { spec } = await generateReport({
     template,
+    runtime: input.runtime,
     title: `${dataSource.name} · 预览报告`,
     scopeNote: `预览样本 ${sessionResults.length} 个会话 / ${userAgg.length} 位用户（非全量）`,
     globalResult: globalResult as JsonObject,
@@ -489,53 +522,6 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
 }
 
 const PREVIEW_MAX_AUDIOS = 6;
-
-async function sessionPayloadContent(
-  session: { id: string; session_key: string; user_key: string; started_at: string | null; ended_at?: string | null; turn_count: number; audio_count: number; digest: string; extra: JsonObject },
-  extraHint: string,
-  useAudio: boolean,
-): Promise<{ content: string | ContentPart[]; requested: number; attached: number }> {
-  const text = [
-    `# 会话元信息`,
-    `session_key: ${session.session_key}`,
-    `user_key: ${session.user_key}`,
-    `开始时间: ${session.started_at ?? "未知"}`,
-    `轮次: ${session.turn_count}，含音频片段: ${session.audio_count}`,
-    Object.keys(session.extra ?? {}).length ? `会话级 extra: ${JSON.stringify(session.extra)}` : "",
-    extraHint ? `\n# extra 字段口径\n${extraHint}` : "",
-    `\n# 完整对话转录\n${session.digest || "（无转录）"}`,
-  ]
-    .filter(Boolean)
-    .join("\n");
-
-  if (!useAudio || !session.audio_count) return { content: text, requested: 0, attached: 0 };
-  const audios = await loadSessionAudio(session.id, PREVIEW_MAX_AUDIOS);
-  if (!audios.length) return { content: text, requested: 0, attached: 0 };
-
-  // Walk `audios`, not the signed map: whatever failed to sign is the number
-  // that silently never reached the model, and that is what we report.
-  const urls = await signedAudioUrls(audios.map((a) => a.audio_path));
-  const clips: ContentPart[] = [];
-  for (const a of audios) {
-    const url = urls.get(a.audio_path);
-    if (!url) continue;
-    clips.push({
-      type: "input_audio",
-      input_audio: { data: url, format: (a.audio_format ?? "wav").toLowerCase() },
-    });
-  }
-  if (!clips.length) return { content: text, requested: audios.length, attached: 0 };
-
-  return {
-    content: [
-      { type: "text", text: `随附 ${clips.length} 段原始音频，顺序与转录一致。若音频可用请结合语气/情绪/打断/停顿判断；不可用则仅依据转录，不要臆测。` },
-      { type: "text", text },
-      ...clips,
-    ],
-    requested: audios.length,
-    attached: clips.length,
-  };
-}
 
 /* ------------------------------------------------------------- stats */
 

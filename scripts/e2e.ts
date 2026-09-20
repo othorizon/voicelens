@@ -10,6 +10,8 @@ import { registerUser, verifyCredentials } from "../src/lib/auth";
 import { buildDemoZip, DEMO_BUSINESS_DESC, DEMO_EXTRA_SCHEMA, generateDemoDataset } from "../src/lib/demo/generate";
 import { importZip } from "../src/lib/engine/import";
 import { defaultGraph, configFromGraph } from "../src/lib/workflow/graph";
+import { resolveRuntime } from "../src/lib/models/registry";
+import { MODE_LABEL, audioKinds, requiredKinds } from "../src/lib/models/mode";
 
 const log = (m: string, extra?: unknown) =>
   console.log(`[${new Date().toISOString().slice(11, 19)}] ${m}`, extra ?? "");
@@ -81,6 +83,32 @@ function shorten(v: unknown) {
 
 const settled = (r: { status?: string }) => ["completed", "failed"].includes(String(r.status));
 
+/**
+ * Models are configured in the app now, not in the environment, so the smoke
+ * test cannot conjure one. Check up front rather than letting the worker fail
+ * a job twenty minutes in with the same message.
+ */
+async function assertModelsConfigured(sourceId: string): Promise<void> {
+  const runtime = await resolveRuntime(sourceId);
+  const missing = [...requiredKinds(runtime.mode), ...audioKinds(runtime.mode)].filter(
+    (kind) => !(kind === "omni" ? runtime.omni : runtime.multimodal),
+  );
+  if (missing.length) {
+    throw new Error(
+      `模型未配置：模式「${MODE_LABEL[runtime.mode]}」还缺 ${missing.join(" / ")}。\n` +
+        "请先用所有者账号登录，在「设置 → 分析模型」里添加模型并选为默认，再跑这个冒烟测试。" +
+        (Object.values(runtime.problems).length
+          ? `\n已选中但不可用：${Object.values(runtime.problems).join("；")}`
+          : ""),
+    );
+  }
+  log("models", {
+    mode: MODE_LABEL[runtime.mode],
+    omni: runtime.omni?.model ?? null,
+    multimodal: runtime.multimodal?.model ?? null,
+  });
+}
+
 async function main() {
   const step = process.argv[2] ?? "all";
   const userId = await ensureUser();
@@ -88,6 +116,9 @@ async function main() {
 
   const sourceId = await ensureSource(userId);
   log("data source", sourceId);
+
+  // Import needs no model; everything after it does.
+  if (step !== "import") await assertModelsConfigured(sourceId);
 
   /* ------------------------------------------------------------ import */
   if (step === "all" || step === "import") {

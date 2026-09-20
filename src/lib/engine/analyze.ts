@@ -1,5 +1,11 @@
 import { MODEL_URL_TTL, signedUrls } from "@/lib/storage";
-import { chat, chatJson, type ContentPart } from "./ai";
+import { chat, chatJson, type ChatMessage, type ContentPart } from "./ai";
+import {
+  requireModel,
+  type AnalysisRuntime,
+  type ModelRuntime,
+} from "@/lib/models/registry";
+import { sessionStrategy, textModelKind, type SessionStrategy } from "@/lib/models/mode";
 import type {
   GlobalAnalysis,
   JsonObject,
@@ -9,7 +15,12 @@ import type {
   UserAnalysis,
 } from "@/lib/types";
 import { loadSessionAudio } from "./sampler";
-import { buildReportMessages, renderSamples } from "./prompts";
+import {
+  AUDIO_OBSERVATION_PROMPT,
+  REFINE_PROMPT,
+  buildReportMessages,
+  renderAudioObservation,
+} from "./prompts";
 import {
   buildGroundTruthSection,
   reconcileWithGroundTruth,
@@ -73,6 +84,8 @@ export interface SessionInput {
 export interface AnalyzeSessionOptions {
   session: SessionInput;
   template: Template;
+  /** Which models run this session, and under which analysis mode. */
+  runtime: AnalysisRuntime;
   useAudio: boolean;
   maxAudiosPerSession: number;
   extraSchemaHint: string;
@@ -88,76 +101,147 @@ export interface SessionAudioUsage {
   attached: number;
 }
 
-export async function analyzeSession(opts: AnalyzeSessionOptions): Promise<{
+export interface SessionAnalysisRun {
   result: SessionAnalysis;
   tokens: number;
   audio: SessionAudioUsage;
-}> {
-  const { session, template, extraSchemaHint } = opts;
-  const payload = renderSessionPayload(session, extraSchemaHint);
-  const { parts, audio } = await buildSessionContent(opts, payload);
-
-  const res = await chat(
-    [
-      { role: "system", content: `${template.session_prompt}${JSON_RULE}` },
-      { role: "user", content: parts },
-    ],
-    { temperature: 0.3 },
-  );
-  const { tryParseJson } = await import("./ai");
-  const parsed = tryParseJson<SessionAnalysis>(res.text);
-  if (!parsed.ok) {
-    const retry = await chat(
-      [
-        { role: "system", content: `${template.session_prompt}${JSON_RULE}` },
-        { role: "user", content: parts },
-        { role: "assistant", content: res.text },
-        { role: "user", content: `你的输出无法解析为 JSON（${parsed.reason}）。请只输出严格合法的 JSON 对象。` },
-      ],
-      { temperature: 0.1 },
-    );
-    const parsed2 = tryParseJson<SessionAnalysis>(retry.text);
-    if (!parsed2.ok) throw new Error(`session ${session.session_key} 输出非法 JSON`);
-    return {
-      result: normalizeSessionResult(parsed2.value, session),
-      tokens: res.usage.total_tokens + retry.usage.total_tokens,
-      audio,
-    };
-  }
-  return { result: normalizeSessionResult(parsed.value, session), tokens: res.usage.total_tokens, audio };
+  /** Which of the four routings actually ran, for the run's tally. */
+  strategy: SessionStrategy;
 }
 
-async function buildSessionContent(
+/**
+ * Analyse one session under the configured analysis mode.
+ *
+ * Both callers — the full run and the workbench preview — come through here, so
+ * a preview can never disagree with the task it is previewing about which model
+ * saw what. The mode decides the routing; `@/lib/models/mode` owns that table.
+ */
+export async function analyzeSession(opts: AnalyzeSessionOptions): Promise<SessionAnalysisRun> {
+  const { session, template, runtime, extraSchemaHint } = opts;
+  const payload = renderSessionPayload(session, extraSchemaHint);
+  const { clips, audio } = await loadAudioParts(opts);
+  // Audio "reaching the model" is what routes, not the switch: a session with
+  // no clips, or whose clips all failed to sign, is a text-only session.
+  const strategy = sessionStrategy(runtime.mode, clips.length > 0);
+  const system = `${template.session_prompt}${JSON_RULE}`;
+
+  const done = (result: SessionAnalysis, tokens: number): SessionAnalysisRun => ({
+    result: normalizeSessionResult(result, session),
+    tokens,
+    audio,
+    strategy,
+  });
+
+  switch (strategy) {
+    case "omni_single":
+    case "multimodal_single": {
+      const kind = strategy === "omni_single" ? "omni" : "multimodal";
+      const model = requireModel(runtime, kind, "会话层分析");
+      // Keyed on the kind, not merely on having clips: a multimodal endpoint
+      // rejects an `input_audio` part, so this must stay true even if the
+      // routing table in @/lib/models/mode is changed later.
+      const content = kind === "omni" && clips.length ? withAudio(payload, clips) : payload;
+      const pass = await sessionJson([sys(system), user(content)], model);
+      return done(pass.result, pass.tokens);
+    }
+
+    case "omni_then_refine": {
+      const omni = requireModel(runtime, "omni", "会话层音频分析");
+      const multimodal = requireModel(runtime, "multimodal", "会话层二次优化");
+      const first = await sessionJson([sys(system), user(withAudio(payload, clips))], omni);
+      // The refine pass gets the transcript and v1 but no audio, so the prompt
+      // tells it to keep v1's audio-derived claims rather than second-guess
+      // what it cannot hear.
+      const second = await sessionJson(
+        [
+          sys(system),
+          user(payload),
+          { role: "assistant", content: JSON.stringify(first.result) },
+          user(REFINE_PROMPT),
+        ],
+        multimodal,
+      );
+      return done(second.result, first.tokens + second.tokens);
+    }
+
+    case "audio_then_multimodal": {
+      const omni = requireModel(runtime, "omni", "音频独立分析");
+      const multimodal = requireModel(runtime, "multimodal", "会话层分析");
+      const heard = await chat(
+        [
+          sys(AUDIO_OBSERVATION_PROMPT),
+          user([
+            {
+              type: "text",
+              text: `以下是同一个会话中按轮次顺序排列的 ${clips.length} 段原始音频，没有转录。`,
+            },
+            ...clips,
+          ]),
+        ],
+        { model: omni, temperature: 0.4, maxTokens: 1500 },
+      );
+      const pass = await sessionJson(
+        [sys(system), user(`${renderAudioObservation(heard.text)}\n\n${payload}`)],
+        multimodal,
+      );
+      return done(pass.result, heard.usage.total_tokens + pass.tokens);
+    }
+  }
+}
+
+function sys(content: string): ChatMessage {
+  return { role: "system", content };
+}
+
+function user(content: string | ContentPart[]): ChatMessage {
+  return { role: "user", content };
+}
+
+async function sessionJson(
+  messages: ChatMessage[],
+  model: ModelRuntime,
+): Promise<{ result: SessionAnalysis; tokens: number }> {
+  const res = await chatJson<SessionAnalysis>(messages, { model, temperature: 0.3 });
+  return { result: res.data, tokens: res.usage.total_tokens };
+}
+
+/** Transcript first, clips after, with the note about what they are on top. */
+function withAudio(payload: string, clips: ContentPart[]): ContentPart[] {
+  if (!clips.length) return [{ type: "text", text: payload }];
+  return [
+    {
+      type: "text",
+      text: `随附 ${clips.length} 段本次会话的原始音频，顺序与转录轮次一致。请结合音频中的语气、语速、停顿、打断与情绪判断；若音频不可用，仅依据转录文本分析，不要臆测音频内容。`,
+    },
+    { type: "text", text: payload },
+    ...clips,
+  ];
+}
+
+async function loadAudioParts(
   opts: AnalyzeSessionOptions,
-  payload: string,
-): Promise<{ parts: ContentPart[]; audio: SessionAudioUsage }> {
-  const content: ContentPart[] = [{ type: "text", text: payload }];
+): Promise<{ clips: ContentPart[]; audio: SessionAudioUsage }> {
   const none: SessionAudioUsage = { requested: 0, attached: 0 };
   if (!opts.useAudio || opts.maxAudiosPerSession <= 0 || opts.session.audio_count <= 0) {
-    return { parts: content, audio: none };
+    return { clips: [], audio: none };
   }
 
   const audios = await loadSessionAudio(opts.session.id, opts.maxAudiosPerSession);
-  if (!audios.length) return { parts: content, audio: none };
+  if (!audios.length) return { clips: [], audio: none };
 
   // `signedUrls` drops whatever it cannot sign, so requested - attached is the
   // count that quietly never reached the model.
   const urls = await signedAudioUrls(audios.map((a) => a.audio_path));
-  let attached = 0;
+  const clips: ContentPart[] = [];
   for (const a of audios) {
     const url = urls.get(a.audio_path);
     if (!url) continue;
-    content.push({ type: "input_audio", input_audio: { data: url, format: normalizeFormat(a.audio_format) } });
-    attached++;
-  }
-
-  if (attached > 0) {
-    content.unshift({
-      type: "text",
-      text: `随附 ${attached} 段本次会话的原始音频，顺序与转录轮次一致。请结合音频中的语气、语速、停顿、打断与情绪判断；若音频不可用，仅依据转录文本分析，不要臆测音频内容。`,
+    clips.push({
+      type: "input_audio",
+      input_audio: { data: url, format: normalizeFormat(a.audio_format) },
     });
   }
-  return { parts: content, audio: { requested: audios.length, attached } };
+  return { clips, audio: { requested: audios.length, attached: clips.length } };
 }
 
 function normalizeFormat(fmt?: string | null): string {
@@ -230,6 +314,7 @@ export interface UserAggInput {
 export async function aggregateUser(
   input: UserAggInput,
   template: Template,
+  runtime: AnalysisRuntime,
 ): Promise<{ result: UserAnalysis; tokens: number }> {
   const compact = input.sessions.map((s) => ({
     session_key: s.session_key,
@@ -259,7 +344,7 @@ export async function aggregateUser(
       },
       { role: "user", content: payload },
     ],
-    { temperature: 0.3 },
+    { model: requireModel(runtime, textModelKind(runtime.mode), "用户层汇总"), temperature: 0.3 },
   );
 
   const known = new Set(input.sessions.map((s) => s.session_key));
@@ -291,6 +376,7 @@ export async function aggregateGlobal(
     userCount: number;
   },
   template: Template,
+  runtime: AnalysisRuntime,
   maxUsers = 300,
 ): Promise<{ result: GlobalAnalysis; tokens: number }> {
   const users = input.userResults.slice(0, maxUsers).map((u) => ({
@@ -319,7 +405,11 @@ export async function aggregateGlobal(
       },
       { role: "user", content: payload },
     ],
-    { temperature: 0.35, maxTokens: 12000 },
+    {
+      model: requireModel(runtime, textModelKind(runtime.mode), "全局层汇总"),
+      temperature: 0.35,
+      maxTokens: 12000,
+    },
   );
 
   const g = res.data ?? ({} as GlobalAnalysis);
@@ -362,6 +452,7 @@ export async function aggregateGlobal(
 
 export async function generateReport(input: {
   template: Template;
+  runtime: AnalysisRuntime;
   title: string;
   scopeNote: string;
   globalResult: JsonObject;
@@ -392,7 +483,11 @@ export async function generateReport(input: {
   });
   // thinking is left off here: the report contract is already precise, and a
   // multi-thousand-token reasoning prefix makes the call take many minutes.
-  const res = await chatJson<ReportSpec>(messages, { temperature: 0.45, maxTokens: 8000 });
+  const res = await chatJson<ReportSpec>(messages, {
+    model: requireModel(input.runtime, textModelKind(input.runtime.mode), "报告生成"),
+    temperature: 0.45,
+    maxTokens: 8000,
+  });
   const base = normalizeReportSpec(res.data, input.title);
   const { spec, overrides } = reconcileWithGroundTruth(base, input.groundTruth);
 

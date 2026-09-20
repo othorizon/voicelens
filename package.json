@@ -12,6 +12,7 @@
     "test": "tsx scripts/test-ground-truth.ts",
     "test:schema": "tsx scripts/test-schema-file.ts",
     "test:access": "tsx scripts/test-access.ts",
+    "test:models": "tsx scripts/test-models.ts",
     "db:migrate": "tsx --env-file=.env.local db/apply.ts"
   },
   "dependencies": {

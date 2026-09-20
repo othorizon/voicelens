@@ -2,6 +2,9 @@ import type { Metadata } from "next";
 import { Bot, Database, ShieldCheck, Users, Cpu, Cloud } from "lucide-react";
 import { count as countRows, maybeOne, query } from "@/lib/db";
 import { ownerScope, requireSession } from "@/lib/actions/common";
+import { listModels, readDefaults } from "@/lib/models/registry";
+import { MODE_LABEL } from "@/lib/models/mode";
+import { ModelSettings, type ModelCard } from "@/components/model-settings";
 import { canAssignRoles, ROLE_HINT, ROLE_LABEL, asRole, type Role } from "@/lib/auth/roles";
 import { MemberRoles, type MemberRow } from "@/components/member-roles";
 import { PageHeader, StatCard } from "@/components/ui-kit";
@@ -50,10 +53,27 @@ export default async function SettingsPage() {
   const roster: MemberRow[] = members.map((m) => ({ ...m, role: asRole(m.role) }));
   const myRole: Role = session.role;
 
-  const model = process.env.AI_MODEL ?? "qwen3.8-omni-flash";
-  const baseUrl = process.env.AI_BASE_URL ?? "";
-  const host = baseUrl.replace(/^https?:\/\//, "").split("/")[0];
-  const aiConfigured = Boolean(process.env.AI_API_KEY && baseUrl);
+  // Models live in the database now. Only the owner may change them, but the
+  // whole workspace sees what is configured — a member picking a model for
+  // their own data source needs the names.
+  const [registry, defaults] = await Promise.all([listModels(), readDefaults()]);
+  const cards: ModelCard[] = registry.map((m) => ({
+    id: m.id,
+    name: m.name,
+    kind: m.kind,
+    baseUrl: m.baseUrl,
+    model: m.model,
+    enableThinking: m.enableThinking,
+    enabled: m.enabled,
+    note: m.note,
+    keyPresent: m.key.present,
+    keyReadable: m.key.readable,
+    keyMasked: m.key.masked,
+  }));
+  const usable = cards.filter((m) => m.enabled && m.keyReadable && m.keyPresent);
+  const defaultOmni = cards.find((m) => m.id === defaults.omniModelId) ?? null;
+  const defaultMultimodal = cards.find((m) => m.id === defaults.multimodalModelId) ?? null;
+  const ready = Boolean(defaultOmni || defaultMultimodal);
 
   return (
     <>
@@ -79,13 +99,19 @@ export default async function SettingsPage() {
             icon={Users}
             tone="info"
           />
-          <StatCard label="分析模型" value={model.replace("qwen3.8-", "")} hint={model} icon={Cpu} tone="good" />
           <StatCard
-            label="模型连通性"
-            value={aiConfigured ? "已配置" : "未配置"}
-            hint={host || "缺少 AI_BASE_URL"}
+            label="可用模型"
+            value={usable.length}
+            hint={`共 ${cards.length} 套配置`}
+            icon={Cpu}
+            tone={usable.length ? "good" : "bad"}
+          />
+          <StatCard
+            label="默认分析模式"
+            value={ready ? MODE_LABEL[defaults.mode] : "未配置"}
+            hint={ready ? MODE_LABEL[defaults.mode] : "尚未选择默认模型，任务无法运行"}
             icon={Bot}
-            tone={aiConfigured ? "good" : "bad"}
+            tone={ready ? "good" : "bad"}
           />
         </div>
 
@@ -173,16 +199,37 @@ export default async function SettingsPage() {
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-sm font-semibold">
+              <Cpu className="size-4 text-primary" />
+              分析模型
+            </CardTitle>
+            <CardDescription className="text-[12.5px]">
+              {myRole === "owner"
+                ? "配置 OpenAI 兼容的模型端点与默认分析模式。API Key 加密存库，保存后只回显掩码。"
+                : "由所有者配置。你可以在各数据源的「分析模型」页签里，从这些模型中为该数据源选择。"}
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ModelSettings models={cards} defaults={defaults} canManage={myRole === "owner"} />
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-sm font-semibold">
               <Cloud className="size-4 text-primary" />
               运行环境
             </CardTitle>
           </CardHeader>
           <CardContent>
             <dl className="grid gap-2 text-[12px] sm:grid-cols-2 lg:grid-cols-3">
-              <Row k="模型" v={model} mono />
-              <Row k="推理服务" v={host || "—"} mono />
+              <Row k="默认 omni 模型" v={defaultOmni ? `${defaultOmni.name} · ${defaultOmni.model}` : "未选择"} mono />
+              <Row
+                k="默认多模态模型"
+                v={defaultMultimodal ? `${defaultMultimodal.name} · ${defaultMultimodal.model}` : "未选择"}
+                mono
+              />
               <Row k="兼容协议" v="OpenAI Chat Completions（stream）" />
-              <Row k="输入模态" v="文本 / 图像 / 音频" />
+              <Row k="模型凭据" v="AES-256-GCM 加密后存库，前端只回显掩码" />
               <Row k="后端数据库" v="PostgreSQL（pg 直连）" />
               <Row k="对象存储" v={`S3 兼容 · bucket: ${process.env.S3_BUCKET ?? "—"}`} />
               <Row k="后台 Worker" v="tsx 常驻进程，轮询任务队列" />
