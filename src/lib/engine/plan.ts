@@ -19,6 +19,7 @@ import {
 } from "./sampler";
 import { signedAudioUrls } from "./analyze";
 import type {
+  AudioUsage,
   ExtraFieldDef,
   GlobalAnalysis,
   JsonObject,
@@ -350,12 +351,18 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
 
   const extraHint = describeExtraSchema(dataSource.extra_schema);
   let done = 0;
+  const audioUse = { sessionsWithAudio: 0, clipsAttached: 0, clipsUnavailable: 0 };
   const results = await mapLimit(sessions, input.concurrency ?? 3, async (s) => {
     try {
+      const payload = await sessionPayloadContent(s, extraHint, input.useAudio);
+      if (payload.attached > 0) audioUse.sessionsWithAudio++;
+      audioUse.clipsAttached += payload.attached;
+      audioUse.clipsUnavailable += payload.requested - payload.attached;
+
       const parsed = await chatJson<SessionAnalysis>(
         [
           { role: "system", content: template.session_prompt },
-          { role: "user", content: await sessionPayloadContent(s, extraHint, input.useAudio) },
+          { role: "user", content: payload.content },
         ],
         { temperature: 0.3 },
       );
@@ -456,11 +463,19 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
   progress({ stage: "report", done: 1, total: 1 });
 
   const drill = buildDrillData(sessions as never, sessionResults, userAgg);
+  const audio: AudioUsage = {
+    enabled: input.useAudio,
+    maxPerSession: PREVIEW_MAX_AUDIOS,
+    sessionsTotal: sessions.length,
+    ...audioUse,
+  };
+
   const html = renderReportHtml({
     spec,
     drill,
     generatedAt: new Date().toISOString(),
     scopeNote: `预览样本 ${sessionResults.length} 个会话 / ${userAgg.length} 位用户`,
+    audio,
   });
 
   return {
@@ -473,11 +488,13 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
   };
 }
 
+const PREVIEW_MAX_AUDIOS = 6;
+
 async function sessionPayloadContent(
   session: { id: string; session_key: string; user_key: string; started_at: string | null; ended_at?: string | null; turn_count: number; audio_count: number; digest: string; extra: JsonObject },
   extraHint: string,
   useAudio: boolean,
-) {
+): Promise<{ content: string | ContentPart[]; requested: number; attached: number }> {
   const text = [
     `# 会话元信息`,
     `session_key: ${session.session_key}`,
@@ -491,22 +508,33 @@ async function sessionPayloadContent(
     .filter(Boolean)
     .join("\n");
 
-  if (!useAudio || !session.audio_count) return text;
-  const audios = await loadSessionAudio(session.id, 6);
-  if (!audios.length) return text;
+  if (!useAudio || !session.audio_count) return { content: text, requested: 0, attached: 0 };
+  const audios = await loadSessionAudio(session.id, PREVIEW_MAX_AUDIOS);
+  if (!audios.length) return { content: text, requested: 0, attached: 0 };
+
+  // Walk `audios`, not the signed map: whatever failed to sign is the number
+  // that silently never reached the model, and that is what we report.
   const urls = await signedAudioUrls(audios.map((a) => a.audio_path));
-  const parts: ContentPart[] = [
-    { type: "text", text: `随附 ${urls.size} 段原始音频，顺序与转录一致。若音频可用请结合语气/情绪/打断/停顿判断；不可用则仅依据转录，不要臆测。` },
-    { type: "text", text },
-  ];
-  for (const [path, url] of urls) {
-    const meta = audios.find((a) => a.audio_path === path);
-    parts.push({
+  const clips: ContentPart[] = [];
+  for (const a of audios) {
+    const url = urls.get(a.audio_path);
+    if (!url) continue;
+    clips.push({
       type: "input_audio",
-      input_audio: { data: url, format: (meta?.audio_format ?? "wav").toLowerCase() },
+      input_audio: { data: url, format: (a.audio_format ?? "wav").toLowerCase() },
     });
   }
-  return parts;
+  if (!clips.length) return { content: text, requested: audios.length, attached: 0 };
+
+  return {
+    content: [
+      { type: "text", text: `随附 ${clips.length} 段原始音频，顺序与转录一致。若音频可用请结合语气/情绪/打断/停顿判断；不可用则仅依据转录，不要臆测。` },
+      { type: "text", text },
+      ...clips,
+    ],
+    requested: audios.length,
+    attached: clips.length,
+  };
 }
 
 /* ------------------------------------------------------------- stats */

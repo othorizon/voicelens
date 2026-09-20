@@ -10,7 +10,7 @@ config({ path: ".env.local" });
 import { closePool, execute, maybeOne, one, query, scalar } from "../src/lib/db";
 import { renderReportHtml } from "../src/lib/engine/report-html";
 import { buildDrillData } from "../src/lib/engine/plan";
-import type { JsonObject, ReportSpec } from "../src/lib/types";
+import type { AudioUsage, JsonObject, ReportSpec } from "../src/lib/types";
 
 const taskId = process.argv[2];
 if (!taskId) {
@@ -29,8 +29,10 @@ async function main() {
     range_end: string | null;
     data_source_id: string;
     template_id: string | null;
+    stats: { audio?: AudioUsage } | null;
   }>(
-    `select id, name, status, report, scope_type, range_start, range_end, data_source_id, template_id
+    `select id, name, status, report, scope_type, range_start, range_end, data_source_id,
+            template_id, stats
      from analysis_tasks where id = $1`,
     [taskId],
   );
@@ -102,6 +104,8 @@ async function main() {
     scopeNote: `${rangeNote} · ${sessionResults.length} 会话 · ${userResults.length} 用户`,
     templateVersion: templateVersion ?? null,
     taskName: task.name,
+    // Carried from the original run; a task from before audio was tracked has none.
+    audio: task.stats?.audio,
   });
 
   await execute(`update analysis_tasks set report_html = $2 where id = $1`, [taskId, html]);

@@ -29,6 +29,47 @@ export async function saveWorkflow(
   return { config };
 }
 
+/**
+ * Patch one node's params in place.
+ *
+ * The analysis workbench shows the same switches the canvas does (听音频、样本
+ * 数…). Before this they were local component state seeded with hardcoded
+ * defaults, so the two pages could disagree about the same setting and the
+ * workbench silently won for the run it started. Now the workbench reads the
+ * graph and writes its choice back here, which keeps the canvas the single
+ * source of truth.
+ *
+ * Deliberately no `validateGraph`: this only ever changes parameter values, it
+ * cannot break the topology, and refusing to save a switch because some other
+ * node is half-wired would be its own trap.
+ */
+export async function updateNodeParams(
+  workflowId: string,
+  kind: string,
+  params: Record<string, unknown>,
+): Promise<void> {
+  const { dataSourceId } = await requireWorkflowAccess(workflowId);
+
+  const stored = await one<{ graph: unknown }>(`select graph from workflows where id = $1`, [
+    workflowId,
+  ]);
+  const graph = normalizeGraph(stored.graph);
+  const node = graph.nodes.find((n) => n.data.kind === kind);
+  if (!node) return; // a graph without this node has nothing to keep in sync
+
+  node.data.params = { ...(node.data.params ?? {}), ...params };
+
+  try {
+    await execute(
+      `update workflows set graph = $2::jsonb, config = $3::jsonb, updated_at = now() where id = $1`,
+      [workflowId, JSON.stringify(graph), JSON.stringify(configFromGraph(graph))],
+    );
+  } catch (err) {
+    throw new ActionError(`保存参数失败：${(err as Error).message}`);
+  }
+  revalidatePath(`/sources/${dataSourceId}/workflow`);
+}
+
 export async function resetWorkflow(workflowId: string): Promise<WfGraph> {
   await requireWorkflowAccess(workflowId);
   const graph = normalizeGraph(null);

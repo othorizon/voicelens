@@ -22,6 +22,7 @@ import { renderReportHtml } from "./report-html";
 import { deriveGroundTruth } from "./ground-truth";
 import { extraHistogramForSessions } from "./plan";
 import type {
+  AudioUsage,
   ExtraFieldDef,
   GlobalAnalysis,
   JsonObject,
@@ -128,6 +129,9 @@ export async function runTask(task: TaskRow, config: WorkflowConfig): Promise<vo
     let succeeded = 0;
     let failed = 0;
     let tokens = 0;
+    // Audio degrades silently, so count what actually reached the model rather
+    // than trusting the switch. See AudioUsage.
+    const audioUse = { sessionsWithAudio: 0, clipsAttached: 0, clipsUnavailable: 0 };
     const results: { session_key: string; user_key: string; result: SessionAnalysis; session: SessionRecord }[] = [];
 
     const CHUNK = 40;
@@ -141,7 +145,7 @@ export async function runTask(task: TaskRow, config: WorkflowConfig): Promise<vo
         let lastError = "";
         for (let attempt = 0; attempt <= config.session.retries; attempt++) {
           try {
-            const { result, tokens: used } = await analyzeSession({
+            const { result, tokens: used, audio } = await analyzeSession({
               session,
               template: task.template,
               useAudio: config.session.useAudio,
@@ -149,6 +153,9 @@ export async function runTask(task: TaskRow, config: WorkflowConfig): Promise<vo
               extraSchemaHint: extraHint,
             });
             tokens += used;
+            if (audio.attached > 0) audioUse.sessionsWithAudio++;
+            audioUse.clipsAttached += audio.attached;
+            audioUse.clipsUnavailable += audio.requested - audio.attached;
             return { ok: true as const, session, result, tokens: used };
           } catch (e) {
             lastError = e instanceof Error ? e.message : String(e);
@@ -416,6 +423,13 @@ export async function runTask(task: TaskRow, config: WorkflowConfig): Promise<vo
       ? drill.users.filter((u) => topUsers.some((t) => t.user_key === u.user_key))
       : drill.users;
 
+    const audio: AudioUsage = {
+      enabled: config.session.useAudio,
+      maxPerSession: config.session.maxAudiosPerSession,
+      sessionsTotal: scope.sessionIds.length,
+      ...audioUse,
+    };
+
     const html = renderReportHtml({
       spec,
       drill,
@@ -423,6 +437,7 @@ export async function runTask(task: TaskRow, config: WorkflowConfig): Promise<vo
       scopeNote: describeScope(task, results.length, userKeys.length),
       templateVersion: task.template.version,
       taskName: task.name,
+      audio,
     });
 
     await execute(
@@ -449,6 +464,7 @@ export async function runTask(task: TaskRow, config: WorkflowConfig): Promise<vo
           duration_ms: Date.now() - Date.parse(startedAt),
           model: process.env.AI_MODEL ?? "qwen3.8-omni-flash",
           metric_overrides: overrides.length,
+          audio,
         }),
         JSON.stringify({
           total: scope.sessionIds.length,

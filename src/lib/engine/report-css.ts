@@ -32,6 +32,9 @@ body{margin:0;background:var(--paper);color:var(--ink);
 .chip{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--line);background:var(--surface);
   border-radius:999px;padding:5px 13px;font-size:12.5px;color:var(--ink-2)}
 .chip b{font-weight:600;color:var(--muted);font-size:11.5px;letter-spacing:.02em}
+/* 「开了音频但一段都没送达」是静默失败，要看得见 */
+.chip.chip-warn{border-color:var(--warn);color:var(--warn)}
+.chip.chip-warn b{color:var(--warn)}
 
 /* hero */
 .hero{margin-top:30px;background:linear-gradient(160deg,#12141b 0%,#1b1f2e 58%,#232a44 100%);color:#f4f5fb;

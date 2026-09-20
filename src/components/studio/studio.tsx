@@ -26,6 +26,7 @@ import {
   type PlanningParams,
 } from "@/lib/actions/studio";
 import { createAnalysisTask } from "@/lib/actions/tasks";
+import { updateNodeParams } from "@/lib/actions/workflow";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -86,6 +87,12 @@ interface StudioState {
   previews: PreviewRow[];
 }
 
+/** Run parameters, seeded from the workflow graph so this page and the canvas agree. */
+export interface StudioRunParams {
+  plan: PlanningParams;
+  preview: { sessions: number; useAudio: boolean };
+}
+
 export function Studio({
   sourceId,
   workflowId,
@@ -94,6 +101,7 @@ export function Studio({
   extraSchema,
   sessionCount,
   initial,
+  runParams,
 }: {
   sourceId: string;
   workflowId: string | null;
@@ -102,14 +110,15 @@ export function Studio({
   extraSchema: ExtraFieldDef[];
   sessionCount: number;
   initial: StudioState;
+  runParams: StudioRunParams;
 }) {
   const router = useRouter();
   const [state, setState] = useState<StudioState>(initial);
   const [selectedId, setSelectedId] = useState<string | null>(
     initial.templates.find((t) => t.status === "confirmed")?.id ?? initial.templates[0]?.id ?? null,
   );
-  const [plan, setPlan] = useState<PlanningParams>({ sessionSamples: 5, userSamples: 4, includeAudio: true, focus: "" });
-  const [previewParams, setPreviewParams] = useState({ sessions: 12, useAudio: false });
+  const [plan, setPlan] = useState<PlanningParams>(runParams.plan);
+  const [previewParams, setPreviewParams] = useState(runParams.preview);
   const [feedback, setFeedback] = useState("");
   const [scope, setScope] = useState<{ type: "incremental" | "range"; start: string; end: string }>({
     type: "incremental",
@@ -174,6 +183,15 @@ export function Studio({
         toast.error("请先导入数据，规划需要真实抽样");
         return;
       }
+      // The params you just ran with become the saved defaults, so the canvas
+      // and this page never drift apart. Persisting on run rather than on every
+      // toggle keeps a bit of fiddling from rewriting the workflow.
+      await persist("plan", {
+        sessionSamples: plan.sessionSamples,
+        userSamples: plan.userSamples,
+        includeAudio: plan.includeAudio,
+        focus: plan.focus,
+      });
       const res =
         kind === "create" || !selected
           ? await startPlanning(sourceId, workflowId, plan)
@@ -192,11 +210,22 @@ export function Studio({
         toast.error("请先完成规划生成模板");
         return;
       }
+      await persist("preview", { sessions: previewParams.sessions, useAudio: previewParams.useAudio });
       const { previewId } = await startPreview(selected.id, previewParams);
       toast.success("预览任务已创建，正在跑抽样分析");
       await poll();
       void previewId;
     };
+  }
+
+  /** Write a node's params back to the workflow; never blocks the run itself. */
+  async function persist(kind: "plan" | "preview", params: Record<string, unknown>) {
+    if (!workflowId) return;
+    try {
+      await updateNodeParams(workflowId, kind, params);
+    } catch {
+      // The run is what the user asked for; a failed sync is not worth aborting it.
+    }
   }
 
   function confirm_() {

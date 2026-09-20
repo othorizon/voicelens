@@ -1,4 +1,4 @@
-import type { ReportSpec, JsonObject } from "@/lib/types";
+import { describeAudioUsage, type AudioUsage, type ReportSpec, type JsonObject } from "@/lib/types";
 import { esc as _esc } from "./report-html-utils";
 import { renderBlock, renderKpis, PALETTE } from "./report-charts";
 import { REPORT_CSS } from "./report-css";
@@ -14,6 +14,8 @@ export interface RenderOptions {
   templateVersion?: number | null;
   taskName?: string;
   standalone?: boolean;
+  /** Whether this run actually listened to anything; rendered as a header chip. */
+  audio?: AudioUsage;
 }
 
 export interface DrillUser {
@@ -61,8 +63,13 @@ const fmt = (n: number, unit?: string) => {
 };
 
 /** Build the complete single-page HTML report. */
+/** Flag the one case that looks fine but is not: switch on, nothing delivered. */
+function audioChipClass(u: AudioUsage): string {
+  return u.enabled && u.clipsAttached === 0 && u.clipsUnavailable > 0 ? " chip-warn" : "";
+}
+
 export function renderReportHtml(opts: RenderOptions): string {
-  const { spec, drill, generatedAt = new Date().toISOString(), backHref, scopeNote, templateVersion, taskName } = opts;
+  const { spec, drill, generatedAt = new Date().toISOString(), backHref, scopeNote, templateVersion, taskName, audio } = opts;
   const drillUsers = drill?.users ?? [];
   const hasDrill = drillUsers.length > 0;
 
@@ -119,6 +126,7 @@ export function renderReportHtml(opts: RenderOptions): string {
   <div class="chips">
     ${(spec.meta ?? []).map((m) => `<span class="chip"><b>${esc(m.label)}</b>${esc(m.value)}</span>`).join("")}
     ${scopeNote ? `<span class="chip"><b>范围</b>${esc(scopeNote)}</span>` : ""}
+    ${audio ? `<span class="chip${audioChipClass(audio)}"><b>音频</b>${esc(describeAudioUsage(audio))}</span>` : ""}
     ${templateVersion ? `<span class="chip"><b>模板</b>v${templateVersion}</span>` : ""}
     ${taskName ? `<span class="chip"><b>任务</b>${esc(taskName)}</span>` : ""}
     <span class="chip"><b>生成时间</b>${esc(new Date(generatedAt).toLocaleString("zh-CN", { hour12: false }))}</span>

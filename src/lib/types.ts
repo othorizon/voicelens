@@ -195,3 +195,40 @@ export type TaskStage =
   | "global_aggregation"
   | "report_generation"
   | "done";
+
+/**
+ * Whether a run actually listened to anything.
+ *
+ * Audio degrades silently by design — the prompt tells the model to fall back
+ * to the transcript when a clip will not load — so "switch was off", "switch
+ * was on but nothing reached the model" and "it listened to 1847 clips" all
+ * produce a report that reads the same. These counters are what tells them
+ * apart, and they are recorded whether the switch was on or off.
+ */
+export interface AudioUsage {
+  /** The 「送入音频」 switch on the analysis node. */
+  enabled: boolean;
+  /** Per-session cap that was in force. */
+  maxPerSession: number;
+  /** Sessions that got at least one clip attached. */
+  sessionsWithAudio: number;
+  /** Sessions the run covered, for the denominator. */
+  sessionsTotal: number;
+  /** Clips actually attached to a prompt. */
+  clipsAttached: number;
+  /** Clips the database had a path for, but that could not be signed. */
+  clipsUnavailable: number;
+}
+
+/** One-line rendering of {@link AudioUsage}, for a report chip or a task page. */
+export function describeAudioUsage(u: AudioUsage): string {
+  const n = (v: number) => v.toLocaleString("en-US");
+  if (!u.enabled) return "未启用（纯文本分析）";
+  if (u.clipsAttached === 0) {
+    return u.clipsUnavailable > 0
+      ? `已启用，但 ${n(u.clipsUnavailable)} 段全部未取到`
+      : "已启用，但数据中没有音频";
+  }
+  const missing = u.clipsUnavailable > 0 ? `，${n(u.clipsUnavailable)} 段未取到` : "";
+  return `已启用 · ${n(u.sessionsWithAudio)}/${n(u.sessionsTotal)} 会话 · ${n(u.clipsAttached)} 段${missing}`;
+}

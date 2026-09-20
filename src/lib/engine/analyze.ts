@@ -80,13 +80,22 @@ export interface AnalyzeSessionOptions {
 
 const JSON_RULE = `\n\n# 输出硬性约束\n只输出一个 JSON 对象，严格按上面的字段结构，不要 Markdown 代码块、不要注释、不要解释文字。metrics 必须是数组，key 使用英文 snake_case。所有结论必须能被提供的对话内容支撑，无法判断时使用保守值（outcome=unknown、risk_level=none、quality_score 取中间值）。`;
 
+/** What one session contributed to the run's audio tally. */
+export interface SessionAudioUsage {
+  /** Clips the database had a path for, after the per-session cap. */
+  requested: number;
+  /** Clips that were signed and attached to the prompt. */
+  attached: number;
+}
+
 export async function analyzeSession(opts: AnalyzeSessionOptions): Promise<{
   result: SessionAnalysis;
   tokens: number;
+  audio: SessionAudioUsage;
 }> {
   const { session, template, extraSchemaHint } = opts;
   const payload = renderSessionPayload(session, extraSchemaHint);
-  const parts = await buildSessionContent(opts, payload);
+  const { parts, audio } = await buildSessionContent(opts, payload);
 
   const res = await chat(
     [
@@ -112,29 +121,43 @@ export async function analyzeSession(opts: AnalyzeSessionOptions): Promise<{
     return {
       result: normalizeSessionResult(parsed2.value, session),
       tokens: res.usage.total_tokens + retry.usage.total_tokens,
+      audio,
     };
   }
-  return { result: normalizeSessionResult(parsed.value, session), tokens: res.usage.total_tokens };
+  return { result: normalizeSessionResult(parsed.value, session), tokens: res.usage.total_tokens, audio };
 }
 
-async function buildSessionContent(opts: AnalyzeSessionOptions, payload: string): Promise<ContentPart[]> {
+async function buildSessionContent(
+  opts: AnalyzeSessionOptions,
+  payload: string,
+): Promise<{ parts: ContentPart[]; audio: SessionAudioUsage }> {
   const content: ContentPart[] = [{ type: "text", text: payload }];
-  if (!opts.useAudio || opts.maxAudiosPerSession <= 0 || opts.session.audio_count <= 0) return content;
+  const none: SessionAudioUsage = { requested: 0, attached: 0 };
+  if (!opts.useAudio || opts.maxAudiosPerSession <= 0 || opts.session.audio_count <= 0) {
+    return { parts: content, audio: none };
+  }
 
   const audios = await loadSessionAudio(opts.session.id, opts.maxAudiosPerSession);
-  if (!audios.length) return content;
+  if (!audios.length) return { parts: content, audio: none };
+
+  // `signedUrls` drops whatever it cannot sign, so requested - attached is the
+  // count that quietly never reached the model.
   const urls = await signedAudioUrls(audios.map((a) => a.audio_path));
+  let attached = 0;
   for (const a of audios) {
     const url = urls.get(a.audio_path);
-    if (url) content.push({ type: "input_audio", input_audio: { data: url, format: normalizeFormat(a.audio_format) } });
+    if (!url) continue;
+    content.push({ type: "input_audio", input_audio: { data: url, format: normalizeFormat(a.audio_format) } });
+    attached++;
   }
-  if (content.length > 1) {
+
+  if (attached > 0) {
     content.unshift({
       type: "text",
-      text: `随附 ${content.length - 1} 段本次会话的原始音频，顺序与转录轮次一致。请结合音频中的语气、语速、停顿、打断与情绪判断；若音频不可用，仅依据转录文本分析，不要臆测音频内容。`,
+      text: `随附 ${attached} 段本次会话的原始音频，顺序与转录轮次一致。请结合音频中的语气、语速、停顿、打断与情绪判断；若音频不可用，仅依据转录文本分析，不要臆测音频内容。`,
     });
   }
-  return content;
+  return { parts: content, audio: { requested: audios.length, attached } };
 }
 
 function normalizeFormat(fmt?: string | null): string {
