@@ -19,6 +19,7 @@ import {
   GitBranch,
   CircleAlert,
   Calculator,
+  Paintbrush,
   Wand2,
 } from "lucide-react";
 import {
@@ -84,6 +85,10 @@ interface PreviewRow extends JsonObject {
   created_at: string;
   finished_at: string | null;
   hasHtml: boolean;
+  /** Whether the page source was kept, so a note can be applied to it. */
+  hasPage: boolean;
+  /** The note this preview's report was produced from, if any. */
+  report_feedback: string | null;
   /** Regenerated the report over an earlier preview's analysis. */
   reportOnly: boolean | null;
   stats: JsonObject;
@@ -205,6 +210,9 @@ export function Studio({
     (p) => p.template_id === selected?.id && p.status === "completed" && p.hasHtml,
   );
   const shownPreview = selectedPreview ?? latestPreview;
+  // A note can only be applied to a page that was kept: an older preview, or one
+  // that fell back to the block renderer, has to be regenerated instead.
+  const canReviseReport = Boolean(shownPreview?.hasPage);
   const shownVersion = versionOf(state.templates, shownPreview?.template_id);
   const previewIsStale = Boolean(shownPreview && selected && shownPreview.template_id !== selected.id);
   // Only the newest preview's failure is worth showing: an older one has
@@ -261,6 +269,24 @@ export function Studio({
    * that owns the prompts, which edits them in place. No sampling, so none of
    * the planning params apply and nothing is written back to the workflow.
    */
+  /**
+   * Spend the note on the report page alone.
+   *
+   * The two acts beside this one fork a template version, because they change
+   * what gets analysed. Most notes about a preview are not about that at all —
+   * they are about the page — and answering those by rewriting prompts and
+   * re-analysing twelve conversations is the long way round to a layout fix.
+   */
+  function reviseReport_() {
+    return async () => {
+      if (!shownPreview) throw new Error("没有可修改的预览报告");
+      await rerunPreviewReport(shownPreview.id, feedback);
+      toast.success("已排队：按建议修改报告");
+      setFeedback("");
+      await poll();
+    };
+  }
+
   function refine_() {
     return async () => {
       if (!selected) {
@@ -675,7 +701,14 @@ export function Studio({
                     >
                       v{versionOf(state.templates, p.template_id)}
                     </span>
-                    {p.reportOnly ? (
+                    {p.report_feedback ? (
+                      <span
+                        className="shrink-0 rounded bg-accent px-1 text-[10.5px] text-primary"
+                        title={p.report_feedback}
+                      >
+                        按建议修改
+                      </span>
+                    ) : p.reportOnly ? (
                       <span className="shrink-0 rounded bg-muted px-1 text-[10.5px]">仅报告</span>
                     ) : null}
                   </div>
@@ -768,15 +801,23 @@ export function Studio({
                   <JobFailure job={refineFailure} />
                 </div>
               ) : null}
-              <div className="mt-2.5 grid gap-2.5 md:grid-cols-2">
+              <div className="mt-2.5 grid gap-2.5 md:grid-cols-3">
+                <FeedbackAction
+                  icon={busy === "revise-report" || activePreview ? Loader2 : Paintbrush}
+                  spinning={busy === "revise-report" || Boolean(activePreview)}
+                  title="按建议只改报告"
+                  desc="不动提示词、不重新分析：模型拿到现在这份报告页面、它的渲染截图和你的建议，只改建议指到的地方。适合排版、图表形态、配色、章节顺序这类「页面本身不对」的问题。一次调用。"
+                  onClick={() => void guard(reviseReport_(), "revise-report")}
+                  disabled={!feedback.trim() || !canReviseReport || Boolean(activePreview) || Boolean(activeJob)}
+                  primary
+                />
                 <FeedbackAction
                   icon={busy === "refine" || activeJob ? Loader2 : Wand2}
                   spinning={busy === "refine" || Boolean(activeJob)}
                   title="按建议直接改配置"
-                  desc="不重新抽样、不重新试听音频，模型只在现有提示词上改动建议涉及的部分，几十秒完成。适合口径微调、章节顺序、增删指标。"
+                  desc="不重新抽样、不重新试听音频，模型只在现有提示词上改动建议涉及的部分，几十秒完成。适合口径微调、增删指标 —— 也就是要改的是「分析什么」。"
                   onClick={() => void guard(refine_(), "refine")}
                   disabled={!feedback.trim() || Boolean(activeJob)}
-                  primary
                 />
                 <FeedbackAction
                   icon={busy === "revise" || activeJob ? Loader2 : Send}
@@ -788,7 +829,11 @@ export function Studio({
                 />
               </div>
               <div className="mt-2 text-[11px] text-muted-foreground">
-                两者都基于 v{selected.version}，生成 v{nextVersion}（父版本保留，可随时切回）。
+                后两者基于 v{selected.version}，生成 v{nextVersion}（父版本保留，可随时切回）；
+                「只改报告」不产生模板版本，落地为一份新的预览报告。
+                {canReviseReport
+                  ? null
+                  : " 当前没有可修改的预览报告页面（需要一份已完成、且由 AI 生成页面的预览）。"}
               </div>
             </div>
           ) : (

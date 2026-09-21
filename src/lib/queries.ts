@@ -172,8 +172,12 @@ export async function loadStudioState(dataSourceId: string) {
     ),
     query<JsonObject>(
       `select id, template_id, status, progress, error, created_at, finished_at, stats,
+              report_feedback,
               (params->>'reportOnly')::boolean as "reportOnly",
-              (html is not null and html <> '') as "hasHtml"
+              (html is not null and html <> '') as "hasHtml",
+              -- Whether this preview's report can be revised by note rather
+              -- than regenerated: the block renderer leaves no page behind.
+              (page is not null and page <> '') as "hasPage"
        from template_previews
        where data_source_id = $1
        order by created_at desc

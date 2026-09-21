@@ -22,6 +22,9 @@ WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
 
 # 先只拷依赖清单：package.json / package-lock.json 没变时这层走缓存
+# playwright 现在是生产依赖（Worker 用它渲染并校验报告页面），但浏览器用镜像里的
+# 发行版 chromium，所以跳过它 postinstall 时自带的那份下载。
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
 
@@ -46,6 +49,33 @@ WORKDIR /app
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \
     PORT=3000
+
+# ---------------------------------------------- 报告校验用的浏览器
+# 报告页面是模型写的。平台在真实浏览器里渲染它、把校验结果和截图发回给模型，不合格就让
+# 它改到合格为止。没有浏览器，这一步整段被跳过（只剩静态检查），报告就是「从来没人看过
+# 一眼」直接发出去的 —— 线上报告排版错乱、深色模式看不见字、窄屏横向溢出，绝大多数
+# 就是这里没有浏览器。
+#
+# 用发行版的 chromium，而不是 `npx playwright install`：后者要再下载一份 ~150MB 的浏览器
+# 和一堆运行库，而 playwright 只需要一个可执行文件路径（VOICELENS_CHROMIUM_PATH，见
+# src/lib/engine/report-validate.ts）。apt 会把它需要的系统库一并带上。
+#
+# fonts-noto-cjk 不是可选项：缺中文字体时截图里全是豆腐块，模型会照着「修」根本不存在
+# 的排版问题，比不给它看更糟。
+#
+# 不想要这 ~300MB：--build-arg WITH_BROWSER=false。此时报告不做渲染校验也没有截图，
+# 任务日志里会写明；自己另外提供浏览器的话，运行时用 -e VOICELENS_CHROMIUM_PATH=... 覆盖。
+ARG WITH_BROWSER=true
+RUN set -eu; \
+    if [ "$WITH_BROWSER" = "true" ]; then \
+      apt-get update; \
+      apt-get install -y --no-install-recommends chromium fonts-noto-cjk; \
+      rm -rf /var/lib/apt/lists/*; \
+      /usr/bin/chromium --version; \
+    else \
+      echo "WITH_BROWSER=false：镜像内不含浏览器，报告将跳过渲染校验与截图"; \
+    fi
+ENV VOICELENS_CHROMIUM_PATH=/usr/bin/chromium
 
 # 运行期要三样东西：构建产物 .next、生产依赖 node_modules、
 # 以及 Worker 与迁移直接用 tsx 执行的 TS 源码（worker/、db/、被 worker 引用的 src/）。

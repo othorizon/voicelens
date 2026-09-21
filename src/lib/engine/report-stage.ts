@@ -1,12 +1,13 @@
-import { callJson, execute, maybeOne, query } from "@/lib/db";
+import { callJson, execute, maybeOne, one, query } from "@/lib/db";
 import { generateReport } from "./analyze";
 import { buildDrillData, collectEvidence, computeStats, extraHistogramForSessions } from "./plan";
 import { deriveGroundTruth, type GroundTruth } from "./ground-truth";
 import { renderReportHtml } from "./report-html";
 import { generateReportPage } from "./report-generate";
+import { reviseReportPage } from "./report-revise";
 import { buildReportPayload } from "./report-payload";
 import { composeReportDocument } from "./report-runtime";
-import type { ValidationResult } from "./report-validate";
+import { renderIssues, type ValidationResult } from "./report-validate";
 import type { AnalysisRuntime } from "@/lib/models/registry";
 import type { WorkflowConfig } from "@/lib/workflow/definition";
 import type {
@@ -55,6 +56,11 @@ export interface ReportStageInputs {
 export interface ReportStageResult {
   /** What was stored and will be served. */
   document: string;
+  /**
+   * The model's page before the runtime was injected — what a later revision
+   * starts from. Null on the block-renderer path, which has no page source.
+   */
+  page: string | null;
   /** Which path produced it: the generated page, or the block renderer. */
   engine: "page" | "spec";
   spec: ReportSpec | null;
@@ -63,7 +69,43 @@ export interface ReportStageResult {
   tokens: number;
   /** Ground-truth corrections, only meaningful on the spec path. */
   overrides: number;
-  screenshot?: Buffer;
+  /** How a revision changed the page, when this run was one. */
+  mode?: "patch" | "rewrite" | "mixed" | "none";
+  /** The row in `task_reports`, when this run persisted one. */
+  reportId?: string;
+  /** Its number in the task's report history. */
+  version?: number;
+}
+
+/** A note asking for a specific change to the report that already exists. */
+export interface ReportRevision {
+  feedback: string;
+  /** The page to change, as stored on `task_reports.page`. */
+  basePage: string;
+  /** Which version it came from, recorded as the new version's parent. */
+  baseReportId: string | null;
+}
+
+/**
+ * The newest stored version that can actually be revised.
+ *
+ * A report from the block renderer has no page source, and so does any report
+ * produced before migration 006 — both have to be regenerated rather than
+ * revised, and saying so up front beats failing three minutes into a model
+ * call. `reportId` is returned even when the page is missing, so the caller can
+ * name the version it could not use.
+ */
+export async function loadRevisionBase(
+  taskId: string,
+  reportId?: string | null,
+): Promise<{ id: string; version: number | null; page: string | null; engine: string | null } | null> {
+  return maybeOne<{ id: string; version: number | null; page: string | null; engine: string | null }>(
+    reportId
+      ? `select id, version, page, engine from task_reports where task_id = $1 and id = $2`
+      : `select id, version, page, engine from task_reports
+         where task_id = $1 order by version desc nulls last, created_at desc limit 1`,
+    reportId ? [taskId, reportId] : [taskId],
+  );
 }
 
 /* ------------------------------------------------------------------- load */
@@ -134,6 +176,17 @@ export async function runReportStage(input: {
   onStep?: (message: string) => void;
   /** Persist the result onto the task row and task_reports. */
   persist?: boolean;
+  /**
+   * Change the report that exists instead of writing another one. The three
+   * analysis layers are read the same way either way — a revision differs only
+   * in where the page starts from.
+   */
+  revise?: ReportRevision;
+  /**
+   * Checked between the report loop's turns. The stage can now run for many
+   * minutes, so whoever owns the task needs a way to say "stop".
+   */
+  shouldStop?: () => Promise<string | null>;
 }): Promise<ReportStageResult> {
   const step = input.onStep ?? (() => {});
   const inputs = await loadReportStageInputs(input.taskId);
@@ -173,25 +226,49 @@ export async function runReportStage(input: {
     models: input.models,
   });
 
-  const generated = await generateReportPage({
-    runtime: input.runtime,
-    brief: inputs.brief,
-    payload,
-    onStep: step,
-  });
+  const revised = input.revise
+    ? await reviseReportPage({
+        runtime: input.runtime,
+        brief: inputs.brief,
+        payload,
+        page: input.revise.basePage,
+        feedback: input.revise.feedback,
+        onStep: step,
+        shouldStop: input.shouldStop,
+      })
+    : null;
+  const generated =
+    revised ??
+    (await generateReportPage({
+      runtime: input.runtime,
+      brief: inputs.brief,
+      payload,
+      onStep: step,
+      shouldStop: input.shouldStop,
+    }));
 
   let result: ReportStageResult;
   if (generated.validation.ok) {
     result = {
       document: generated.document,
+      page: generated.page,
       engine: "page",
       spec: null,
       validation: generated.validation,
       attempts: generated.attempts,
       tokens: generated.tokens,
       overrides: 0,
-      screenshot: generated.screenshot,
+      mode: revised?.mode,
     };
+  } else if (input.revise) {
+    // A revision that could not be made to render must not silently become a
+    // block-rendered report: the reviewer asked for a change to a page they
+    // were otherwise keeping, and replacing it with a different report
+    // altogether answers a question nobody asked.
+    throw new Error(
+      `按建议修改报告失败：改出来的页面没有通过渲染校验（${generated.attempts} 轮）。` +
+        `原报告未被替换。${renderIssues(generated.validation.issues).slice(0, 600)}`,
+    );
   } else {
     // Generation had its tries and the page still does not render. The block
     // renderer is not as good a report, but it is a report.
@@ -212,18 +289,33 @@ export async function runReportStage(input: {
   }
 
   if (input.persist !== false) {
-    await execute(
-      `insert into task_reports (task_id, kind, title, report, html, created_by)
-       values ($1, $2, $3, $4::jsonb, $5, $6)`,
+    // The version number is computed in the insert rather than read first, which
+    // keeps it to one statement; `task_reports_task_version_key` is what
+    // actually makes a duplicate impossible, because max + 1 under READ
+    // COMMITTED would happily hand two concurrent inserts the same number.
+    const stored = await one<{ id: string; version: number }>(
+      `insert into task_reports
+         (task_id, kind, title, report, html, page, engine, feedback, parent_id, validation, version, created_by)
+       values ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10::jsonb,
+               (select coalesce(max(version), 0) + 1 from task_reports where task_id = $1), $11)
+       returning id, version`,
       [
         input.taskId,
-        result.engine === "page" ? "final" : "final-fallback",
+        reportKind(result.engine, Boolean(input.revise)),
         payload.meta.title,
         result.spec ? JSON.stringify(result.spec) : null,
         result.document,
+        result.page,
+        result.engine,
+        input.revise?.feedback ?? "",
+        input.revise?.baseReportId ?? null,
+        JSON.stringify(summarizeValidation(result.validation)),
         inputs.task.created_by,
       ],
     );
+    result.reportId = stored.id;
+    result.version = stored.version;
+
     await execute(
       `update analysis_tasks set report = $2::jsonb, report_html = $3 where id = $1`,
       [input.taskId, result.spec ? JSON.stringify(result.spec) : null, result.document],
@@ -297,6 +389,9 @@ async function renderWithSpecEngine(input: {
 
   return {
     document: html,
+    // The block renderer assembles a document from a spec; there is no model
+    // page underneath it, so there is nothing a revision could start from.
+    page: null,
     engine: "spec",
     spec,
     attempts: 0,
@@ -306,6 +401,28 @@ async function renderWithSpecEngine(input: {
 }
 
 /* ---------------------------------------------------------------- helpers */
+
+/** What the row is called, so the history reads without decoding flags. */
+function reportKind(engine: "page" | "spec", revised: boolean): string {
+  if (engine === "spec") return "final-fallback";
+  return revised ? "revision" : "final";
+}
+
+/**
+ * The verdict, without the frames.
+ *
+ * `ValidationResult` carries the screenshots, which are megabytes of JPEG and
+ * derived from the page stored beside it. What is worth keeping is why the
+ * version was accepted.
+ */
+function summarizeValidation(validation: ValidationResult | undefined): JsonObject {
+  if (!validation) return {};
+  return {
+    ok: validation.ok,
+    stats: validation.stats as unknown as JsonObject,
+    issues: validation.issues.map((i) => ({ level: i.level, kind: i.kind, message: i.message })),
+  };
+}
 
 function describeScope(inputs: ReportStageInputs, sessions: number, users: number): string {
   const t = inputs.task;

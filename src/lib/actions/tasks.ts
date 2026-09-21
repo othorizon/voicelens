@@ -238,10 +238,14 @@ export async function cancelTask(taskId: string): Promise<void> {
   await requireTaskAccess(taskId);
   try {
     // Only an in-flight task can be cancelled; a finished one is left alone.
+    // `report_pending` is in the list because the report stage is a loop that
+    // can run for minutes now: the Worker checks this status between turns and
+    // stops, so a cancel during report generation is honoured rather than
+    // merely recorded.
     await execute(
       `update analysis_tasks
        set status = 'cancelled', error = '用户手动取消'
-       where id = $1 and status in ('pending', 'running', 'aggregating', 'reporting')`,
+       where id = $1 and status in ('pending', 'running', 'aggregating', 'reporting', 'report_pending')`,
       [taskId],
     );
   } catch (err) {
@@ -265,7 +269,8 @@ export async function rerunReport(taskId: string): Promise<void> {
   try {
     parked = await execute(
       `update analysis_tasks
-       set status = 'report_pending', stage = 'report_generation', error = null, finished_at = null
+       set status = 'report_pending', stage = 'report_generation', error = null, finished_at = null,
+           report_request = null
        where id = $1 and status in ('completed', 'failed')`,
       [taskId],
     );
@@ -273,6 +278,65 @@ export async function rerunReport(taskId: string): Promise<void> {
     throw new ActionError(`重新生成报告失败：${(err as Error).message}`);
   }
   if (!parked) throw new ActionError("只有已完成或已失败的任务可以单独重新生成报告");
+  revalidatePath(`/tasks/${taskId}`);
+  revalidatePath("/tasks");
+}
+
+/**
+ * Change the report that exists, instead of asking for another one.
+ *
+ * `rerunReport` throws the page away and designs again from the brief, which
+ * answers "I don't like this report". It does not answer "this report is right
+ * except the legend covers the title" — there, regenerating loses a layout
+ * someone already approved and may well reintroduce the same defect elsewhere.
+ *
+ * The note is parked on the row next to the same `report_pending` status the
+ * rerun uses, so there is one queue, one claim and one code path in the Worker.
+ * Which version it applies to is resolved here, so a revision can never be
+ * silently based on a newer report that arrived while the note was being
+ * written.
+ */
+export async function reviseReport(taskId: string, feedback: string): Promise<void> {
+  const { session } = await requireTaskAccess(taskId);
+  const note = feedback.trim();
+  if (!note) throw new ActionError("请填写修改建议");
+  if (note.length > 4000) throw new ActionError("修改建议太长了，请精简到 4000 字以内");
+
+  const base = await maybeOne<{ id: string; version: number | null; page: string | null; engine: string | null }>(
+    `select id, version, page, engine from task_reports
+     where task_id = $1 order by version desc nulls last, created_at desc limit 1`,
+    [taskId],
+  );
+  if (!base) throw new ActionError("这个任务还没有报告可以修改，请先生成一次报告");
+  if (!base.page) {
+    throw new ActionError(
+      base.engine === "spec"
+        ? "这份报告是内置渲染器产出的，没有可修改的页面源码，请先「重新生成报告」拿到 AI 生成的页面"
+        : "这份报告生成于本功能上线之前，没有保存页面源码，请先「重新生成报告」",
+    );
+  }
+
+  let parked = 0;
+  try {
+    parked = await execute(
+      `update analysis_tasks
+       set status = 'report_pending', stage = 'report_generation', error = null, finished_at = null,
+           report_request = $2::jsonb
+       where id = $1 and status in ('completed', 'failed')`,
+      [
+        taskId,
+        JSON.stringify({
+          kind: "revise",
+          feedback: note,
+          baseReportId: base.id,
+          requestedBy: session.userId,
+        }),
+      ],
+    );
+  } catch (err) {
+    throw new ActionError(`按建议修改报告失败：${(err as Error).message}`);
+  }
+  if (!parked) throw new ActionError("只有已完成或已失败的任务可以修改报告");
   revalidatePath(`/tasks/${taskId}`);
   revalidatePath("/tasks");
 }

@@ -4,8 +4,10 @@ import { notFound } from "next/navigation";
 import { FileBarChart, ExternalLink, Download, Layers, Users, MessagesSquare } from "lucide-react";
 import { callJson, count as countRows, maybeOne } from "@/lib/db";
 import { requireTaskPage } from "@/lib/actions/common";
+import { listReportVersions } from "@/lib/report-history";
 import { TaskLive } from "@/components/task-live";
 import { DrillExplorer } from "@/components/drill-explorer";
+import { ReportRevise } from "@/components/report-revise";
 import { BarStrip, Donut } from "@/components/mini-charts";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -46,7 +48,7 @@ export default async function TaskDetailPage({ params }: { params: Promise<{ id:
   };
   const completed = t.status === "completed";
 
-  const [globalRes, sessionStats, userStats, userCount] = await Promise.all([
+  const [globalRes, sessionStats, userStats, userCount, reportVersions] = await Promise.all([
     maybeOne<{ result: JsonObject | null; status: string }>(
       `select result, status from task_global_result where task_id = $1`,
       [id],
@@ -54,6 +56,10 @@ export default async function TaskDetailPage({ params }: { params: Promise<{ id:
     completed ? callJson<JsonObject>("task_session_stats", [id, "all", null]) : null,
     completed ? callJson<JsonObject>("task_user_stats", [id]) : null,
     countRows(`select count(*) from task_session_results where task_id = $1`, [id]),
+    // Deliberately not gated on `completed`: a failed task can still have an
+    // earlier report worth reading, and the revision panel needs the history to
+    // say whether the newest one can be revised at all.
+    listReportVersions(id),
   ]);
 
   const g = (globalRes?.result ?? {}) as JsonObject;
@@ -139,11 +145,21 @@ export default async function TaskDetailPage({ params }: { params: Promise<{ id:
 
         {!completed ? (
           <EmptyState
-            title={t.status === "failed" ? "任务失败，未产出报告" : "任务尚未完成"}
+            title={
+              t.status !== "failed"
+                ? "任务尚未完成"
+                : t.report_html
+                  ? "任务失败，上一份报告仍然可用"
+                  : "任务失败，未产出报告"
+            }
             description={
-              t.status === "failed"
-                ? "查看上方日志定位原因，修正模板或数据后点击「重跑」。"
-                : "Worker 正在按 会话 → 用户 → 全局 → 报告 的顺序执行，完成后报告会显示在这里。"
+              t.status !== "failed"
+                ? "Worker 正在按 会话 → 用户 → 全局 → 报告 的顺序执行，完成后报告会显示在这里。"
+                : t.report_html
+                  ? // A report generation or revision that fails leaves the report it
+                    // started from untouched, so it is still down there to read.
+                    "下方是上一次成功生成的报告，没有被这次失败改动。失败原因见上方日志；也可以直接在报告下方提交修改建议重试。"
+                  : "查看上方日志定位原因，修正模板或数据后点击「重跑」。"
             }
             className="py-12"
           />
@@ -294,33 +310,6 @@ export default async function TaskDetailPage({ params }: { params: Promise<{ id:
               </Card>
             </div>
 
-            {/* ------------------------------------------------------ 报告 */}
-            {t.report_html ? (
-              <Card>
-                <CardHeader className="flex-row items-center justify-between space-y-0">
-                  <div className="space-y-1">
-                    <CardTitle className="text-sm font-semibold">动态生成的单页报告</CardTitle>
-                    <CardDescription className="text-[12px]">
-                      报告本身自带三层下探：章节内的下探按钮与末尾的用户索引都可点开抽屉查看用户画像与会话转录。
-                    </CardDescription>
-                  </div>
-                  <Button asChild size="sm" variant="ghost" className="h-8">
-                    <a href={`/api/report/task/${id}`} target="_blank" rel="noreferrer">
-                      <ExternalLink className="size-3.5" />
-                      全屏
-                    </a>
-                  </Button>
-                </CardHeader>
-                <CardContent>
-                  <iframe
-                    src={`/api/report/task/${id}`}
-                    title="分析报告"
-                    className="h-[720px] w-full rounded-xl border border-border/70 bg-white"
-                  />
-                </CardContent>
-              </Card>
-            ) : null}
-
             {/* -------------------------------------------------- 三层下探 */}
             <div>
               <div className="mb-3 flex flex-wrap items-center gap-2">
@@ -334,6 +323,47 @@ export default async function TaskDetailPage({ params }: { params: Promise<{ id:
             </div>
           </>
         )}
+
+        {/* -------------------------------------------------------- 报告 */}
+        {/* Outside the `completed` branch on purpose: a report generation or
+            revision that fails leaves the report it started from in place, and
+            that report is the thing someone came to read. */}
+        {t.report_html ? (
+          <Card>
+            <CardHeader className="flex-row items-center justify-between space-y-0">
+              <div className="space-y-1">
+                <CardTitle className="text-sm font-semibold">动态生成的单页报告</CardTitle>
+                <CardDescription className="text-[12px]">
+                  报告本身自带三层下探：章节内的下探按钮与末尾的用户索引都可点开抽屉查看用户画像与会话转录。
+                </CardDescription>
+              </div>
+              <Button asChild size="sm" variant="ghost" className="h-8">
+                <a href={`/api/report/task/${id}`} target="_blank" rel="noreferrer">
+                  <ExternalLink className="size-3.5" />
+                  全屏
+                </a>
+              </Button>
+            </CardHeader>
+            <CardContent>
+              <iframe
+                src={`/api/report/task/${id}`}
+                title="分析报告"
+                className="h-[720px] w-full rounded-xl border border-border/70 bg-white"
+              />
+            </CardContent>
+          </Card>
+        ) : null}
+
+        {/* ---------------------------------------------------- 报告修改建议 */}
+        {t.report_html ? (
+          <ReportRevise
+            taskId={id}
+            versions={reportVersions}
+            active={["pending", "running", "aggregating", "reporting", "report_pending"].includes(
+              String(t.status),
+            )}
+          />
+        ) : null}
       </div>
     </>
   );

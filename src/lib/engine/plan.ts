@@ -42,6 +42,7 @@ import type { DrillData, DrillSession, DrillUser } from "./report-html";
 import { renderReportHtml } from "./report-html";
 import { buildReportPayload } from "./report-payload";
 import { generateReportPage } from "./report-generate";
+import { reviseReportPage } from "./report-revise";
 import { deriveGroundTruth, type HistogramEntry } from "./ground-truth";
 
 export interface DataSourceLike {
@@ -479,6 +480,8 @@ export interface PreviewOutput {
   /** Only set when the page could not be generated and the renderer ran. */
   spec: ReportSpec | null;
   html: string;
+  /** The model's page before injection, so the next round can revise it. */
+  page: string | null;
 }
 
 export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> {
@@ -659,6 +662,7 @@ export async function buildPreview(input: PreviewInput): Promise<PreviewOutput> 
     },
     spec: report.spec,
     html: report.html,
+    page: report.page,
   };
 }
 
@@ -688,12 +692,20 @@ export interface PreviewReportInput {
   stats: JsonObject;
   histograms: HistogramEntry[];
   audio: AudioUsage;
+  /**
+   * Change the page this preview already has instead of designing another one.
+   * The same note that would have gone into a replan can be spent on the report
+   * alone, which is where most of it was aimed anyway.
+   */
+  revise?: { page: string; feedback: string };
   onProgress?: (message: string) => void;
 }
 
 export interface PreviewReportOutput {
   spec: ReportSpec | null;
   html: string;
+  /** The model's page before injection. Null on the block-renderer path. */
+  page: string | null;
   engine: "page" | "spec";
   attempts: number;
 }
@@ -752,16 +764,43 @@ export async function renderPreviewReport(input: PreviewReportInput): Promise<Pr
     sessions: drill.sessions as unknown as JsonObject[],
   };
 
-  const generated = await generateReportPage({
-    runtime: input.runtime,
-    brief: template.report_prompt,
-    payload,
-    snapshot,
-    onStep: step,
-  });
+  const generated = input.revise
+    ? await reviseReportPage({
+        runtime: input.runtime,
+        brief: template.report_prompt,
+        payload,
+        snapshot,
+        page: input.revise.page,
+        feedback: input.revise.feedback,
+        onStep: step,
+      })
+    : await generateReportPage({
+        runtime: input.runtime,
+        brief: template.report_prompt,
+        payload,
+        snapshot,
+        onStep: step,
+      });
 
   if (generated.validation.ok) {
-    return { spec: null, html: generated.document, engine: "page", attempts: generated.attempts };
+    return {
+      spec: null,
+      html: generated.document,
+      page: generated.page,
+      engine: "page",
+      attempts: generated.attempts,
+    };
+  }
+
+  // A revision is asked for against a page the operator was otherwise keeping.
+  // Answering it with a block-rendered report would throw that page away to
+  // deliver something nobody asked for, so it fails and leaves the preview it
+  // was derived from alone.
+  if (input.revise) {
+    throw new Error(
+      `按建议修改预览报告失败：改出来的页面没有通过渲染校验（${generated.attempts} 轮）。` +
+        `上一份预览报告仍然可用。`,
+    );
   }
 
   // The preview is what the operator judges the template by, so it must exist
@@ -793,6 +832,7 @@ export async function renderPreviewReport(input: PreviewReportInput): Promise<Pr
       scopeNote: `预览样本 ${input.sessionResults.length} 个会话 / ${input.userResults.length} 位用户`,
       audio: input.audio,
     }),
+    page: null,
     engine: "spec",
     attempts: generated.attempts,
   };
@@ -820,6 +860,8 @@ export async function buildPreviewReportOnly(input: {
     globalResult: JsonObject;
     stats: JsonObject;
   };
+  /** Change that preview's page by note, instead of designing a new one. */
+  revise?: { page: string; feedback: string };
   onProgress?: (p: { stage: string; done: number; total: number; message?: string }) => void;
 }): Promise<PreviewOutput> {
   const progress = input.onProgress ?? (() => {});
@@ -851,9 +893,15 @@ export async function buildPreviewReportOnly(input: {
     clipsUnavailable: 0,
   };
 
-  progress({ stage: "report", done: 0, total: 1, message: "重新生成预览报告" });
+  progress({
+    stage: "report",
+    done: 0,
+    total: 1,
+    message: input.revise ? "按建议修改预览报告" : "重新生成预览报告",
+  });
   const byKey = new Map(sessions.map((s) => [s.session_key, s]));
   const report = await renderPreviewReport({
+    revise: input.revise,
     dataSource: input.dataSource,
     runtime: input.runtime,
     template: input.template,
@@ -885,9 +933,11 @@ export async function buildPreviewReportOnly(input: {
       report_engine: report.engine,
       report_attempts: report.attempts,
       report_only: true,
+      ...(input.revise ? { report_revised: true } : {}),
     },
     spec: report.spec,
     html: report.html,
+    page: report.page,
   };
 }
 

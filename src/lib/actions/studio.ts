@@ -224,21 +224,32 @@ export async function updateTemplatePrompt(
  * are the expensive part and they are already on the row, so this reuses
  * them and costs one call.
  *
- * It lands as a new preview rather than overwriting the old one: the point
- * is usually to compare two designs, and the workbench already lists
+ * With a note it does not design a new report at all: the stored page comes
+ * back as the starting point and only what the note asks for changes. Without
+ * one it designs again from the brief, which is the right thing when the
+ * complaint is the design itself rather than a defect in it.
+ *
+ * Either way it lands as a new preview rather than overwriting the old one: the
+ * point is usually to compare two designs, and the workbench already lists
  * previews side by side.
  */
-export async function rerunPreviewReport(previewId: string): Promise<{ previewId: string }> {
+export async function rerunPreviewReport(
+  previewId: string,
+  feedback = "",
+): Promise<{ previewId: string }> {
+  const note = feedback.trim();
   const source = await maybeOne<{
     id: string;
     template_id: string;
     status: string;
     params: Record<string, unknown> | null;
     has_results: boolean;
+    has_page: boolean;
   }>(
     `select id, template_id, status, params,
             (jsonb_array_length(coalesce(session_results, '[]'::jsonb)) > 0
-             and global_result is not null) as has_results
+             and global_result is not null) as has_results,
+            (page is not null and page <> '') as has_page
      from template_previews where id = $1`,
     [previewId],
   );
@@ -248,24 +259,36 @@ export async function rerunPreviewReport(previewId: string): Promise<{ previewId
 
   if (source.status !== "completed") throw new ActionError("只有已完成的预览可以只重新生成报告");
   if (!source.has_results) throw new ActionError("这份预览没有可复用的分析结果，请完整重跑");
+  // Said here rather than three minutes into the job: a preview from before
+  // migration 006, or one that fell back to the block renderer, has no page for
+  // a note to be applied to.
+  if (note && !source.has_page) {
+    throw new ActionError("这份预览报告没有保存可修改的页面源码（旧数据或内置渲染器产出），请改用「只重新生成报告」");
+  }
 
   let created: { id: string };
   try {
     created = await one<{ id: string }>(
       `insert into template_previews
-         (template_id, data_source_id, status, params, progress, created_by)
-       values ($1, $2, 'pending', $3::jsonb, $4::jsonb, $5)
+         (template_id, data_source_id, status, params, progress, report_feedback, created_by)
+       values ($1, $2, 'pending', $3::jsonb, $4::jsonb, $5, $6)
        returning id`,
       [
         source.template_id,
         dataSourceId,
         JSON.stringify({ ...(source.params ?? {}), reportOnly: true, sourcePreviewId: previewId }),
-        JSON.stringify({ stage: "report", done: 0, total: 1, message: "排队中（只重新生成报告）" }),
+        JSON.stringify({
+          stage: "report",
+          done: 0,
+          total: 1,
+          message: note ? "排队中（按建议修改报告）" : "排队中（只重新生成报告）",
+        }),
+        note,
         session.userId,
       ],
     );
   } catch (err) {
-    throw new ActionError(`重新生成预览报告失败：${(err as Error).message}`);
+    throw new ActionError(`${note ? "按建议修改预览报告" : "重新生成预览报告"}失败：${(err as Error).message}`);
   }
 
   revalidatePath(`/sources/${dataSourceId}/studio`);

@@ -25,7 +25,8 @@ import {
   type TemplateConfig,
 } from "../src/lib/engine/plan";
 import { runTask, log } from "../src/lib/engine/executor";
-import { runReportStage } from "../src/lib/engine/report-stage";
+import { loadRevisionBase, runReportStage, type ReportRevision } from "../src/lib/engine/report-stage";
+import { ReportSession } from "../src/lib/engine/report-validate";
 import { importZip } from "../src/lib/engine/import";
 import { configFromGraph, normalizeGraph } from "../src/lib/workflow/graph";
 import type { WorkflowConfig } from "../src/lib/workflow/definition";
@@ -34,6 +35,21 @@ import { MODE_LABEL } from "../src/lib/models/mode";
 import type { ExtraFieldDef, JsonObject } from "../src/lib/types";
 
 const POLL_MS = Number(process.env.WORKER_POLL_MS ?? 2500);
+
+/**
+ * How many jobs one Worker holds at once.
+ *
+ * `tick` used to claim from every queue on every pass, which was fine when the
+ * report stage was a couple of model calls. It is now a loop that keeps a
+ * Chromium open for its whole duration, so four concurrent jobs is four browsers
+ * in one container — and on a small Worker that is the OOM, not a slowdown.
+ *
+ * Claiming simply stops while this Worker is busy; the rows stay `pending` for
+ * the next tick or for another Worker, which is exactly what
+ * `for update skip locked` already makes safe. Raise it on a big Worker,
+ * or scale Workers out instead.
+ */
+const MAX_ACTIVE = Math.max(1, Number(process.env.WORKER_MAX_ACTIVE ?? 3) || 3);
 
 let stopping = false;
 const active = new Set<string>();
@@ -358,6 +374,8 @@ interface PreviewJob extends JsonObject {
   template_id: string;
   data_source_id: string;
   params: JsonObject;
+  /** Set when this row was created to apply a note to the previous report. */
+  report_feedback: string | null;
   created_by: string | null;
 }
 
@@ -369,8 +387,9 @@ async function loadPreviewResults(sourceId: string) {
         user_results: JsonObject[];
         global_result: JsonObject | null;
         stats: JsonObject;
+        page: string | null;
       }>(
-        `select session_results, user_results, global_result, stats
+        `select session_results, user_results, global_result, stats, page
          from template_previews where id = $1 and status = 'completed'`,
         [sourceId],
       )
@@ -382,6 +401,8 @@ async function loadPreviewResults(sourceId: string) {
     userResults: row.user_results as never,
     globalResult: row.global_result,
     stats: row.stats ?? {},
+    /** The page a revision would start from; absent on older previews. */
+    page: row.page,
   };
 }
 
@@ -411,12 +432,22 @@ async function handlePreview(job: PreviewJob) {
   // `reportOnly`: the three layers come from the preview being redone, and
   // only the report is generated again. Iterating on how a report looks
   // should not mean re-analysing the same twelve conversations.
-  const out = params.reportOnly
+  const feedback = (job.report_feedback ?? "").trim();
+  const stored = params.reportOnly ? await loadPreviewResults(String(params.sourcePreviewId ?? "")) : null;
+  // A note can only be applied to a page that was kept. An older preview, or
+  // one that fell back to the block renderer, has none — and answering the note
+  // with a fresh design is not what was asked for, so it says so instead.
+  if (feedback && stored && !stored.page) {
+    throw new Error("这份预览报告没有保存可修改的页面源码（可能是旧数据或内置渲染器产出），请改用「只重新生成报告」");
+  }
+
+  const out = params.reportOnly && stored
     ? await buildPreviewReportOnly({
         dataSource: source,
         runtime,
         template: tpl,
-        stored: await loadPreviewResults(String(params.sourcePreviewId ?? "")),
+        stored,
+        ...(feedback && stored.page ? { revise: { page: stored.page, feedback } } : {}),
         onProgress,
       })
     : await buildPreview({
@@ -433,7 +464,7 @@ async function handlePreview(job: PreviewJob) {
     `update template_previews
      set status = 'completed', session_results = $2::jsonb, user_results = $3::jsonb,
          global_result = $4::jsonb, report = $5::jsonb, html = $6, stats = $7::jsonb,
-         finished_at = now(), progress = $8::jsonb
+         page = $9, finished_at = now(), progress = $8::jsonb
      where id = $1`,
     [
       job.id,
@@ -444,6 +475,7 @@ async function handlePreview(job: PreviewJob) {
       out.html,
       JSON.stringify(out.stats),
       JSON.stringify({ stage: "done", done: 1, total: 1 }),
+      out.page,
     ],
   );
 }
@@ -460,6 +492,9 @@ interface TaskRow extends JsonObject {
   range_start: string | null;
   range_end: string | null;
   config: JsonObject;
+  stats: JsonObject;
+  /** A pending ask about the report: regenerate, or revise with this note. */
+  report_request: JsonObject | null;
 }
 
 async function handleTask(job: TaskRow) {
@@ -507,6 +542,12 @@ async function handleTask(job: TaskRow) {
  * they cost hours; a page that failed to render, or a design worth asking for
  * again, must not send anyone back through them. A task parked at
  * `report_pending` is claimed here and picks up from the report stage alone.
+ *
+ * `report_request` says which of the two was asked for. Without one it is the
+ * regeneration this path has always done. With `kind = 'revise'` the stored
+ * page comes back as the starting point and the note travels with it, so the
+ * report people were mostly happy with survives the one thing they wanted
+ * changed.
  */
 async function handleReportRerun(job: TaskRow) {
   const runtime = await resolveRuntime(job.data_source_id);
@@ -514,14 +555,49 @@ async function handleReportRerun(job: TaskRow) {
   const overrides = (job.config ?? {}) as Partial<{ scope: unknown; session: unknown; report: unknown }>;
   const merged = { ...config, ...(overrides as object) } as WorkflowConfig;
 
+  const request = (job.report_request ?? null) as {
+    kind?: string;
+    feedback?: string;
+    baseReportId?: string | null;
+  } | null;
+  const feedback = request?.kind === "revise" ? (request.feedback ?? "").trim() : "";
+
+  let revise: ReportRevision | undefined;
+  if (feedback) {
+    const base = await loadRevisionBase(job.id, request?.baseReportId ?? null);
+    if (!base?.page) {
+      throw new Error(
+        base
+          ? `报告 v${base.version ?? "?"} 没有保存可修改的页面源码（${base.engine === "spec" ? "内置渲染器产出" : "旧数据"}），请改用「重新生成报告」`
+          : "这个任务还没有可修改的报告，请先生成一次报告",
+      );
+    }
+    revise = { feedback, basePage: base.page, baseReportId: base.id };
+  }
+
   await execute(`update analysis_tasks set stage = 'report_generation', error = null where id = $1`, [job.id]);
-  await log(job.id, "info", "report", "重新生成报告（复用已有的三层分析结果）");
+  await log(
+    job.id,
+    "info",
+    "report",
+    revise ? "按建议修改报告（复用已有的三层分析结果与上一版页面）" : "重新生成报告（复用已有的三层分析结果）",
+  );
+
+  // What the original run heard and which models it used live on the task's
+  // stats. Without them the report header loses its audio chip and its model
+  // attribution — and a revision would quietly drop both from a page that had
+  // them, which reads as the revision having broken something.
+  const stats = (job.stats ?? {}) as { audio?: JsonObject; models?: JsonObject };
 
   const result = await runReportStage({
     taskId: job.id,
     runtime,
     config: merged,
+    revise,
+    audio: stats.audio as never,
+    models: stats.models,
     onStep: (message: string) => void log(job.id, "info", "report", message),
+    shouldStop: () => reportStopCheck(job.id),
   });
 
   if (result.engine === "spec") {
@@ -531,6 +607,7 @@ async function handleReportRerun(job: TaskRow) {
   await execute(
     `update analysis_tasks
      set status = 'completed', stage = 'done', heartbeat_at = now(), finished_at = now(),
+         report_request = null,
          stats = coalesce(stats, '{}'::jsonb) || $2::jsonb
      where id = $1`,
     [
@@ -539,16 +616,54 @@ async function handleReportRerun(job: TaskRow) {
         report_engine: result.engine,
         report_attempts: result.attempts,
         report_rerun_at: new Date().toISOString(),
+        report_version: result.version ?? null,
+        ...(revise ? { report_revised: true, report_revise_mode: result.mode ?? null } : {}),
       }),
     ],
   );
-  await log(job.id, "info", "report", `报告已重新生成（${result.engine === "page" ? "AI 生成页面" : "内置渲染器"}）`);
+  await log(
+    job.id,
+    "info",
+    "report",
+    revise
+      ? `报告已按建议修改为 v${result.version ?? "?"}（${MODE_NOTE[result.mode ?? "none"]}，${result.attempts} 轮）`
+      : `报告已重新生成为 v${result.version ?? "?"}（${result.engine === "page" ? "AI 生成页面" : "内置渲染器"}）`,
+  );
 }
+
+/**
+ * Bump the heartbeat and answer whether the job should still be running.
+ *
+ * Both in one statement because they are the same question: the row is only
+ * still ours while it says `running`. Cancelling a task used to set a flag that
+ * nothing in the report path ever read — harmless when the stage was one call,
+ * wasteful now that it is a loop that can run for minutes.
+ */
+async function reportStopCheck(taskId: string): Promise<string | null> {
+  const rows = await query<{ status: string }>(
+    `update analysis_tasks set heartbeat_at = now()
+     where id = $1 and status = 'running'
+     returning status`,
+    [taskId],
+  );
+  return rows.length ? null : "任务已被取消或删除，报告生成中止";
+}
+
+/** How a revision reached its result, for the log the operator reads. */
+const MODE_NOTE: Record<string, string> = {
+  patch: "局部修改",
+  rewrite: "整页重写",
+  mixed: "局部修改 + 重写",
+  none: "页面未改动",
+};
 
 /* ---------------------------------------------------------------- loop */
 
 async function tick() {
   await sweepStaleImports();
+
+  const busy = () => active.size >= MAX_ACTIVE;
+  if (busy()) return;
 
   const batch = await claimImport();
   if (batch) {
@@ -565,6 +680,8 @@ async function tick() {
     });
   }
 
+  if (busy()) return;
+
   const planning = await claim<PlanningJob>("planning_jobs", "started_at = now()");
   if (planning) {
     active.add(planning.id);
@@ -575,6 +692,8 @@ async function tick() {
       );
     });
   }
+
+  if (busy()) return;
 
   const preview = await claim<PreviewJob>("template_previews", "progress = $2::jsonb", [
     JSON.stringify({ step: "claimed" }),
@@ -589,17 +708,31 @@ async function tick() {
     });
   }
 
+  if (busy()) return;
+
   const rerun = await claim<TaskRow>("analysis_tasks", "heartbeat_at = now()", [], "report_pending");
   if (rerun) {
     active.add(rerun.id);
     void run("report-rerun", rerun.id, () => handleReportRerun(rerun), async (err) => {
+      // The note is dropped with the failure — leaving it on the row would have
+      // the next plain rerun silently apply a revision nobody asked for — but it
+      // is written into the log first, so nobody has to retype what they wrote.
+      const note = String((rerun.report_request as { feedback?: string } | null)?.feedback ?? "").trim();
+      if (note) await log(rerun.id, "warn", "report", `未生效的修改建议（请重新提交）：${note.slice(0, 1500)}`);
+      // A cancel is not a failure, and the cancel happened later than this row
+      // was claimed: overwriting it would erase what the operator asked for.
       await execute(
-        `update analysis_tasks set status = 'failed', error = $2, finished_at = now() where id = $1`,
+        `update analysis_tasks
+         set status = 'failed', error = $2, finished_at = now(), report_request = null
+         where id = $1 and status <> 'cancelled'`,
         [rerun.id, err.slice(0, 4000)],
       );
+      await execute(`update analysis_tasks set report_request = null where id = $1`, [rerun.id]);
       await log(rerun.id, "error", "report", `报告重新生成失败: ${err.slice(0, 600)}`);
     });
   }
+
+  if (busy()) return;
 
   const task = await claim<TaskRow>("analysis_tasks", "started_at = now()");
   if (task) {
@@ -636,6 +769,26 @@ async function run(kind: string, id: string, fn: () => Promise<void>, onError: (
   }
 }
 
+/**
+ * Whether this Worker can render a report page at all.
+ *
+ * Worth a second at startup and a line in the banner, because the failure is
+ * otherwise invisible: without a browser the report stage skips rendering,
+ * skips the screenshots and accepts whatever the model wrote on the first try.
+ * Every report then goes out having never been looked at — which is what a
+ * deployment that pruned `playwright`, or has no Chromium, quietly does.
+ */
+async function probeBrowser(): Promise<string> {
+  try {
+    const session = await ReportSession.open();
+    await session.close();
+    return "浏览器=可用";
+  } catch (e) {
+    const why = (e instanceof Error ? e.message : String(e)).split("\n")[0].slice(0, 160);
+    return `浏览器=不可用（报告将跳过渲染校验与截图，质量明显下降：${why}）`;
+  }
+}
+
 async function main() {
   // Fail fast, with a clear message, if the database is unreachable.
   const probe = await scalar<number>(`select 1 as ok`);
@@ -647,8 +800,10 @@ async function main() {
         .filter(Boolean)
         .join(" · ") || "未选择模型"
     : "模型配置不可读";
+  const browser = await probeBrowser();
   console.log(
-    `[worker] connected · 默认模式=${defaults ? MODE_LABEL[defaults.mode] : "?"} · ${models} · poll=${POLL_MS}ms · probe=${probe === 1 ? "ok" : "n/a"}`,
+    `[worker] connected · 默认模式=${defaults ? MODE_LABEL[defaults.mode] : "?"} · ${models}` +
+      ` · poll=${POLL_MS}ms · 并发上限=${MAX_ACTIVE} · ${browser} · probe=${probe === 1 ? "ok" : "n/a"}`,
   );
 
   await recoverStaleJobs();
